@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# 환경 변수 (예시 파일만 커밋)
+.env
+.env.*
+!.env.example
+
+# Node (관리자 웹)
+node_modules/
+web/admin/dist/
+
+# 편집기 · OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
