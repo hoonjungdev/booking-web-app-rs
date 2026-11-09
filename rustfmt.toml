@@ -1,0 +1,5 @@
+# stable rustfmt 옵션만 쓴다 (nightly 전용 옵션은 CI에서 경고 없이 무시되므로 넣지 않는다).
+edition = "2024"
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

@@ -1,0 +1,12 @@
+[package]
+name = "booking-server"
+description = "예약 API + 관리자 API + 워커 실행 파일"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

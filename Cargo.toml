@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# 모든 크레이트가 공유하는 패키지 정보. 각 크레이트에서 `xxx.workspace = true`로 가져다 쓴다.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+# 모든 크레이트에 같은 린트 규칙을 적용한다 (각 크레이트의 `[lints] workspace = true`).
+# CI와 Stop 훅은 `-D warnings`로 돌리므로 "warn"도 사실상 빌드 실패다.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# 기본 그룹(correctness, suspicious, style, complexity, perf)은 그대로 켜 둔다.
+# 아래는 CLAUDE.md 코딩 규칙을 기계적으로 강제하기 위해 추가로 켜는 것들이다.
+unwrap_used = "warn"          # 테스트 밖 unwrap 금지 (expect("이유")는 허용)
+dbg_macro = "warn"            # dbg!() 남기지 않기
+todo = "warn"                 # todo!() 남기지 않기
+unimplemented = "warn"
+print_stdout = "warn"         # println! 대신 tracing
+print_stderr = "warn"
+large_futures = "warn"        # 너무 큰 Future (스택 오버플로 위험)
+needless_pass_by_value = "warn"

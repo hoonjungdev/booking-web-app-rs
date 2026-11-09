@@ -1,0 +1,12 @@
+[package]
+name = "providers"
+description = "외부 업체 어댑터와 장애 대응 파이프라인"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

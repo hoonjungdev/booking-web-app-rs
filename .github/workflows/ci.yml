@@ -1,0 +1,98 @@
+# 모든 검사는 scripts/check.sh를 그대로 호출한다 (로컬 · Claude Code 훅과 같은 명령).
+# 컴파일러 버전은 rust-toolchain.toml을 따른다.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 매주 월요일 09:00 KST: 코드가 그대로여도 새로 공개된 보안 권고(cargo-deny)를 잡기 위해
+    - cron: "0 0 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - run: scripts/check.sh fmt
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check.sh clippy
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - run: scripts/check.sh test
+
+  deny:
+    name: deny (보안 · 라이선스)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: scripts/check.sh deny
+
+  shear:
+    name: shear (미사용 의존성)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear@1.14.0
+      - run: scripts/check.sh shear
+
+  # 브랜치 보호 규칙에는 이 job 하나만 "필수"로 걸면 된다.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [fmt, clippy, test, deny, shear]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 모든 검사 결과 확인
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "결과: $RESULTS"
+          for r in $RESULTS; do
+            [[ "$r" == "success" ]] || { echo "실패한 검사가 있습니다."; exit 1; }
+          done

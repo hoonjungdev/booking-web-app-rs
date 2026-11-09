@@ -1,0 +1,12 @@
+[package]
+name = "domain"
+description = "예약 도메인 모델, 상태 머신, 도메인 에러 (I/O 없음)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

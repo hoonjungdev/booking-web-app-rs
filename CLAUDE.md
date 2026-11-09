@@ -60,15 +60,41 @@
 - 서버 데이터는 TanStack Query 훅으로만 가져온다 (`useEffect` 안에서 fetch하지 않는다).
 - `src/api/schema.d.ts`는 자동 생성 파일이므로 직접 고치지 않는다. 백엔드 API가 바뀌면 OpenAPI를 다시 생성한다.
 
-## 명령어
+## 품질 검사와 개발 루프
 
-Phase 1에서 workspace를 만든 뒤 실제 명령을 확인하고 이 절을 갱신한다.
+검사는 `scripts/check.sh` 한 곳에 정의되어 있고, 로컬 · Claude Code 훅 · CI가 모두 이 스크립트를 쓴다. 검사 내용을 바꿀 때는 이 스크립트만 고친다.
 
 ```bash
-cargo fmt --all                                   # 포맷
-cargo clippy --workspace --all-targets -- -D warnings   # 린트
-cargo test --workspace                            # 테스트
-docker compose up -d                              # postgres, otel-lgtm
+scripts/check.sh          # 전체: fmt → clippy → test → deny → shear (CI와 동일)
+scripts/check.sh fast     # fmt + clippy (Stop 훅이 쓰는 빠른 검사)
+scripts/check.sh test     # 단계별 실행: fmt | clippy | test | deny | shear
+cargo fmt --all           # 포맷 자동 수정
+```
+
+| 단계 | 도구 | 잡는 것 |
+|---|---|---|
+| fmt | rustfmt | 포맷 (`rustfmt.toml`) |
+| clippy | clippy `-D warnings` | 버그 패턴, 그리고 CLAUDE.md 규칙 위반: `unwrap`, `println!`, `dbg!`, `todo!` 등 (`Cargo.toml`의 `[workspace.lints]`) |
+| test | cargo-nextest + doctest | 테스트 실패 |
+| deny | cargo-deny | 보안 권고, 허용하지 않은 라이선스, 출처 불명 의존성 (`deny.toml`) |
+| shear | cargo-shear | `Cargo.toml`에 선언했지만 쓰지 않는 의존성 |
+
+Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
+- **PostToolUse** (Edit · Write · MultiEdit): 수정한 `.rs` 파일을 즉시 rustfmt로 정리한다. 그래서 편집 직후 파일 내용이 바뀔 수 있다. 이어서 같은 부분을 고칠 때는 파일을 다시 읽는다.
+- **Stop**: 응답을 끝내기 전에 `scripts/check.sh fast`를 돌린다. 실패하면 오류가 돌아오므로 **고친 뒤에** 마무리한다. 두 번째에도 실패하면 막지 않고 사용자에게 경고만 표시된다.
+- Stop 훅은 빠른 검사만 한다. 기능을 끝냈다고 보고하기 전에는 `scripts/check.sh`(전체)를 직접 돌려 통과를 확인한다.
+
+규칙:
+- 린트를 끄는 `#[allow(...)]`는 꼭 필요할 때만, 가장 좁은 범위(함수 · 문장)에 붙이고 이유를 주석으로 남긴다. `[workspace.lints]`를 느슨하게 바꾸는 것은 사용자와 상의한다.
+- 의존성을 추가하면 `Cargo.lock`도 함께 커밋한다 (모든 검사가 `--locked`로 돈다).
+- 컴파일러 버전은 `rust-toolchain.toml`에 고정되어 있다. 올릴 때는 버전을 바꾸고 `scripts/check.sh` 통과를 확인한 뒤 별도 커밋으로 올린다.
+- 필요한 도구: `brew install cargo-nextest cargo-deny cargo-shear actionlint`
+
+## 그 밖의 명령어
+
+```bash
+actionlint                # .github/workflows 검사
+docker compose up -d      # postgres, otel-lgtm (Phase 1에서 추가 예정)
 ```
 
 ## 로컬 포트
