@@ -11,10 +11,10 @@
 ## Phase 1. 뼈대 + mock 업체 (alpha)
 - [x] Cargo workspace, 크레이트 골격, `rust-toolchain.toml`, `cargo fmt` / `clippy` 설정
 - [x] 품질 검사 스크립트(`scripts/check.sh`), Claude Code 훅, GitHub Actions CI, cargo-deny, cargo-shear
-- [ ] `docker-compose.yml` (postgres, otel-lgtm)
-- [ ] `telemetry` 크레이트: 콘솔 로그 초기화
-- [ ] `mock-provider`: alpha의 자원 · 빈 시간 · 예약 생성/조회/취소 (메모리 저장), 멱등키, rate limit 헤더
-- [ ] 장애 주입 API와 프리셋
+- [x] `docker-compose.yml` (postgres 18.6, otel-lgtm 0.40.0)
+- [x] `telemetry` 크레이트: 콘솔 로그 초기화 (`LOG_FORMAT=json` 지원)
+- [x] `mock-provider`: alpha의 자원 · 빈 시간 · 예약 생성/조회/취소 (메모리 저장), 멱등키, rate limit 헤더
+- [x] 장애 주입 API와 프리셋, 테스트 28개 (단위 18 + HTTP 통합 10)
 
 **완료 기준**: `curl`로 alpha에 예약을 만들 수 있고, `slow` 프리셋을 켜면 응답이 느려진다.
 **배우는 것**: cargo, 모듈, struct/enum, serde, axum 핸들러 · 라우터 · State, `Arc<Mutex<_>>`, async/await 기초

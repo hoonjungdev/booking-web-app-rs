@@ -153,9 +153,35 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
 | GET | `/alpha/v1/reservations?from=&to=` | 기간별 목록 (대사용) |
 | DELETE | `/alpha/v1/reservations/{id}` | |
 
-- 시각: RFC 3339 UTC
+- 시각: RFC 3339 UTC. 요청의 `slot_start`에는 `+09:00` 같은 오프셋을 붙여도 된다.
 - 한도 초과: `429` + `Retry-After` (초 단위)
-- 모든 응답에 `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+- 업체 API 응답에는 `X-RateLimit-Limit`(초당 허용 수), `X-RateLimit-Remaining`, `X-RateLimit-Reset`(버킷이 다시 가득 차기까지 초)이 붙는다. 한도는 토큰 버킷 방식이다.
+- 자원: `store-001`(강남점), `store-002`(홍대점), `store-003`(판교점)
+- 슬롯: 한국 시간 10:00~21:00, 1시간 단위 11개. 슬롯마다 정원이 0~4건이다 (0이면 마감된 슬롯).
+
+예약 생성 요청:
+```json
+{
+  "resource_id": "store-001",
+  "slot_start": "2026-11-20T19:00:00+09:00",
+  "party_size": 2,
+  "customer": { "name": "홍길동", "phone": "010-1234-5678" },
+  "client_reference": "우리 booking id (선택)"
+}
+```
+
+| 응답 | 경우 |
+|---|---|
+| 201 | 새로 만듦 |
+| 200 | 같은 `Idempotency-Key` + 같은 본문 (이전 결과를 그대로) |
+| 400 `invalid_request` / `invalid_slot` / `slot_in_past` | 입력 오류, 슬롯 경계가 아닌 시각, 지난 슬롯 |
+| 404 `resource_not_found` | 없는 자원 |
+| 409 `slot_unavailable` | 정원 마감 |
+| 422 `idempotency_key_mismatch` | 같은 `Idempotency-Key` + 다른 본문 |
+
+에러 본문: `{ "error": { "code": "slot_unavailable", "message": "..." } }`
+
+취소(`DELETE`)는 멱등이다. 이미 취소된 예약도 200으로 같은 결과를 돌려준다.
 
 ### beta: 까다로운 레거시 API
 | 메서드 | 경로 | 비고 |
@@ -195,10 +221,18 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
 ```
 | 항목 | 효과 |
 |---|---|
-| `slow` | 일정 확률로 긴 지연 |
+| `latency_ms` | 모든 요청에 이 범위의 무작위 지연 |
+| `slow` | 일정 확률로 지연을 더함 |
 | `error` | 일정 확률로 5xx (예약은 **만들지 않음**) |
-| `hang_probability` | 응답하지 않고 연결만 유지 (클라이언트 타임아웃 유발) |
-| `drop_after_commit_probability` | 예약은 **만들고** 응답 직전에 연결을 끊음 → 결과 불명 상황 재현 |
-| `outage` | 모든 요청에 503 |
+| `hang_probability` | 처리하지 않고 30초 동안 응답하지 않음 (클라이언트 타임아웃 유발) |
+| `drop_after_commit_probability` | 쓰기 요청(POST · PUT · PATCH · DELETE)만 해당. 예약은 **만들고** 30초 동안 응답하지 않음 → 결과 불명 상황 재현 |
+| `rate_limit` | 토큰 버킷. 초당 `per_second`개가 다시 채워지고 최대 `burst`개까지 쌓임 |
+| `outage` | 모든 요청에 503 (rate limit 토큰도 쓰지 않음) |
+
+- `PUT /_chaos/{provider}`에서 빠진 필드는 `healthy` 값으로 채워진다. 확률이 0~1을 벗어나는 등 잘못된 값은 400.
+- 적용 순서: outage → rate limit → 지연 → 5xx 또는 hang → 처리 → drop_after_commit
+- 프리셋: `healthy`(20~120ms, 초당 20회), `flaky`(5xx 10%), `slow`(30% 확률로 +3초), `throttled`(초당 5회), `lossy`(쓰기의 20% 응답 유실), `outage`
 
 슬롯 데이터는 날짜와 자원 ID로 정해지는 고정 규칙으로 만든다. 재시작해도 같은 슬롯이 나온다.
+
+실행: `cargo run -p mock-provider` (주소는 `MOCK_PROVIDER_ADDR`로 바꿀 수 있고, 기본값은 `127.0.0.1:9090`)

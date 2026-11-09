@@ -93,9 +93,14 @@ Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
 ## 그 밖의 명령어
 
 ```bash
-actionlint                # .github/workflows 검사
-docker compose up -d      # postgres, otel-lgtm (Phase 1에서 추가 예정)
+docker compose up -d --wait      # postgres(:5432), otel-lgtm(Grafana :3000, OTLP :4317/4318)
+docker compose down              # 정지 (-v를 붙이면 DB 데이터까지 삭제)
+cargo run -p mock-provider       # mock 업체 서버 (:9090). RUST_LOG=debug로 장애 주입 로그 확인
+actionlint                       # .github/workflows 검사
 ```
+
+- 셸 환경에 따라 `cargo`가 PATH에 없을 수 있다. 그럴 때는 `. "$HOME/.cargo/env"`를 먼저 실행한다.
+- mock 업체의 장애 설정은 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다.
 
 ## 로컬 포트
 
