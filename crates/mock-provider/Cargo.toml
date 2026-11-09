@@ -1,0 +1,12 @@
+[package]
+name = "mock-provider"
+description = "장애 주입이 가능한 가짜 외부 예약 업체 서버"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

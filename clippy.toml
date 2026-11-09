@@ -1,0 +1,5 @@
+# 테스트 코드에서는 unwrap/expect/출력/dbg를 허용한다.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true

@@ -58,3 +58,10 @@
 ### D-12. 에러 응답은 RFC 9457 Problem Details
 - 상태: 채택
 - 이유: 표준 형식이다. 클라이언트가 `type`으로 에러 종류를 구분할 수 있다.
+
+### D-13. 품질 게이트는 단일 스크립트 + 고정 toolchain, 세 곳(로컬 · Claude Code 훅 · CI)에서 같은 명령 실행
+- 상태: 채택
+- 이유: 로컬에서 통과한 코드가 CI에서 깨지는 일을 없앤다. Claude Code가 응답을 끝내기 전에 Stop 훅이 fmt + clippy를 돌려, 실패하면 Claude가 스스로 고치게 한다. 코딩 규칙(`unwrap` · `println!` 금지 등)은 문서로만 두지 않고 clippy 린트로 강제한다.
+- 구성: `scripts/check.sh`(fmt · clippy · nextest · cargo-deny · cargo-shear), `rust-toolchain.toml`(1.99.1 고정), `[workspace.lints]`, `.claude/settings.json` 훅, `.github/workflows/ci.yml`, Dependabot
+- 결과: toolchain과 CI 도구 버전은 사람이 직접 올린다. Stop 훅 때문에 응답이 끝날 때마다 수 초가 더 걸린다 (Rust 변경이 없으면 건너뜀).
+- 대안: pre-commit 훅 (커밋할 때만 돌아서 Claude의 작업 중간 피드백이 늦음), `just`/`make` (도구 추가 설치 필요)

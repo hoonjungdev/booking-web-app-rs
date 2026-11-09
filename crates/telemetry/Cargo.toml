@@ -1,0 +1,12 @@
+[package]
+name = "telemetry"
+description = "tracing · OpenTelemetry 초기화 (booking-server와 mock-provider가 공유)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

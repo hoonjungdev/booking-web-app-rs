@@ -9,7 +9,8 @@
 - [ ] Rust 기초 학습: The Rust Book 1~10장, Rustlings 일부
 
 ## Phase 1. 뼈대 + mock 업체 (alpha)
-- [ ] Cargo workspace, 크레이트 골격, `rust-toolchain.toml`, `cargo fmt` / `clippy` 설정
+- [x] Cargo workspace, 크레이트 골격, `rust-toolchain.toml`, `cargo fmt` / `clippy` 설정
+- [x] 품질 검사 스크립트(`scripts/check.sh`), Claude Code 훅, GitHub Actions CI, cargo-deny, cargo-shear
 - [ ] `docker-compose.yml` (postgres, otel-lgtm)
 - [ ] `telemetry` 크레이트: 콘솔 로그 초기화
 - [ ] `mock-provider`: alpha의 자원 · 빈 시간 · 예약 생성/조회/취소 (메모리 저장), 멱등키, rate limit 헤더
@@ -71,7 +72,8 @@
 
 ## Phase 7. 품질과 마무리
 - [ ] 부하 테스트 (oha / goose) + 결과 기록
-- [ ] GitHub Actions CI: fmt, clippy, nextest, cargo-deny, sqlx 오프라인 검사, 프론트 빌드
+- [x] GitHub Actions CI: fmt, clippy, nextest, cargo-deny, cargo-shear (Phase 1에서 먼저 구축)
+- [ ] CI 확장: sqlx 오프라인 검사(Phase 2), 프론트 빌드 · 타입 생성 검사(Phase 5)
 - [ ] Dockerfile (다단계 빌드), docker-compose로 전체 실행
 - [ ] 운영 문서 (장애 대응 런북)
 

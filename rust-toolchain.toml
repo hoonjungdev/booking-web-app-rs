@@ -1,0 +1,7 @@
+# 로컬, CI, Claude Code 훅이 모두 같은 컴파일러를 쓰도록 버전을 고정한다.
+# 새 버전의 clippy 린트가 갑자기 CI를 깨는 일을 막기 위해 "stable" 대신 정확한 버전을 쓴다.
+# 올릴 때는 이 값을 바꾸고 `scripts/check.sh`가 통과하는지 확인한 뒤 커밋한다.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "rust-analyzer"]
+profile = "minimal"
