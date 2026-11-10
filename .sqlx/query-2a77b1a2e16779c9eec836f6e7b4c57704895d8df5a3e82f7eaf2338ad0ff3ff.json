@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error\n         FROM jobs WHERE booking_id = $1 ORDER BY id",
+  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error, payload\n         FROM jobs WHERE booking_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -90,6 +90,17 @@
             "name": "last_error"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "payload"
+          }
+        }
       }
     ],
     "parameters": {
@@ -105,8 +116,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "e747d3c9b0221383f15c4800c7d2cb98d8c5c3c678268e3cd5e777d5d0ff0987"
+  "hash": "2a77b1a2e16779c9eec836f6e7b4c57704895d8df5a3e82f7eaf2338ad0ff3ff"
 }

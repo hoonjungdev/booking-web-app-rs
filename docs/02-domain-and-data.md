@@ -233,6 +233,12 @@ CREATE TABLE reconciliation_issues (
 - 고객 정보(`customer`)는 API 응답에 넣지 않고, 로그에 찍혀도 `Debug`에서 `***`로 가려진다.
 - `timestamptz`는 마이크로초까지만 저장한다. 그런데 Linux의 `Utc::now()`는 나노초까지 돌려주므로, 저장할 시각은 API 입구에서 `db::normalize_timestamp`로 마이크로초에 맞춘다. 그래야 요청 해시를 계산한 값, 저장한 값, 다시 읽은 값이 같다. (macOS는 시계가 마이크로초 단위라 로컬에서는 이 차이가 드러나지 않는다)
 
+### 구현 메모 (Phase 3)
+- `provider_calls`는 `migrations/20261111000001_create_provider_calls.sql`에서 추가했다. 기록 테이블이라 보관 기간이 예약과 다르므로 `booking_id`에 외래 키를 걸지 않았다. `trace_id`는 Phase 4(OpenTelemetry)에서 채운다.
+- 저장은 `db::provider_calls::insert_batch` 한 문장으로 한다. 열마다 값을 배열로 모아 보내고 `UNNEST`로 펼치므로, 건수와 상관없이 `query!`로 컴파일 시점에 검사된다.
+- `jobs.kind`에 `resolve_unknown`이 추가되었다. `jobs.payload`는 작업별 진행 상황(지금은 `resolve_unknown`이 "업체에 없음"을 확인한 횟수)을 담는다.
+- 예약 상태 전이와 "그 상태를 처리할 다음 작업" 등록을 한 트랜잭션으로 묶는다: `unknown`이 되면 `resolve_unknown`, `unknown → pending`이 되면 `submit_booking`.
+
 ## 5. 작업 큐 동작
 
 별도 메시지 브로커(RabbitMQ, Kafka) 없이 PostgreSQL 테이블로 작업 큐를 만든다. → [D-03](decisions.md#d-03-예약-생성은-비동기202--postgresql-작업-큐)
@@ -268,12 +274,14 @@ RETURNING *;
 |---|---|
 | 성공 | `status = 'done'`, 같은 트랜잭션에서 예약 상태 전이 |
 | 다시 시도할 만한 실패 | `status = 'queued'`, `run_at = now() + 백오프` |
-| 업체를 호출하지 않고 미룬 경우 (서킷 열림, 업체 pause) | 위와 같지만 `attempts`를 되돌린다 (실제로 호출하지 않았으므로). 대신 예약의 `deadline_at`으로 전체 기한을 제한한다 |
+| 업체를 호출하지 않고 미룬 경우 (서킷 열림, 업체 pause, 우리 쪽 대기 한도 초과) | 위와 같지만 `attempts`를 되돌린다 (실제로 호출하지 않았으므로, `db::jobs::defer`). 대신 예약의 `deadline_at`으로 전체 기한을 제한한다 |
 | 횟수 소진 또는 기한 초과 | `status = 'dead'`, 예약을 `failed` 또는 `cancel_failed`로 전이. 관리자 화면에 표시 |
 
 폴링 간격은 500ms로 시작한다. 지연을 더 줄이고 싶으면 나중에 PostgreSQL `LISTEN/NOTIFY`로 워커를 깨우는 방식을 더한다.
 
 **lease와 fencing**: 작업을 가져갈 때 늘어난 `attempts` 값이 "이 작업을 쥐고 있다"는 증표다. 완료 · 재예약 · 포기 SQL은 모두 `WHERE id = $1 AND status = 'running' AND attempts = $n`으로 이 증표를 확인한다. 처리 도중 lease가 만료되어 다른 워커가 같은 작업을 다시 가져가면 `attempts`가 또 늘어나므로, 늦게 끝난 원래 워커의 결과는 반영되지 않는다. 작업 완료와 예약 상태 전이는 한 트랜잭션으로 저장한다.
+
+미루기(`defer`)는 `attempts`를 1 되돌리므로, 미룬 작업을 다시 가져가면 같은 번호가 다시 나온다. 그래도 fencing은 깨지지 않는다: 미룬 워커는 그 쓰기가 마지막이라 그 번호로 다시 쓰지 않고, lease를 잃은 워커의 번호보다 작은 값으로는 돌아가지 않는다 (다른 워커가 가져가면서 이미 1을 더했으므로).
 
 **시각 기준**: `run_at`, `locked_until` 계산은 모두 DB의 `now()`로 한다. 서버가 여러 대여도 시계 하나를 기준으로 삼기 위해서다. 예약의 `deadline_at`만 API 서버가 접수 시각으로 계산한다.
 

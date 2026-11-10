@@ -11,6 +11,7 @@ pub mod bookings;
 pub mod clients;
 mod error;
 pub mod jobs;
+pub mod provider_calls;
 pub mod providers;
 
 use std::time::Duration;

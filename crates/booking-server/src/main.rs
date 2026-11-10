@@ -6,13 +6,14 @@
 //! ```
 //! 두 명령 모두 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use booking_server::{
     api::{self, ApiState},
     auth,
     config::Config,
+    recorder,
     registry::ProviderRegistry,
     worker::{self, WorkerContext},
 };
@@ -23,6 +24,9 @@ use telemetry::LogFormat;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// 워커 lease에 업체 호출 시간 말고도 더 남겨 둘 여유 (작업 가져오기 · 결과 저장 같은 DB 작업)
+const LEASE_MARGIN: Duration = Duration::from_secs(5);
 
 /// `#[derive(Parser)]`: 구조체 정의만으로 명령줄 인자 해석과 `--help`를 만들어 준다 (≈ System.CommandLine)
 #[derive(Parser)]
@@ -92,18 +96,43 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     if matches!(role, Role::All | Role::Worker) {
-        let registry = ProviderRegistry::load(&pool)
+        // 업체 호출 기록 채널. 보내는 쪽은 업체 파이프라인마다 나눠 주고, 받는 쪽은 저장 태스크가 쓴다.
+        let (call_recorder, calls) = providers::call_recorder(recorder::CHANNEL_CAPACITY);
+        let registry = ProviderRegistry::load(&pool, call_recorder.clone())
             .await
             .context("업체 어댑터를 준비할 수 없습니다")?;
         tracing::info!(providers = ?registry.ids(), "provider adapters loaded");
+
+        // lease가 업체 호출 한 번보다 짧으면, 호출 도중 lease가 끝나 다른 워커가 같은 작업을 다시 가져간다
+        // (멱등키 없는 업체라면 이중 예약 위험). 이런 설정 실수는 시작할 때 막는다.
+        let worker_config = config.worker();
+        let needed = registry.longest_call() + LEASE_MARGIN;
+        anyhow::ensure!(
+            worker_config.lease >= needed,
+            "BOOKING_WORKER_LEASE_SECS({}초)가 너무 짧습니다. 업체 호출 한 번이 끝나고 결과를 저장할 시간을 포함해 {}초 이상이어야 합니다",
+            worker_config.lease.as_secs(),
+            needed.as_secs_f64().ceil()
+        );
+
+        // 워커가 멈추고 업체 파이프라인이 사라지면 채널이 닫히고, 남은 기록을 저장한 뒤 이 태스크도 끝난다
+        let recorder_pool = pool.clone();
+        tasks.spawn(async move {
+            recorder::run(recorder_pool, calls).await;
+            Ok(())
+        });
+
         let ctx = WorkerContext {
             pool: pool.clone(),
             providers: Arc::new(registry),
-            config: config.worker(),
+            config: worker_config,
         };
         let token = shutdown.clone();
         tasks.spawn(async move {
             worker::run(ctx, token).await;
+            // 기록 채널의 보내는 쪽 하나를 워커가 끝날 때까지 쥐고 있다가 여기서 놓는다.
+            // 사용 중인 업체가 하나도 없으면 다른 보내는 쪽이 없어서, 이것이 없으면 채널이 바로 닫히고
+            // 기록 태스크가 먼저 끝나 버린다 (그러면 아래 select!가 "태스크 하나가 끝남"으로 보고 서버 전체를 멈춘다).
+            drop(call_recorder);
             Ok(())
         });
     }

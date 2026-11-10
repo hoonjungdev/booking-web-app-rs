@@ -127,3 +127,66 @@ async fn 포기한_작업은_dead로_남는다(pool: PgPool) {
             .is_none()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 미룬_작업은_시도_횟수를_되돌린다(pool: PgPool) {
+    let booking_id = one_job(&pool).await;
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.attempts, 1);
+
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        jobs::defer(&mut conn, job.lease(), Duration::ZERO, "circuit_open")
+            .await
+            .unwrap()
+    );
+    let record = &jobs::for_booking(&pool, booking_id).await.unwrap()[0];
+    assert_eq!(record.status, "queued");
+    assert_eq!(
+        record.attempts, 0,
+        "업체를 부르지 않았으므로 시도로 세지 않는다"
+    );
+    assert_eq!(record.last_error.as_deref(), Some("circuit_open"));
+
+    // 다시 가져가면 다시 1번째 시도다.
+    // (미룬 워커는 defer가 마지막 쓰기라서, 같은 시도 번호가 다시 나와도 그 워커가 이 작업을 건드릴 일은 없다)
+    let again = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.attempts, 1);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 진행_상황을_payload에_남기고_다시_가져갈_때_읽는다(pool: PgPool) {
+    one_job(&pool).await;
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.payload, serde_json::json!({}));
+
+    let mut conn = pool.acquire().await.unwrap();
+    let progress = serde_json::json!({ "not_found_checks": 1 });
+    assert!(
+        jobs::retry_later_with_payload(
+            &mut conn,
+            job.lease(),
+            Duration::ZERO,
+            "not_found",
+            &progress
+        )
+        .await
+        .unwrap()
+    );
+
+    let again = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.payload, progress);
+    assert_eq!(again.attempts, 2);
+}

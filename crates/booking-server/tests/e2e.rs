@@ -19,6 +19,7 @@ use mock_provider::{
     alpha::model::ReservationQuery,
     chaos::{ChaosConfig, Preset},
 };
+use providers::CallRecorder;
 use tokio_util::sync::CancellationToken;
 
 use common::{booking_body, create_client, send, wait_for_status};
@@ -35,8 +36,9 @@ async fn start_mock(pool: &PgPool, chaos: &ChaosConfig) -> mock_provider::AppSta
 
     sqlx::query("UPDATE providers SET base_url = $1, policy = $2 WHERE id = 'alpha'")
         .bind(format!("http://{addr}/alpha/v1"))
-        // 테스트가 오래 걸리지 않도록 호출 타임아웃을 짧게 둔다
-        .bind(serde_json::json!({ "attempt_timeout_ms": 500 }))
+        // 테스트가 오래 걸리지 않도록 호출 타임아웃을 짧게 두고, 워커의 재시도 흐름을 한 단계씩 보도록
+        // 호출 내 재시도는 끈다 (호출 내 재시도는 scenarios.rs에서 검증)
+        .bind(serde_json::json!({ "attempt_timeout_ms": 500, "retry": { "max_attempts": 1 } }))
         .execute(pool)
         .await
         .expect("업체 설정을 바꿀 수 있어야 한다");
@@ -48,7 +50,7 @@ async fn real_worker(pool: &PgPool) -> WorkerContext {
     WorkerContext {
         pool: pool.clone(),
         providers: Arc::new(
-            ProviderRegistry::load(pool)
+            ProviderRegistry::load(pool, CallRecorder::discard())
                 .await
                 .expect("어댑터를 만들 수 있어야 한다"),
         ),
@@ -56,6 +58,7 @@ async fn real_worker(pool: &PgPool) -> WorkerContext {
             concurrency: 2,
             poll_interval: Duration::from_millis(20),
             lease: Duration::from_secs(30),
+            ..WorkerConfig::default()
         },
     }
 }

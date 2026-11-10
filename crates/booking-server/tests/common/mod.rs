@@ -5,7 +5,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -22,8 +22,12 @@ use booking_server::{
 };
 use chrono::{Days, Utc};
 use db::PgPool;
-use domain::{BookingStatus, ClientId};
-use providers::{Capabilities, CreateBooking, ProviderAdapter, ProviderBooking, ProviderError};
+use domain::{BookingId, BookingStatus, ClientId, ProviderId};
+use providers::{
+    AdapterReply, CallRecorder, Capabilities, CircuitBreakerPolicy, CreateBooking, ProviderAdapter,
+    ProviderBooking, ProviderError, ProviderPolicy, RateLimitPolicy, ResilientProvider,
+    RetryPolicy,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -158,24 +162,42 @@ pub async fn wait_for_status(
 /// 정해 둔 응답을 순서대로 돌려주는 가짜 어댑터 (≈ C#의 Moq로 만든 test double)
 pub struct FakeAdapter {
     capabilities: Capabilities,
-    responses: Mutex<VecDeque<Result<ProviderBooking, ProviderError>>>,
-    calls: AtomicUsize,
+    creates: Mutex<VecDeque<Result<ProviderBooking, ProviderError>>>,
+    finds: Mutex<VecDeque<Result<Option<ProviderBooking>, ProviderError>>>,
+    create_calls: AtomicUsize,
+    find_calls: AtomicUsize,
 }
 
 impl FakeAdapter {
+    /// `creates`: 예약 생성 호출에 차례로 돌려줄 응답
     pub fn new(
         capabilities: Capabilities,
-        responses: Vec<Result<ProviderBooking, ProviderError>>,
+        creates: Vec<Result<ProviderBooking, ProviderError>>,
     ) -> Self {
         Self {
             capabilities,
-            responses: Mutex::new(responses.into()),
-            calls: AtomicUsize::new(0),
+            creates: Mutex::new(creates.into()),
+            finds: Mutex::new(VecDeque::new()),
+            create_calls: AtomicUsize::new(0),
+            find_calls: AtomicUsize::new(0),
         }
     }
 
-    pub fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
+    /// 참조값 조회 호출에 차례로 돌려줄 응답
+    pub fn with_finds(self, finds: Vec<Result<Option<ProviderBooking>, ProviderError>>) -> Self {
+        *self
+            .finds
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다") = finds.into();
+        self
+    }
+
+    pub fn create_calls(&self) -> usize {
+        self.create_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn find_calls(&self) -> usize {
+        self.find_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -185,17 +207,59 @@ impl ProviderAdapter for FakeAdapter {
         self.capabilities
     }
 
-    async fn create_booking(
-        &self,
-        _request: &CreateBooking,
-    ) -> Result<ProviderBooking, ProviderError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.responses
+    async fn create_booking(&self, _request: &CreateBooking) -> AdapterReply<ProviderBooking> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
+        self.creates
             .lock()
             .expect("테스트 중에는 잠금이 오염되지 않는다")
             .pop_front()
             .unwrap_or(Err(ProviderError::Server { status: 599 }))
+            .into()
     }
+
+    async fn find_booking(&self, _reference: BookingId) -> AdapterReply<Option<ProviderBooking>> {
+        self.find_calls.fetch_add(1, Ordering::SeqCst);
+        self.finds
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다")
+            .pop_front()
+            .unwrap_or(Err(ProviderError::Server { status: 599 }))
+            .into()
+    }
+}
+
+/// 워커 판단만 보려고 장애 대응 계층을 사실상 끈 정책: 호출 내 재시도 없음, 넉넉한 rate limit, 잘 열리지 않는 서킷
+pub fn single_attempt_policy() -> ProviderPolicy {
+    ProviderPolicy {
+        retry: RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        },
+        rate_limit: RateLimitPolicy {
+            per_second: 10_000,
+            burst: 10_000,
+            max_wait_ms: 100,
+        },
+        circuit_breaker: CircuitBreakerPolicy {
+            window: 1_000,
+            min_calls: 1_000,
+            ..CircuitBreakerPolicy::default()
+        },
+        ..ProviderPolicy::default()
+    }
+}
+
+/// 어댑터를 alpha 업체로서 장애 대응 계층으로 감싼다 (호출 기록은 버림)
+pub fn resilient(
+    adapter: Arc<dyn ProviderAdapter>,
+    policy: ProviderPolicy,
+) -> Arc<ResilientProvider> {
+    Arc::new(ResilientProvider::new(
+        ProviderId::parse("alpha").expect("올바른 업체 ID"),
+        adapter,
+        policy,
+        CallRecorder::discard(),
+    ))
 }
 
 pub const IDEMPOTENT: Capabilities = Capabilities {

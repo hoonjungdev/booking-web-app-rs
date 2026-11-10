@@ -107,6 +107,13 @@ provider.attempt 완료 ──try_send──▶ [mpsc 채널, 용량 10,000] ─
 ```
 "관측 때문에 서비스가 느려지면 안 된다"는 원칙을 따른다. Rust의 채널과 배압(backpressure)을 연습하기에도 좋다.
 
+**구현 (Phase 3)**
+- 보내는 쪽은 `providers::CallRecorder`(`crates/providers/src/recorder.rs`), 받아서 저장하는 쪽은 `booking_server::recorder::run`이다. providers가 db에 의존하지 않도록 나눴다 ([D-18](decisions.md#d-18-호출-기록은-providers가-채널로-보내고-db-저장은-booking-server가-맡는다)).
+- 첫 기록을 받으면 1초 동안(또는 500건이 찰 때까지) 더 모아 `INSERT` 한 번으로 넣는다. 저장에 실패한 배치는 로그를 남기고 버린다 (예약 상태의 원본은 `bookings` · `booking_events`이고, 기록은 분석용이다).
+- 관문에서 막혀 업체를 부르지 않은 시도도 `circuit_open` / `throttled`로 기록한다.
+- 버린 건수는 `CallRecorder::dropped()`로 센다. `provider_calls.recorder.dropped` 메트릭은 Phase 4에서 붙인다.
+- 서버가 멈출 때는 워커가 먼저 끝나 보내는 쪽이 모두 사라지면, 기록 태스크가 남은 기록을 저장하고 끝난다.
+
 ## 7. 분석 쿼리 (관리자 통계 API의 기반)
 
 구간별 p50/p95/p99와 결과 분포:

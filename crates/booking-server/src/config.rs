@@ -9,7 +9,8 @@
 //! | `BOOKING_DB_MAX_CONNECTIONS` | `10` |
 //! | `BOOKING_WORKER_CONCURRENCY` | `4` |
 //! | `BOOKING_WORKER_POLL_INTERVAL_MS` | `500` |
-//! | `BOOKING_WORKER_LEASE_SECS` | `60` |
+//! | `BOOKING_WORKER_LEASE_SECS` | `60` (업체 호출 최대 시간 + 5초 이상이어야 한다. 짧으면 서버가 시작하지 않는다) |
+//! | `BOOKING_WORKER_UNKNOWN_RECHECK_SECS` | `30` |
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -31,6 +32,9 @@ pub struct Config {
     pub worker_poll_interval_ms: u64,
     #[serde(default = "defaults::worker_lease_secs")]
     pub worker_lease_secs: u64,
+    /// 결과 불명 예약을 업체에서 찾지 못했을 때 다시 조회하기까지의 간격
+    #[serde(default = "defaults::worker_unknown_recheck_secs")]
+    pub worker_unknown_recheck_secs: u64,
 }
 
 impl Config {
@@ -51,6 +55,9 @@ impl Config {
             concurrency: self.worker_concurrency.max(1),
             poll_interval: Duration::from_millis(self.worker_poll_interval_ms),
             lease: Duration::from_secs(self.worker_lease_secs),
+            unknown_recheck_interval: Duration::from_secs(self.worker_unknown_recheck_secs),
+            // 재시도 간격은 설계 값(5초 → 최대 10분)을 그대로 쓴다
+            ..WorkerConfig::default()
         }
     }
 }
@@ -77,5 +84,9 @@ mod defaults {
 
     pub fn worker_lease_secs() -> u64 {
         60
+    }
+
+    pub fn worker_unknown_recheck_secs() -> u64 {
+        30
     }
 }

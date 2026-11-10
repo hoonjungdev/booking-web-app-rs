@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE jobs\n        SET status = 'running',\n            attempts = attempts + 1,\n            locked_until = now() + make_interval(secs => $1),\n            updated_at = now()\n        WHERE id = (\n            SELECT id FROM jobs\n            WHERE (status = 'queued' AND run_at <= now())\n               OR (status = 'running' AND locked_until < now())\n            ORDER BY run_at\n            LIMIT 1\n            FOR UPDATE SKIP LOCKED\n        )\n        RETURNING id, kind, booking_id, attempts, max_attempts\n        ",
+  "query": "\n        UPDATE jobs\n        SET status = 'running',\n            attempts = attempts + 1,\n            locked_until = now() + make_interval(secs => $1),\n            updated_at = now()\n        WHERE id = (\n            SELECT id FROM jobs\n            WHERE (status = 'queued' AND run_at <= now())\n               OR (status = 'running' AND locked_until < now())\n            ORDER BY run_at\n            LIMIT 1\n            FOR UPDATE SKIP LOCKED\n        )\n        RETURNING id, kind, booking_id, attempts, max_attempts, payload\n        ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,17 @@
             "name": "max_attempts"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "payload"
+          }
+        }
       }
     ],
     "parameters": {
@@ -69,8 +80,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "35e6d498ba1e16e7cc4435f71a0089acbce8c7f63d442a67e75d1c096765859f"
+  "hash": "1c5350b7d81d5d376eb09648d2f23c4972fa6d3779f1e2a7ab1b7690d6d5c5f0"
 }
