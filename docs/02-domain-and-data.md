@@ -79,12 +79,23 @@ pub enum BookingEvent {
 
 impl BookingStatus {
     /// 허용되지 않은 전이는 Err를 돌려준다.
-    /// 모든 경우를 match로 처리하므로 상태나 사건을 하나 추가하면
-    /// 컴파일러가 처리가 빠진 곳을 알려 준다.
     pub fn apply(self, event: &BookingEvent) -> Result<BookingStatus, InvalidTransition> {
-        todo!()
+        match (self, event) {
+            (Self::Pending, BookingEvent::ProviderConfirmed { .. }) => Ok(Self::Confirmed),
+            // ... 전이표의 13개 전이
+            (from, event) => Err(InvalidTransition { from, event: event.name() }),
+        }
     }
 }
+```
+
+`apply`에는 나머지를 모두 거절하는 `(from, event) => Err(..)` 줄이 있어서, 상태를 추가해도 컴파일러가 `apply`에서 빠진 곳을 알려 주지는 않는다.
+대신 단위 테스트가 다음 두 가지로 이를 보완한다 (`crates/domain/src/status.rs`).
+- 모든 상태 × 모든 사건 조합을 위 전이표와 비교한다.
+- 상태 · 사건 목록을 `_` 없이 나열한 `match`를 둬서, 목록에 빠진 값이 있으면 컴파일이 되지 않게 한다.
+
+```rust
+// (구현은 crates/domain 참고)
 ```
 
 상태 전이 규칙은 `domain` 크레이트에 순수 함수로 두고, DB 없이 단위 테스트로 모든 전이를 검증한다.
@@ -215,6 +226,12 @@ CREATE TABLE reconciliation_issues (
 
 관리자 인증용 `admin_users` 테이블은 Phase 6에서 추가한다.
 
+### 구현 메모 (Phase 2)
+- 테이블은 그 기능을 만드는 Phase에서 마이그레이션으로 추가한다. Phase 2 마이그레이션(`migrations/20261110000001_create_booking_core.sql`)에는 `api_clients`, `providers`, `bookings`, `booking_events`, `jobs`만 있다. `provider_calls`는 Phase 3, `reconciliation_issues`는 Phase 6.
+- `bookings.status`와 `jobs.status`에는 허용 값 CHECK 제약을 걸었다. 상태를 추가하려면 제약을 바꾸는 새 마이그레이션이 필요하다.
+- 같은 마이그레이션이 로컬 개발용 업체 `alpha`(`http://127.0.0.1:9090/alpha/v1`)를 넣는다. 다른 환경에서는 `providers.base_url`을 그 환경 주소로 바꾼다.
+- 고객 정보(`customer`)는 API 응답에 넣지 않고, 로그에 찍혀도 `Debug`에서 `***`로 가려진다.
+
 ## 5. 작업 큐 동작
 
 별도 메시지 브로커(RabbitMQ, Kafka) 없이 PostgreSQL 테이블로 작업 큐를 만든다. → [D-03](decisions.md#d-03-예약-생성은-비동기202--postgresql-작업-큐)
@@ -254,6 +271,10 @@ RETURNING *;
 | 횟수 소진 또는 기한 초과 | `status = 'dead'`, 예약을 `failed` 또는 `cancel_failed`로 전이. 관리자 화면에 표시 |
 
 폴링 간격은 500ms로 시작한다. 지연을 더 줄이고 싶으면 나중에 PostgreSQL `LISTEN/NOTIFY`로 워커를 깨우는 방식을 더한다.
+
+**lease와 fencing**: 작업을 가져갈 때 늘어난 `attempts` 값이 "이 작업을 쥐고 있다"는 증표다. 완료 · 재예약 · 포기 SQL은 모두 `WHERE id = $1 AND status = 'running' AND attempts = $n`으로 이 증표를 확인한다. 처리 도중 lease가 만료되어 다른 워커가 같은 작업을 다시 가져가면 `attempts`가 또 늘어나므로, 늦게 끝난 원래 워커의 결과는 반영되지 않는다. 작업 완료와 예약 상태 전이는 한 트랜잭션으로 저장한다.
+
+**시각 기준**: `run_at`, `locked_until` 계산은 모두 DB의 `now()`로 한다. 서버가 여러 대여도 시계 하나를 기준으로 삼기 위해서다. 예약의 `deadline_at`만 API 서버가 접수 시각으로 계산한다.
 
 ## 6. 보관 정책
 

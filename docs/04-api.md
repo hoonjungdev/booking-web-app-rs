@@ -9,7 +9,8 @@
 | ID | UUID v7 문자열 |
 | 에러 | RFC 9457 Problem Details (`application/problem+json`). ASP.NET Core의 `ProblemDetails`와 같은 형식 |
 | 페이지네이션 | 커서 방식: `?limit=50&cursor=<불투명 문자열>` → 응답에 `next_cursor` |
-| 추적 | 모든 응답 헤더에 `X-Trace-Id`. 에러 본문에도 `trace_id` |
+| 추적 | 모든 응답 헤더에 `X-Trace-Id`. 에러 본문에도 `trace_id` (OpenTelemetry를 붙이는 Phase 4에서 추가) |
+| 인증 | `X-Api-Key` 헤더. 키는 `booking-server create-client --name <이름>`으로 발급하며, 발급할 때 한 번만 보여 준다 |
 | 문서 | `/openapi.json`, `/docs` (Swagger UI). utoipa로 코드에서 생성 |
 
 에러 예:

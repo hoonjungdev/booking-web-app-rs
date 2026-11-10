@@ -16,7 +16,7 @@ chrono.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-telemetry = { path = "../telemetry" }
+telemetry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

@@ -20,12 +20,13 @@
 **배우는 것**: cargo, 모듈, struct/enum, serde, axum 핸들러 · 라우터 · State, `Arc<Mutex<_>>`, async/await 기초
 
 ## Phase 2. 예약 API + DB + 워커
-- [ ] `domain`: 예약 상태 머신 + 전이 단위 테스트
-- [ ] 마이그레이션, `db` 크레이트 (sqlx)
-- [ ] `POST/GET /v1/bookings`, Idempotency-Key, API 키 인증, Problem Details 에러
-- [ ] `jobs` 큐 + 워커 (`submit_booking`)
-- [ ] alpha 어댑터 (타임아웃만 적용한 단순 호출)
-- [ ] graceful shutdown (Ctrl+C를 누르면 처리 중인 작업을 마무리하고 종료)
+- [x] `domain`: 예약 상태 머신 + 전이 단위 테스트 (8개 상태 × 11개 사건 전 조합 검사)
+- [x] 마이그레이션, `db` 크레이트 (sqlx, 오프라인 쿼리 데이터 `.sqlx/`)
+- [x] `POST/GET /v1/bookings`, Idempotency-Key, API 키 인증, Problem Details 에러
+- [x] `jobs` 큐 + 워커 (`submit_booking`, lease 만료 회수 · fencing)
+- [x] alpha 어댑터 (타임아웃만 적용한 단순 호출)
+- [x] graceful shutdown (Ctrl+C를 누르면 처리 중인 작업을 마무리하고 종료)
+- [x] `booking-server create-client` (API 키 발급), CI에 PostgreSQL 서비스와 `sqlx` 검사 추가
 
 **완료 기준**: 예약을 요청하면 몇 초 뒤 `confirmed`가 된다. 같은 Idempotency-Key로 두 번 보내도 업체 예약은 1건이다.
 **배우는 것**: `Result`와 `?`, thiserror, trait, sqlx 쿼리 매크로, 트랜잭션, `tokio::spawn`, CancellationToken
@@ -73,7 +74,8 @@
 ## Phase 7. 품질과 마무리
 - [ ] 부하 테스트 (oha / goose) + 결과 기록
 - [x] GitHub Actions CI: fmt, clippy, nextest, cargo-deny, cargo-shear (Phase 1에서 먼저 구축)
-- [ ] CI 확장: sqlx 오프라인 검사(Phase 2), 프론트 빌드 · 타입 생성 검사(Phase 5)
+- [x] CI 확장: sqlx 오프라인 검사 (Phase 2에서 구축)
+- [ ] CI 확장: 프론트 빌드 · 타입 생성 검사 (Phase 5)
 - [ ] Dockerfile (다단계 빌드), docker-compose로 전체 실행
 - [ ] 운영 문서 (장애 대응 런북)
 

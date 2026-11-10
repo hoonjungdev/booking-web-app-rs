@@ -65,3 +65,20 @@
 - 구성: `scripts/check.sh`(fmt · clippy · nextest · cargo-deny · cargo-shear), `rust-toolchain.toml`(1.99.1 고정), `[workspace.lints]`, `.claude/settings.json` 훅, `.github/workflows/ci.yml`, Dependabot
 - 결과: toolchain과 CI 도구 버전은 사람이 직접 올린다. Stop 훅 때문에 응답이 끝날 때마다 수 초가 더 걸린다 (Rust 변경이 없으면 건너뜀).
 - 대안: pre-commit 훅 (커밋할 때만 돌아서 Claude의 작업 중간 피드백이 늦음), `just`/`make` (도구 추가 설치 필요)
+
+### D-14. API 키는 256비트 무작위 값, DB에는 SHA-256 해시만 저장
+- 상태: 채택
+- 이유: 비밀번호는 사람이 정해 짧고 추측하기 쉬워서 느린 해시(argon2 등)가 필요하다. API 키는 서버가 만든 256비트 무작위 값이라, 빠른 해시로도 역산하거나 추측할 수 없다. 빠른 해시라서 요청마다 인증해도 비용이 거의 없고, 해시 값으로 바로 DB를 조회할 수 있다.
+- 결과: 키 원문은 발급할 때 한 번만 보여 준다(`booking-server create-client`). 잃어버리면 새로 발급한다.
+- 대안: argon2 (요청마다 수십 ms가 들고, 해시로 바로 조회할 수 없어 키에 별도 식별자가 필요함)
+
+### D-15. sqlx 쿼리 검사는 커밋된 오프라인 데이터(`.sqlx/`)로, 최신 여부는 별도 단계로 확인
+- 상태: 채택
+- 이유: CI와 Stop 훅에서 DB 없이 컴파일할 수 있다. SQL을 바꾸고 `cargo sqlx prepare`를 잊으면 바로 컴파일 에러가 난다.
+- 구성: `scripts/check.sh`가 `SQLX_OFFLINE=true`를 기본으로 쓴다. `sqlx` 단계는 마이그레이션을 적용한 뒤 `cargo sqlx prepare --check`로 `.sqlx/`가 스키마와 맞는지 확인한다. CI의 `test` · `sqlx` job에는 PostgreSQL 서비스 컨테이너를 붙인다.
+- 결과: 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`를 돌려 `.sqlx/`를 함께 커밋해야 한다. sqlx CLI 버전은 sqlx 크레이트(0.9.0)와 맞춘다.
+
+### D-16. 업체 어댑터는 `async-trait`으로 만든 `dyn` trait
+- 상태: 채택
+- 이유: 업체마다 다른 어댑터를 실행 중에 업체 ID로 골라 써야 해서 `Arc<dyn ProviderAdapter>`가 필요하다. Rust 1.99에서도 `async fn`이 있는 trait은 `dyn`으로 쓸 수 없어서(E0038) `async-trait` 크레이트로 해결한다. 호출마다 Future를 힙에 하나 할당하지만, 네트워크 호출에 비하면 무시할 만하다.
+- 대안: enum으로 어댑터를 나열해 `match`로 고르기 (업체를 추가할 때마다 enum과 모든 메서드를 고쳐야 하고, 테스트용 가짜 어댑터를 넣기 어려움)

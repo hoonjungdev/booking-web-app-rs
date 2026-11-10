@@ -29,6 +29,8 @@ impl LogFormat {
 ///
 /// 로그 수준은 `RUST_LOG` 환경 변수로 정한다 (예: `RUST_LOG=debug`).
 /// 없으면 `default_filter`를 쓴다 (예: `"info,mock_provider=debug"`).
+///
+/// 로그는 표준 에러(stderr)로 쓴다. 표준 출력(stdout)은 명령의 결과(예: 발급한 API 키)에 쓰기 위해 비워 둔다.
 pub fn init(default_filter: &str, format: LogFormat) -> Result<(), TryInitError> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
@@ -36,9 +38,16 @@ pub fn init(default_filter: &str, format: LogFormat) -> Result<(), TryInitError>
     let registry = tracing_subscriber::registry().with(filter);
 
     match format {
-        LogFormat::Compact => registry.with(fmt::layer().compact()).try_init(),
+        LogFormat::Compact => registry
+            .with(fmt::layer().compact().with_writer(std::io::stderr))
+            .try_init(),
         LogFormat::Json => registry
-            .with(fmt::layer().json().flatten_event(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(std::io::stderr),
+            )
             .try_init(),
     }
 }

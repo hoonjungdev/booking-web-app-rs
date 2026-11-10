@@ -1,0 +1,296 @@
+//! 예약 (`bookings`, `booking_events`)
+
+use chrono::{DateTime, Utc};
+use domain::{
+    Booking, BookingEvent, BookingId, BookingRequest, BookingStatus, ClientId, Customer, ProviderId,
+};
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+use crate::{
+    DbError, PgPool,
+    jobs::{self, JobKind},
+};
+
+/// 새로 접수할 예약
+#[derive(Debug, Clone)]
+pub struct NewBooking {
+    pub id: BookingId,
+    pub client_id: ClientId,
+    pub idempotency_key: String,
+    /// 요청 본문의 해시. 같은 멱등키로 다른 요청이 왔는지 가려낸다.
+    pub request_hash: Vec<u8>,
+    pub request: BookingRequest,
+    pub deadline_at: DateTime<Utc>,
+}
+
+/// 접수 결과
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// 새로 저장함 (예약 + 상태 이력 + 작업)
+    Created(Booking),
+    /// 같은 클라이언트 · 같은 멱등키의 예약이 이미 있음. `same_request`는 요청 해시가 같은지
+    Existing {
+        booking: Booking,
+        same_request: bool,
+    },
+}
+
+/// 상태 전이 결과
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transitioned {
+    /// 바뀜
+    Applied(BookingStatus),
+    /// 그사이 다른 곳에서 상태를 먼저 바꿔서 아무것도 하지 않음 (낙관적 동시성 충돌)
+    Conflict,
+}
+
+/// 상태 이력 한 줄
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub from_status: Option<BookingStatus>,
+    pub to_status: BookingStatus,
+    pub reason: Option<String>,
+    pub actor: String,
+    pub at: DateTime<Utc>,
+}
+
+/// DB 행을 그대로 담는 구조체. sqlx 매크로가 컬럼 타입에 맞춰 채운다.
+/// 도메인 타입([`Booking`])과 분리해 두고 `TryFrom`으로 바꾼다 (≈ EF 엔티티와 도메인 모델 사이의 매핑).
+struct BookingRow {
+    id: Uuid,
+    client_id: Uuid,
+    provider_id: String,
+    resource_id: String,
+    slot_start: DateTime<Utc>,
+    party_size: i32,
+    customer: serde_json::Value,
+    status: String,
+    status_reason: Option<String>,
+    provider_booking_id: Option<String>,
+    deadline_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    request_hash: Vec<u8>,
+}
+
+impl TryFrom<BookingRow> for Booking {
+    type Error = DbError;
+
+    fn try_from(row: BookingRow) -> Result<Self, Self::Error> {
+        let customer: Customer = serde_json::from_value(row.customer).map_err(DbError::corrupt)?;
+        Ok(Booking {
+            id: BookingId::from_uuid(row.id),
+            client_id: ClientId::from_uuid(row.client_id),
+            request: BookingRequest {
+                provider: ProviderId::parse(&row.provider_id).map_err(DbError::corrupt)?,
+                resource_id: row.resource_id,
+                slot_start: row.slot_start,
+                party_size: u32::try_from(row.party_size).map_err(DbError::corrupt)?,
+                customer,
+            },
+            status: row.status.parse().map_err(DbError::corrupt)?,
+            status_reason: row.status_reason,
+            provider_booking_id: row.provider_booking_id,
+            deadline_at: row.deadline_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+/// 예약을 접수한다: 예약 · 상태 이력 · `submit_booking` 작업을 **한 트랜잭션**으로 저장한다.
+///
+/// 같은 클라이언트가 같은 멱등키로 이미 접수했으면 새로 만들지 않고 기존 예약을 돌려준다.
+/// 두 요청이 동시에 와도 `UNIQUE (client_id, idempotency_key)` 제약 때문에 한쪽만 저장된다.
+pub async fn accept(pool: &PgPool, new: &NewBooking) -> Result<AcceptOutcome, DbError> {
+    let customer = serde_json::to_value(&new.request.customer).map_err(DbError::corrupt)?;
+    let party_size = i32::try_from(new.request.party_size).map_err(DbError::corrupt)?;
+
+    // `begin`으로 트랜잭션을 시작한다. `commit` 전에 함수가 끝나면(에러로 `?` 반환 등) 자동으로 롤백된다.
+    // (≈ C#의 `using var tx = conn.BeginTransaction();` 후 Commit을 안 부르면 롤백되는 것)
+    let mut tx = pool.begin().await?;
+
+    let inserted = sqlx::query_as!(
+        BookingRow,
+        r#"
+        INSERT INTO bookings (id, client_id, idempotency_key, request_hash, provider_id, resource_id,
+                              slot_start, party_size, customer, status, deadline_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10)
+        ON CONFLICT ON CONSTRAINT bookings_idempotency_key DO NOTHING
+        RETURNING id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+                  status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        "#,
+        new.id.as_uuid(),
+        new.client_id.as_uuid(),
+        new.idempotency_key,
+        new.request_hash,
+        new.request.provider.as_str(),
+        new.request.resource_id,
+        new.request.slot_start,
+        party_size,
+        customer,
+        new.deadline_at,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match inserted {
+        Some(row) => {
+            insert_event(&mut tx, new.id, None, BookingStatus::Pending, None, "api").await?;
+            jobs::enqueue(
+                &mut tx,
+                JobKind::SubmitBooking,
+                Some(new.id),
+                jobs::DEFAULT_MAX_ATTEMPTS,
+            )
+            .await?;
+            AcceptOutcome::Created(row.try_into()?)
+        }
+        None => {
+            let row = sqlx::query_as!(
+                BookingRow,
+                r#"
+                SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+                       status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+                FROM bookings WHERE client_id = $1 AND idempotency_key = $2
+                "#,
+                new.client_id.as_uuid(),
+                new.idempotency_key,
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let same_request = row.request_hash == new.request_hash;
+            AcceptOutcome::Existing {
+                booking: row.try_into()?,
+                same_request,
+            }
+        }
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// 예약 하나 (클라이언트 구분 없이). 워커용.
+pub async fn get(pool: &PgPool, id: BookingId) -> Result<Option<Booking>, DbError> {
+    let row = sqlx::query_as!(
+        BookingRow,
+        r#"
+        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        FROM bookings WHERE id = $1
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.map(Booking::try_from).transpose()
+}
+
+/// 클라이언트 자신의 예약 하나. 다른 클라이언트의 예약이면 `None`.
+pub async fn find_for_client(
+    pool: &PgPool,
+    client_id: ClientId,
+    id: BookingId,
+) -> Result<Option<Booking>, DbError> {
+    let row = sqlx::query_as!(
+        BookingRow,
+        r#"
+        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        FROM bookings WHERE id = $1 AND client_id = $2
+        "#,
+        id.as_uuid(),
+        client_id.as_uuid(),
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.map(Booking::try_from).transpose()
+}
+
+/// 상태를 바꾸고 이력을 남긴다.
+///
+/// 다음 상태는 도메인의 [`BookingStatus::apply`]로만 정한다. 그래서 규칙에 없는 전이는 저장 단계에서 막힌다.
+/// `WHERE status = $from`: 읽은 뒤 다른 곳에서 상태가 바뀌었으면 아무 행도 바꾸지 않는다 (낙관적 동시성).
+pub async fn transition(
+    conn: &mut PgConnection,
+    id: BookingId,
+    from: BookingStatus,
+    event: &BookingEvent,
+    actor: &str,
+) -> Result<Transitioned, DbError> {
+    let to = from.apply(event)?;
+    let reason = event.reason();
+    let provider_booking_id = event.provider_booking_id();
+
+    let result = sqlx::query!(
+        "UPDATE bookings
+         SET status = $3, status_reason = $4,
+             provider_booking_id = COALESCE($5, provider_booking_id), updated_at = now()
+         WHERE id = $1 AND status = $2",
+        id.as_uuid(),
+        from.as_str(),
+        to.as_str(),
+        reason,
+        provider_booking_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Ok(Transitioned::Conflict);
+    }
+    insert_event(conn, id, Some(from), to, reason, actor).await?;
+    Ok(Transitioned::Applied(to))
+}
+
+/// 예약의 상태 이력 (오래된 것부터)
+pub async fn events(pool: &PgPool, id: BookingId) -> Result<Vec<EventRecord>, DbError> {
+    let rows = sqlx::query!(
+        "SELECT from_status, to_status, reason, actor, at
+         FROM booking_events WHERE booking_id = $1 ORDER BY id",
+        id.as_uuid(),
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(EventRecord {
+                from_status: r
+                    .from_status
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(DbError::corrupt)?,
+                to_status: r.to_status.parse().map_err(DbError::corrupt)?,
+                reason: r.reason,
+                actor: r.actor,
+                at: r.at,
+            })
+        })
+        .collect()
+}
+
+async fn insert_event(
+    conn: &mut PgConnection,
+    booking_id: BookingId,
+    from: Option<BookingStatus>,
+    to: BookingStatus,
+    reason: Option<String>,
+    actor: &str,
+) -> Result<(), DbError> {
+    let from = from.map(BookingStatus::as_str);
+    sqlx::query!(
+        "INSERT INTO booking_events (booking_id, from_status, to_status, reason, actor)
+         VALUES ($1, $2, $3, $4, $5)",
+        booking_id.as_uuid(),
+        from,
+        to.as_str(),
+        reason,
+        actor,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
+}

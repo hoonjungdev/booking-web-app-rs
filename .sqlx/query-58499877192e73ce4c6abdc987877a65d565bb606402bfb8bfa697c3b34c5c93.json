@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, display_name, adapter_kind, base_url, enabled, policy\n         FROM providers WHERE enabled ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "adapter_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "adapter_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "base_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "base_url"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "policy",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "policy"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "58499877192e73ce4c6abdc987877a65d565bb606402bfb8bfa697c3b34c5c93"
+}

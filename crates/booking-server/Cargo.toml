@@ -10,3 +10,29 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+db.workspace = true
+domain.workspace = true
+dotenvy.workspace = true
+figment.workspace = true
+providers.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+telemetry.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+mock-provider.workspace = true
+tower = { workspace = true, features = ["util"] }
