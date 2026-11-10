@@ -15,8 +15,19 @@ pub mod providers;
 
 use std::time::Duration;
 
+use chrono::{DateTime, SubsecRound, Utc};
+
 pub use error::DbError;
 pub use sqlx::{PgPool, Postgres, Transaction};
+
+/// 시각을 DB가 저장할 수 있는 정밀도(마이크로초)로 맞춘다. 그보다 작은 단위는 버린다.
+///
+/// PostgreSQL의 `timestamptz`는 마이크로초까지만 저장하는데, Linux에서 `Utc::now()`는 나노초까지 돌려준다.
+/// 그대로 저장하면 "넣은 값"과 "다시 읽은 값"이 달라지므로, 저장할 시각은 경계(API 입구)에서 미리 맞춰 둔다.
+/// (macOS는 시계가 마이크로초 단위라 이 차이가 드러나지 않아서, 로컬에서는 통과하고 CI(Linux)에서만 실패했었다)
+pub fn normalize_timestamp(time: DateTime<Utc>) -> DateTime<Utc> {
+    time.trunc_subsecs(6)
+}
 
 /// `migrations/` 폴더의 SQL을 컴파일할 때 실행 파일 안에 넣어 둔다. 서버 시작 시 `MIGRATOR.run(&pool)`로 적용한다.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");

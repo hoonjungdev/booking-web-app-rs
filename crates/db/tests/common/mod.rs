@@ -20,7 +20,8 @@ pub fn request() -> BookingRequest {
     BookingRequest {
         provider: ProviderId::parse("alpha").expect("올바른 업체 ID"),
         resource_id: "store-001".into(),
-        slot_start: Utc::now() + TimeDelta::days(1),
+        // 저장 후 다시 읽은 값과 비교하므로 DB 정밀도(마이크로초)로 맞춘다 (Linux의 Utc::now()는 나노초까지 있다)
+        slot_start: db::normalize_timestamp(Utc::now() + TimeDelta::days(1)),
         party_size: 2,
         customer: Customer {
             name: "홍길동".into(),

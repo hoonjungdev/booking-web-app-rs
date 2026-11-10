@@ -85,7 +85,8 @@ pub async fn create(
     let request = BookingRequest {
         provider,
         resource_id: body.resource_id,
-        slot_start: body.slot_start,
+        // DB 정밀도(마이크로초)로 맞춘다. 그래야 요청 해시를 계산하는 값 = 저장되는 값 = 다시 읽는 값이 된다.
+        slot_start: db::normalize_timestamp(body.slot_start),
         party_size: body.party_size,
         customer: body.customer,
     };

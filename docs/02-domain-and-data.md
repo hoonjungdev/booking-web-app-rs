@@ -231,6 +231,7 @@ CREATE TABLE reconciliation_issues (
 - `bookings.status`와 `jobs.status`에는 허용 값 CHECK 제약을 걸었다. 상태를 추가하려면 제약을 바꾸는 새 마이그레이션이 필요하다.
 - 같은 마이그레이션이 로컬 개발용 업체 `alpha`(`http://127.0.0.1:9090/alpha/v1`)를 넣는다. 다른 환경에서는 `providers.base_url`을 그 환경 주소로 바꾼다.
 - 고객 정보(`customer`)는 API 응답에 넣지 않고, 로그에 찍혀도 `Debug`에서 `***`로 가려진다.
+- `timestamptz`는 마이크로초까지만 저장한다. 그런데 Linux의 `Utc::now()`는 나노초까지 돌려주므로, 저장할 시각은 API 입구에서 `db::normalize_timestamp`로 마이크로초에 맞춘다. 그래야 요청 해시를 계산한 값, 저장한 값, 다시 읽은 값이 같다. (macOS는 시계가 마이크로초 단위라 로컬에서는 이 차이가 드러나지 않는다)
 
 ## 5. 작업 큐 동작
 

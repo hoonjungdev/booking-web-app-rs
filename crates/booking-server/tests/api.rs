@@ -292,6 +292,48 @@ async fn 다른_클라이언트의_예약이나_잘못된_id는_404(pool: PgPool
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }
 
+/// 회귀 테스트: PostgreSQL은 시각을 마이크로초까지만 저장한다.
+/// 나노초가 붙은 시각(Linux의 `Utc::now()`가 이렇다)이 와도 입구에서 마이크로초로 맞추므로,
+/// 같은 시각을 마이크로초로 다시 보내면 같은 요청으로 본다 (맞추지 않으면 해시가 달라 422가 난다).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 나노초가_붙은_시각은_마이크로초로_맞춰_접수한다(pool: PgPool) {
+    let app = common::app(&pool);
+    let client = create_client(&pool, "app").await;
+    let headers = [
+        ("x-api-key", client.api_key.as_str()),
+        ("idempotency-key", "order-ns"),
+    ];
+    let tomorrow = (Utc::now() + TimeDelta::days(1)).date_naive();
+    let with_nanos = format!("{tomorrow}T10:00:00.123456789Z");
+    let micros_only = format!("{tomorrow}T10:00:00.123456Z");
+
+    let created = send(
+        &app,
+        Method::POST,
+        "/v1/bookings",
+        &headers,
+        Some(&booking_body(&with_nanos)),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+    let created = created.booking();
+    assert_eq!(
+        created.slot_start,
+        micros_only.parse::<DateTime<Utc>>().unwrap()
+    );
+
+    let replay = send(
+        &app,
+        Method::POST,
+        "/v1/bookings",
+        &headers,
+        Some(&booking_body(&micros_only)),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::ACCEPTED);
+    assert_eq!(replay.booking().id, created.id);
+}
+
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn 헬스_체크(pool: PgPool) {
     let app = common::app(&pool);

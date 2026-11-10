@@ -64,7 +64,8 @@ run_test() {
   require cargo-nextest "brew install cargo-nextest"
   require_db
   step "test: 단위 · 통합 테스트 (nextest)"
-  cargo nextest run --workspace --all-features --locked --no-tests=pass
+  # --no-fail-fast: 실패가 있어도 끝까지 돌려 실패를 한 번에 모두 보여 준다
+  cargo nextest run --workspace --all-features --locked --no-tests=pass --no-fail-fast
   step "test: 문서 테스트"
   cargo test --workspace --all-features --locked --doc
 }
