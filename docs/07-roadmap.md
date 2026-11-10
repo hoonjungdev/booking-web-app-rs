@@ -32,15 +32,21 @@
 **배우는 것**: `Result`와 `?`, thiserror, trait, sqlx 쿼리 매크로, 트랜잭션, `tokio::spawn`, CancellationToken
 
 ## Phase 3. 장애 대응 계층
-- [ ] `ProviderError` 분류
-- [ ] `ResilientProvider`: 재시도(백오프 + jitter), 시도 타임아웃, 전체 예산
-- [ ] rate limiter (governor), bulkhead (Semaphore), 업체 pause
-- [ ] 서킷 브레이커 직접 구현 + 단위 테스트
-- [ ] 결과 불명 처리 (`resolve_unknown`)
-- [ ] 호출 기록기 (`provider_calls`, mpsc 배치 INSERT)
-- [ ] 장애 시나리오 통합 테스트 ([03-resilience.md §10](03-resilience.md#10-장애-시나리오와-기대-동작))
+- [x] `ProviderError` 분류 (`CircuitOpen` · `Throttled` 추가, 분류별 재시도 안전성 · 서킷 집계)
+- [x] `ResilientProvider`: 재시도(백오프 + jitter), 시도 타임아웃, 전체 예산
+- [x] rate limiter (governor), bulkhead (Semaphore), 업체 pause
+- [x] 서킷 브레이커 직접 구현 + 단위 테스트
+- [x] 결과 불명 처리 (`resolve_unknown`), 우리 쪽에서 막힌 작업은 시도 횟수를 쓰지 않고 미루기
+- [x] 호출 기록기 (`provider_calls`, mpsc 배치 INSERT)
+- [x] 장애 시나리오 통합 테스트 ([03-resilience.md §10](03-resilience.md#10-장애-시나리오와-기대-동작)): 정상 · 간헐적 5xx · 지연 폭증 · 호출 제한(2종) · 응답 유실 · 완전 장애 · 멱등키 없는 업체의 결과 불명
 
 **완료 기준**: `flaky` / `slow` / `throttled` / `lossy` / `outage` 시나리오 테스트를 통과하고, 이중 예약이 0건이다.
+
+뒤로 미룬 것 (다른 Phase에서 함께 하는 편이 자연스러운 것):
+- 워커의 업체별 동시 처리 제한, "한 업체만 장애" 격리 시나리오 → 두 번째 업체가 생기는 Phase 6 ([D-19](decisions.md#d-19-워커의-업체별-동시-처리-제한은-두-번째-업체phase-6와-함께-만든다))
+- "업체측 취소" 시나리오 → 대사 작업과 함께 Phase 6
+- 장애 대응 메트릭(재시도 수, 서킷 상태, 버린 기록 수 등) → Phase 4. 지금은 로그와 `provider_calls`로 확인한다
+- `provider_calls` 30일 보관 정리 작업 → 정리 작업(`jobs` 7일 보관)과 함께 Phase 7
 **배우는 것**: 제네릭, trait 객체(`dyn`), `Arc`와 공유 상태, 채널, `tokio::time`, 테스트 작성법
 
 ## Phase 4. 관측
@@ -63,6 +69,8 @@
 **완료 기준**: 관리자 웹에서 장애 주입 → 대시보드에서 서킷 Open 확인 → 복구 → dead 작업 재처리까지 화면만으로 할 수 있다.
 
 ## Phase 6. 두 번째 업체 + 운영 기능
+- [ ] 멱등키 없는 업체 호출 직전 "보냄" 표시: 보낸 뒤 결과를 저장하기 전에 워커가 죽어도 다시 보내지 않고 `unknown`으로 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)의 알려진 한계)
+- [ ] 워커의 업체별 동시 처리 제한 + "한 업체만 장애" 시나리오 테스트 ([D-19](decisions.md#d-19-워커의-업체별-동시-처리-제한은-두-번째-업체phase-6와-함께-만든다))
 - [ ] mock beta + beta 어댑터 (시간대 변환, 200으로 오는 에러, 503 rate limit)
 - [ ] 취소 흐름 (`cancel_booking`)
 - [ ] 대사 작업 + 이슈 화면

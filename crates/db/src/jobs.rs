@@ -17,16 +17,20 @@ use crate::{DbError, PgPool};
 /// 작업 하나가 최대 몇 번까지 시도되는가 (docs/03-resilience.md §4)
 pub const DEFAULT_MAX_ATTEMPTS: i32 = 8;
 
-/// 작업 종류. Phase 3 이후 `resolve_unknown`, `cancel_booking` 등이 추가된다.
+/// 작업 종류. Phase 6에서 `cancel_booking`, `reconcile_provider`가 추가된다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
+    /// 접수한 예약을 업체에 제출한다
     SubmitBooking,
+    /// 결과 불명(`unknown`)인 예약을 업체에서 조회해 확인한다 (docs/03-resilience.md §5)
+    ResolveUnknown,
 }
 
 impl JobKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitBooking => "submit_booking",
+            Self::ResolveUnknown => "resolve_unknown",
         }
     }
 }
@@ -37,6 +41,7 @@ impl FromStr for JobKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "submit_booking" => Ok(Self::SubmitBooking),
+            "resolve_unknown" => Ok(Self::ResolveUnknown),
             other => Err(DbError::corrupt(format!("알 수 없는 작업 종류: {other}"))),
         }
     }
@@ -52,6 +57,8 @@ pub struct Job {
     /// 이번이 몇 번째 시도인가 (가져갈 때 1 늘어난 값)
     pub attempts: i32,
     pub max_attempts: i32,
+    /// 작업 종류별 진행 상황 (예: `resolve_unknown`이 "없음"을 확인한 횟수)
+    pub payload: serde_json::Value,
 }
 
 impl Job {
@@ -81,6 +88,7 @@ pub struct JobRecord {
     pub max_attempts: i32,
     pub run_at: DateTime<Utc>,
     pub last_error: Option<String>,
+    pub payload: serde_json::Value,
 }
 
 /// 작업을 등록한다. 보통 예약 저장과 같은 트랜잭션 안에서 부른다.
@@ -122,7 +130,7 @@ pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, D
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, kind, booking_id, attempts, max_attempts
+        RETURNING id, kind, booking_id, attempts, max_attempts, payload
         "#,
         lease.as_secs_f64(),
     )
@@ -135,6 +143,7 @@ pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, D
         booking_id: r.booking_id.map(BookingId::from_uuid),
         attempts: r.attempts,
         max_attempts: r.max_attempts,
+        payload: r.payload,
     }))
 }
 
@@ -173,6 +182,55 @@ pub async fn retry_later(
     Ok(result.rows_affected() == 1)
 }
 
+/// [`retry_later`]와 같지만 작업의 진행 상황(`payload`)도 함께 바꾼다. lease를 잃었으면 `false`.
+pub async fn retry_later_with_payload(
+    conn: &mut PgConnection,
+    lease: Lease,
+    delay: Duration,
+    error: &str,
+    payload: &serde_json::Value,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs
+         SET status = 'queued', run_at = now() + make_interval(secs => $3),
+             locked_until = NULL, last_error = $4, payload = $5, updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2",
+        lease.job_id,
+        lease.attempt,
+        delay.as_secs_f64(),
+        error,
+        payload,
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 업체를 부르지 않고 `delay` 뒤로 미룬다. lease를 잃었으면 `false`.
+///
+/// 서킷이 열려 있거나 업체가 쉬라고 해서 호출하지 않은 경우다. 실제로 시도하지 않았으므로
+/// 가져갈 때 늘린 `attempts`를 되돌린다 (docs/02-domain-and-data.md §5). 전체 기한은 예약의 `deadline_at`이 막는다.
+pub async fn defer(
+    conn: &mut PgConnection,
+    lease: Lease,
+    delay: Duration,
+    reason: &str,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs
+         SET status = 'queued', attempts = attempts - 1, run_at = now() + make_interval(secs => $3),
+             locked_until = NULL, last_error = $4, updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2",
+        lease.job_id,
+        lease.attempt,
+        delay.as_secs_f64(),
+        reason,
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// 더 시도하지 않는 작업(dead)으로 표시한다. 관리자 화면에서 확인 · 재처리 대상. lease를 잃었으면 `false`.
 pub async fn mark_dead(
     conn: &mut PgConnection,
@@ -194,7 +252,7 @@ pub async fn mark_dead(
 /// 예약에 딸린 작업 목록 (등록 순서대로)
 pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<JobRecord>, DbError> {
     let rows = sqlx::query!(
-        "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error
+        "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error, payload
          FROM jobs WHERE booking_id = $1 ORDER BY id",
         booking_id.as_uuid(),
     )
@@ -212,6 +270,7 @@ pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<Job
             max_attempts: r.max_attempts,
             run_at: r.run_at,
             last_error: r.last_error,
+            payload: r.payload,
         })
         .collect())
 }

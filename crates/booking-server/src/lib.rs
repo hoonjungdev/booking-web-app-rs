@@ -8,11 +8,13 @@
 //! | [`config`] | 환경 변수에서 설정 읽기 |
 //! | [`auth`] | API 키 발급 · 해시 · 요청 인증 |
 //! | [`api`] | 예약 API (`/v1/bookings`)와 헬스 체크 |
-//! | [`registry`] | 업체 ID → 어댑터 |
-//! | [`worker`] | 작업 큐 처리 (업체에 예약 제출) |
+//! | [`registry`] | 업체 ID → 장애 대응 파이프라인으로 감싼 업체 (`ResilientProvider`) |
+//! | [`worker`] | 작업 큐 처리 (업체에 예약 제출, 결과 불명 예약 확인) |
+//! | [`recorder`] | 업체 호출 기록을 모아 `provider_calls`에 저장 |
 
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod recorder;
 pub mod registry;
 pub mod worker;

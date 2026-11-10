@@ -169,6 +169,11 @@ mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업
 | `CancellationToken` | `tokio_util::sync::CancellationToken` | 정상 종료(graceful shutdown) |
 | `SemaphoreSlim` | `tokio::sync::Semaphore` | bulkhead |
 | `Channel<T>` | `tokio::sync::mpsc` | 호출 기록기 |
+| `Func<Task<T>>`를 받는 제네릭 메서드 | 제네릭 함수 + 클로저 (`F: FnMut() -> Fut`) | `ResilientProvider::call`: 재시도마다 클로저를 다시 불러 새 요청을 만든다 |
+| `task.WaitAsync(timeout)` | `tokio::time::timeout` | 시간 안에 끝나지 않으면 Future를 버린다 (요청 취소) |
+| `using` / `IDisposable` | `Drop` (값이 사라질 때 자동 정리) | bulkhead 자리(`SemaphorePermit`)는 drop될 때 반납된다 |
+| `Interlocked.Increment` | `AtomicU64::fetch_add` | 잠금 없이 여러 스레드가 함께 올리는 카운터 |
+| `System.Threading.RateLimiting` | governor | 업체별 rate limiter |
 | GC | 소유권(ownership)과 빌림(borrowing) | 여러 곳에서 공유하려면 `Arc<T>` (참조 카운트 포인터) |
 | `.csproj` / `.sln` | crate / workspace | |
 | `[Attribute]` | `#[derive(...)]`, 속성 매크로 | `#[derive(Serialize)]`는 JSON 직렬화 코드를 자동 생성 |

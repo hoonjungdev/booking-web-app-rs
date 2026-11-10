@@ -2,10 +2,12 @@
 //!
 //! 이후의 판단(재시도할지, 결과 불명으로 볼지, 서킷에 실패로 셀지)은 모두 이 분류만 보고 한다.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use domain::RejectReason;
 
+/// `Instant`는 단조 시계(monotonic clock)의 한 시점이다 (≈ C#의 `Stopwatch.GetTimestamp()` 값).
+/// 벽시계(`DateTime<Utc>`)와 달리 시스템 시각이 바뀌어도 뒤로 가지 않아서, "몇 초 뒤"를 계산할 때 쓴다.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
     /// 응답 시간 초과. 요청이 업체에 닿았는지 알 수 없다
@@ -32,6 +34,23 @@ pub enum ProviderError {
     /// 응답 형식이 계약과 다름
     #[error("응답 형식 오류: {detail}")]
     Decode { detail: String },
+    /// 서킷이 열려 있어서 호출하지 않음. `retry_at`이 지나면 다시 시도해 볼 수 있다
+    #[error("서킷이 열려 있어 호출하지 않음")]
+    CircuitOpen { retry_at: Instant },
+    /// 우리 쪽 rate limiter · bulkhead에서 대기 한도를 넘었거나, 업체가 쉬라고 해서(pause) 호출하지 않음
+    #[error("호출 대기 한도 초과 또는 업체 pause 중이라 호출하지 않음")]
+    Throttled { retry_at: Instant },
+}
+
+/// 서킷 브레이커가 이 결과를 어떻게 셀지 (docs/03-resilience.md §1 표의 "서킷 브레이커 집계" 열)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitVerdict {
+    /// 업체가 정상이라는 신호
+    Success,
+    /// 업체가 아프다는 신호
+    Failure,
+    /// 업체 상태와 상관없는 결과라 세지 않는다
+    Ignored,
 }
 
 impl ProviderError {
@@ -46,6 +65,8 @@ impl ProviderError {
             Self::Rejected { .. } => "rejected",
             Self::Client { .. } => "client_error",
             Self::Decode { .. } => "decode_error",
+            Self::CircuitOpen { .. } => "circuit_open",
+            Self::Throttled { .. } => "throttled",
         }
     }
 
@@ -54,12 +75,121 @@ impl ProviderError {
     /// `true`면 멱등키가 없는 업체에도 다시 보내도 중복 생성 위험이 없다.
     /// 타임아웃 · 5xx · 전송 오류 · 응답 해석 실패는 업체가 이미 처리했을 수 있으므로 `false`.
     pub fn definitely_not_processed(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Connect { .. }
-                | Self::RateLimited { .. }
-                | Self::Rejected { .. }
-                | Self::Client { .. }
-        )
+            | Self::RateLimited { .. }
+            | Self::Rejected { .. }
+            | Self::Client { .. }
+            | Self::CircuitOpen { .. }
+            | Self::Throttled { .. } => true,
+            Self::Timeout | Self::Transport { .. } | Self::Server { .. } | Self::Decode { .. } => {
+                false
+            }
+        }
+    }
+
+    /// 업체를 부르지 않고 우리 쪽에서 막았다면 다시 시도해 볼 시각.
+    ///
+    /// 이런 실패는 작업 시도 횟수로 세지 않는다 (docs/03-resilience.md §4).
+    pub fn blocked_until(&self) -> Option<Instant> {
+        match self {
+            Self::CircuitOpen { retry_at } | Self::Throttled { retry_at } => Some(*retry_at),
+            _ => None,
+        }
+    }
+
+    /// 서킷 브레이커 집계 방법
+    pub fn circuit_verdict(&self) -> CircuitVerdict {
+        match self {
+            // 업무적 거절은 업체가 정상적으로 일했다는 뜻이다
+            Self::Rejected { .. } => CircuitVerdict::Success,
+            Self::Timeout
+            | Self::Connect { .. }
+            | Self::Transport { .. }
+            | Self::Server { .. }
+            | Self::Decode { .. } => CircuitVerdict::Failure,
+            // 호출 제한과 우리 버그(4xx)는 업체 건강 상태와 상관없다. 우리 쪽에서 막은 것도 마찬가지
+            Self::RateLimited { .. }
+            | Self::Client { .. }
+            | Self::CircuitOpen { .. }
+            | Self::Throttled { .. } => CircuitVerdict::Ignored,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 모든 분류를 하나씩 (새 분류를 추가하면 아래 match가 컴파일되지 않아 여기도 고치게 된다)
+    fn all_errors() -> Vec<ProviderError> {
+        let now = Instant::now();
+        let errors = vec![
+            ProviderError::Timeout,
+            ProviderError::Connect { detail: "x".into() },
+            ProviderError::Transport { detail: "x".into() },
+            ProviderError::RateLimited { retry_after: None },
+            ProviderError::Server { status: 503 },
+            ProviderError::Rejected {
+                reason: RejectReason::SlotUnavailable,
+            },
+            ProviderError::Client {
+                status: 422,
+                body: String::new(),
+            },
+            ProviderError::Decode { detail: "x".into() },
+            ProviderError::CircuitOpen { retry_at: now },
+            ProviderError::Throttled { retry_at: now },
+        ];
+        for error in &errors {
+            match error {
+                ProviderError::Timeout
+                | ProviderError::Connect { .. }
+                | ProviderError::Transport { .. }
+                | ProviderError::RateLimited { .. }
+                | ProviderError::Server { .. }
+                | ProviderError::Rejected { .. }
+                | ProviderError::Client { .. }
+                | ProviderError::Decode { .. }
+                | ProviderError::CircuitOpen { .. }
+                | ProviderError::Throttled { .. } => {}
+            }
+        }
+        errors
+    }
+
+    #[test]
+    fn 분류_표와_일치한다() {
+        // (outcome, 처리 안 됐다고 확신, 서킷 집계) — docs/03-resilience.md §1
+        let expected = [
+            ("timeout", false, CircuitVerdict::Failure),
+            ("connect_error", true, CircuitVerdict::Failure),
+            ("transport_error", false, CircuitVerdict::Failure),
+            ("rate_limited", true, CircuitVerdict::Ignored),
+            ("server_error", false, CircuitVerdict::Failure),
+            ("rejected", true, CircuitVerdict::Success),
+            ("client_error", true, CircuitVerdict::Ignored),
+            ("decode_error", false, CircuitVerdict::Failure),
+            ("circuit_open", true, CircuitVerdict::Ignored),
+            ("throttled", true, CircuitVerdict::Ignored),
+        ];
+        let errors = all_errors();
+        assert_eq!(errors.len(), expected.len());
+        for (error, (outcome, not_processed, verdict)) in errors.iter().zip(expected) {
+            assert_eq!(error.outcome(), outcome);
+            assert_eq!(error.definitely_not_processed(), not_processed, "{outcome}");
+            assert_eq!(error.circuit_verdict(), verdict, "{outcome}");
+        }
+    }
+
+    #[test]
+    fn 우리_쪽에서_막은_실패만_재시도_시각을_알려_준다() {
+        for error in all_errors() {
+            let blocked = matches!(
+                error,
+                ProviderError::CircuitOpen { .. } | ProviderError::Throttled { .. }
+            );
+            assert_eq!(error.blocked_until().is_some(), blocked, "{error:?}");
+        }
     }
 }

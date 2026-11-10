@@ -32,8 +32,12 @@ curl -i -X POST http://127.0.0.1:8080/v1/bookings \
        \"customer\":{\"name\":\"홍길동\",\"phone\":\"010-0000-0000\"}}"
 # → 202 Accepted, Location: /v1/bookings/{id}. 잠시 뒤 GET으로 조회하면 status가 confirmed
 
-# mock 업체를 느리게 만들기
+# mock 업체를 느리게 만들기 (flaky, throttled, lossy, outage, healthy도 있음)
 curl -X POST http://127.0.0.1:9090/_chaos/alpha/preset/slow
+
+# 업체 호출 기록 (시도 1번 = 1행): 재시도 · 타임아웃 · 서킷 차단이 결과별로 쌓인다
+docker compose exec postgres psql -U booking -c \
+  "SELECT outcome, count(*), round(avg(duration_ms)) AS avg_ms FROM provider_calls GROUP BY 1 ORDER BY 2 DESC"
 ```
 
 품질 검사는 `scripts/check.sh`로 돌립니다 (CI와 같은 명령, PostgreSQL 필요).
@@ -44,4 +48,4 @@ curl -X POST http://127.0.0.1:9090/_chaos/alpha/preset/slow
 
 ## 진행 상태
 
-Phase 2 (예약 API + DB + 워커)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.
+Phase 3 (장애 대응 계층: 재시도 · 서킷 브레이커 · rate limit · bulkhead · 결과 불명 처리 · 호출 기록)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.

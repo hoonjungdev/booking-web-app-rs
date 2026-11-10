@@ -5,26 +5,41 @@
 //! 루프끼리(서버가 여러 대여도) 같은 작업을 동시에 처리하지 않는다.
 //!
 //! 종료 신호(`CancellationToken`)를 받으면 새 작업을 가져오지 않고, 처리 중이던 작업은 끝까지 마친 뒤 멈춘다.
+//!
+//! | 작업 | 하는 일 |
+//! |---|---|
+//! | `submit_booking` | 접수한 예약을 업체에 제출한다 (`submit`) |
+//! | `resolve_unknown` | 결과 불명인 예약을 업체에서 조회해 확인한다 (`resolve`) |
 
 mod backoff;
+mod resolve;
 mod submit;
 
 use std::{sync::Arc, time::Duration};
 
 use db::{
     PgPool,
-    jobs::{self, Job, JobKind},
+    bookings::{self, Transitioned},
+    jobs::{self, Job, JobKind, Lease},
 };
+use domain::{Booking, BookingEvent, BookingStatus};
+use providers::ProviderError;
+use rand::RngExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-pub use backoff::job_backoff;
-pub use submit::{Decision, decide};
+pub use backoff::JobBackoff;
+pub use resolve::{REQUIRED_NOT_FOUND_CHECKS, decide_resolution};
+pub use submit::decide;
 
 use crate::registry::ProviderRegistry;
 
 /// 워커 이름. `booking_events.actor`에 남는다.
 const ACTOR: &str = "worker";
+/// 미룬 작업을 다시 꺼내기까지 최소한 기다리는 시간 (같은 작업을 너무 자주 꺼내지 않도록)
+const MIN_DEFER: Duration = Duration::from_millis(200);
+/// 미룬 작업들이 같은 순간에 몰려 돌아오지 않도록 더하는 무작위 시간의 최대값
+const DEFER_JITTER: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerConfig {
@@ -34,6 +49,22 @@ pub struct WorkerConfig {
     pub poll_interval: Duration,
     /// 작업 하나를 쥐고 있을 수 있는 시간. 넘기면 다른 워커가 회수한다.
     pub lease: Duration,
+    /// 실패한 작업을 다시 시도하기까지의 간격
+    pub backoff: JobBackoff,
+    /// 결과 불명 예약을 업체에서 찾지 못했을 때, 다시 조회하기까지 기다리는 시간 (docs/03-resilience.md §5)
+    pub unknown_recheck_interval: Duration,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            poll_interval: Duration::from_millis(500),
+            lease: Duration::from_secs(60),
+            backoff: JobBackoff::default(),
+            unknown_recheck_interval: Duration::from_secs(30),
+        }
+    }
 }
 
 /// 워커가 공유하는 의존성 (≈ C#에서 생성자로 주입받는 서비스 묶음)
@@ -50,6 +81,31 @@ pub enum WorkerError {
     Db(#[from] db::DbError),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+}
+
+/// 업체 호출 결과를 보고 정한 다음 행동. 판단(`decide` 함수들)과 실행([`apply`])을 나눠
+/// 판단은 DB 없이 단위 테스트한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// 이 사건으로 예약 상태를 바꾸고 작업을 끝낸다. 바뀐 상태에 이어서 할 작업이 있으면 함께 등록한다.
+    Transition(BookingEvent),
+    /// 나중에 다시 시도한다. 시도 횟수를 하나 쓴다 (사유)
+    Retry(String),
+    /// 업체를 부르지 않고 우리 쪽에서 막혔다 (서킷 열림, 대기 한도 초과, 업체 pause).
+    /// 시도 횟수를 쓰지 않고 `wait` 뒤로 미룬다.
+    Defer { wait: Duration, reason: String },
+    /// 결과 불명 예약이 업체에 아직 없다. 확인한 횟수를 남기고 잠시 뒤 다시 조회한다.
+    Recheck { not_found_checks: u32 },
+    /// 더 시도하지 않고 포기한다 (사유)
+    GiveUp(String),
+}
+
+/// 우리 쪽에서 막힌 실패면 `Defer`를 만든다 (submit · resolve가 함께 쓰는 규칙)
+fn defer_if_blocked(error: &ProviderError, now: std::time::Instant) -> Option<Decision> {
+    error.blocked_until().map(|retry_at| Decision::Defer {
+        wait: retry_at.saturating_duration_since(now),
+        reason: error.to_string(),
+    })
 }
 
 /// 종료 신호가 올 때까지 워커 루프들을 돌린다.
@@ -109,6 +165,7 @@ pub async fn process_next(ctx: &WorkerContext) -> Result<bool, WorkerError> {
 async fn process(ctx: &WorkerContext, job: Job) -> Result<(), WorkerError> {
     match job.kind.parse::<JobKind>() {
         Ok(JobKind::SubmitBooking) => submit::handle(ctx, &job).await,
+        Ok(JobKind::ResolveUnknown) => resolve::handle(ctx, &job).await,
         Err(_) => {
             tracing::error!("알 수 없는 작업 종류라 처리하지 않는다");
             let mut conn = ctx.pool.acquire().await?;
@@ -116,4 +173,163 @@ async fn process(ctx: &WorkerContext, job: Job) -> Result<(), WorkerError> {
             Ok(())
         }
     }
+}
+
+/// 작업의 예약을 읽는다. 작업에 예약이 없거나 예약을 찾을 수 없으면 작업을 `dead`로 묻고 `None`.
+async fn load_booking(ctx: &WorkerContext, job: &Job) -> Result<Option<Booking>, WorkerError> {
+    let Some(booking_id) = job.booking_id else {
+        bury(ctx, job.lease(), "작업에 booking_id가 없습니다").await?;
+        return Ok(None);
+    };
+    tracing::Span::current().record("booking_id", tracing::field::display(booking_id));
+
+    let booking = bookings::get(&ctx.pool, booking_id).await?;
+    if booking.is_none() {
+        bury(ctx, job.lease(), "작업의 예약을 찾을 수 없습니다").await?;
+    }
+    Ok(booking)
+}
+
+/// 판단한 행동을 DB에 반영한다
+async fn apply(
+    ctx: &WorkerContext,
+    job: &Job,
+    booking: &Booking,
+    decision: Decision,
+) -> Result<(), WorkerError> {
+    let lease = job.lease();
+    let exhausted = job.attempts >= job.max_attempts;
+    match decision {
+        Decision::Transition(event) => finish(ctx, lease, booking, &event).await,
+        Decision::GiveUp(reason) => give_up(ctx, lease, booking, reason).await,
+        Decision::Retry(reason) if exhausted => {
+            give_up(ctx, lease, booking, format!("attempts_exhausted: {reason}")).await
+        }
+        Decision::Retry(reason) => {
+            let delay = ctx.config.backoff.delay(job.attempts, rand::rng().random());
+            tracing::info!(?delay, %reason, "나중에 다시 시도한다");
+            let mut conn = ctx.pool.acquire().await?;
+            if !jobs::retry_later(&mut conn, lease, delay, &reason).await? {
+                warn_lease_lost();
+            }
+            Ok(())
+        }
+        Decision::Defer { wait, reason } => {
+            let delay = wait.max(MIN_DEFER) + DEFER_JITTER.mul_f64(rand::rng().random());
+            tracing::info!(?delay, %reason, "업체를 부르지 않고 미룬다 (시도 횟수로 세지 않음)");
+            let mut conn = ctx.pool.acquire().await?;
+            if !jobs::defer(&mut conn, lease, delay, &reason).await? {
+                warn_lease_lost();
+            }
+            Ok(())
+        }
+        Decision::Recheck { .. } if exhausted => {
+            let reason = "attempts_exhausted: not_found_at_provider".to_owned();
+            give_up(ctx, lease, booking, reason).await
+        }
+        Decision::Recheck { not_found_checks } => {
+            let delay = ctx.config.unknown_recheck_interval;
+            tracing::info!(
+                ?delay,
+                not_found_checks,
+                "업체에 아직 없다. 잠시 뒤 다시 조회한다"
+            );
+            let payload = serde_json::json!({ "not_found_checks": not_found_checks });
+            let mut conn = ctx.pool.acquire().await?;
+            if !jobs::retry_later_with_payload(
+                &mut conn,
+                lease,
+                delay,
+                "not_found_at_provider",
+                &payload,
+            )
+            .await?
+            {
+                warn_lease_lost();
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 예약 상태 전이, 작업 완료, 이어서 할 작업 등록을 한 트랜잭션으로 저장한다.
+/// 하나만 저장되면 "확정됐는데 작업이 또 도는" 식의 불일치나, 상태만 바뀌고 처리할 작업이 없는 유실이 생기기 때문이다.
+async fn finish(
+    ctx: &WorkerContext,
+    lease: Lease,
+    booking: &Booking,
+    event: &BookingEvent,
+) -> Result<(), WorkerError> {
+    let mut tx = ctx.pool.begin().await?;
+    if !jobs::complete(&mut tx, lease).await? {
+        warn_lease_lost();
+        return Ok(()); // tx가 commit 없이 버려지면서 롤백된다
+    }
+    match bookings::transition(&mut tx, booking.id, booking.status, event, ACTOR).await? {
+        Transitioned::Applied(to) => {
+            if let Some(kind) = follow_up(to) {
+                jobs::enqueue(&mut tx, kind, Some(booking.id), jobs::DEFAULT_MAX_ATTEMPTS).await?;
+            }
+            tracing::info!(status = %to, "예약 상태를 바꿨다");
+        }
+        Transitioned::Conflict => tracing::warn!("그사이 예약 상태가 바뀌어 전이를 건너뛴다"),
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 예약이 이 상태가 되면 이어서 처리할 작업.
+/// `pending`이 되면 업체에 (다시) 제출하고, `unknown`이 되면 업체에서 조회해 확인한다.
+fn follow_up(status: BookingStatus) -> Option<JobKind> {
+    match status {
+        BookingStatus::Pending => Some(JobKind::SubmitBooking),
+        BookingStatus::Unknown => Some(JobKind::ResolveUnknown),
+        // 취소 작업(cancel_booking)은 Phase 6에서 추가한다
+        BookingStatus::Confirmed
+        | BookingStatus::Rejected
+        | BookingStatus::Failed
+        | BookingStatus::CancelRequested
+        | BookingStatus::Cancelled
+        | BookingStatus::CancelFailed => None,
+    }
+}
+
+/// 예약을 `failed`로, 작업을 `dead`로 만든다 (한 트랜잭션)
+async fn give_up(
+    ctx: &WorkerContext,
+    lease: Lease,
+    booking: &Booking,
+    reason: String,
+) -> Result<(), WorkerError> {
+    tracing::warn!(%reason, "예약 처리를 포기한다");
+    let mut tx = ctx.pool.begin().await?;
+    if !jobs::mark_dead(&mut tx, lease, &reason).await? {
+        warn_lease_lost();
+        return Ok(());
+    }
+    let event = BookingEvent::GaveUp { reason };
+    bookings::transition(&mut tx, booking.id, booking.status, &event, ACTOR).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 이미 다른 경로로 처리된 예약의 작업: 예약은 두고 작업만 끝낸다
+async fn complete_only(ctx: &WorkerContext, lease: Lease) -> Result<(), WorkerError> {
+    let mut conn = ctx.pool.acquire().await?;
+    if !jobs::complete(&mut conn, lease).await? {
+        warn_lease_lost();
+    }
+    Ok(())
+}
+
+/// 예약이 없는 등 작업 자체가 잘못된 경우: 작업만 `dead`로 남긴다
+async fn bury(ctx: &WorkerContext, lease: Lease, reason: &str) -> Result<(), WorkerError> {
+    tracing::error!(%reason, "처리할 수 없는 작업");
+    let mut conn = ctx.pool.acquire().await?;
+    jobs::mark_dead(&mut conn, lease, reason).await?;
+    Ok(())
+}
+
+fn warn_lease_lost() {
+    tracing::warn!("lease를 잃어 결과를 반영하지 않는다 (다른 워커가 이 작업을 다시 가져감)");
 }

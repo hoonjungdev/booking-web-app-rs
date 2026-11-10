@@ -19,6 +19,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["std", "clo
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
 figment = { version = "0.10.19", features = ["env"] }
+# 업체 호출 rate limit (GCRA 토큰 버킷). 기본 기능의 dashmap(키별 limiter) · quanta(고속 시계) · jitter는 쓰지 않는다.
+governor = { version = "0.10.4", default-features = false, features = ["std"] }
 rand = "0.10.3"
 # TLS 없이 http만 쓴다. 실제 업체(https)와 연동할 때 TLS feature를 추가한다.
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
