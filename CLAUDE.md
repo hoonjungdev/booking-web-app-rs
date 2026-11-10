@@ -51,8 +51,10 @@
 - 고객 이름 · 전화번호 같은 개인정보는 로그와 span 속성에 넣지 않는다.
 - 메트릭 라벨에 `booking_id`처럼 값이 끝없이 늘어나는 것을 넣지 않는다.
 - 시각은 UTC(`DateTime<Utc>`, DB는 `timestamptz`), ID는 UUID v7.
-- DB 쿼리는 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace`로 `.sqlx/`를 갱신해서 함께 커밋한다.
+- DB 쿼리는 `db` 크레이트에 두고 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`로 `.sqlx/`를 갱신해서 함께 커밋한다 (`scripts/check.sh`는 `.sqlx/`로 오프라인 검사하므로, 갱신하지 않으면 컴파일 에러가 난다). 테스트에서 준비용으로만 쓰는 SQL은 검사 없는 `sqlx::query(...)`를 써도 된다.
+- 예약 상태는 `db::bookings::transition`(내부에서 `BookingStatus::apply` 호출)으로만 바꾼다. `bookings.status`를 직접 UPDATE하지 않는다 (테스트 준비 코드 제외).
 - 이미 적용된 마이그레이션 파일은 수정하지 않는다. 바꿀 것이 있으면 새 마이그레이션을 추가한다.
+- 통합 테스트(`tests/`)의 헬퍼 함수에서는 `unwrap()` 대신 `expect("이유")`를 쓴다. clippy의 테스트 예외는 `#[test]` 함수 안에만 적용되기 때문이다.
 - 코드를 바꾼 뒤에는 `cargo fmt`와 `cargo clippy`를 통과시킨다.
 
 ### 관리자 웹 (`web/admin`)
@@ -65,9 +67,9 @@
 검사는 `scripts/check.sh` 한 곳에 정의되어 있고, 로컬 · Claude Code 훅 · CI가 모두 이 스크립트를 쓴다. 검사 내용을 바꿀 때는 이 스크립트만 고친다.
 
 ```bash
-scripts/check.sh          # 전체: fmt → clippy → test → deny → shear (CI와 동일)
-scripts/check.sh fast     # fmt + clippy (Stop 훅이 쓰는 빠른 검사)
-scripts/check.sh test     # 단계별 실행: fmt | clippy | test | deny | shear
+scripts/check.sh          # 전체: fmt → clippy → test → sqlx → deny → shear (CI와 동일)
+scripts/check.sh fast     # fmt + clippy (Stop 훅이 쓰는 빠른 검사, DB 불필요)
+scripts/check.sh test     # 단계별 실행: fmt | clippy | test | sqlx | deny | shear
 cargo fmt --all           # 포맷 자동 수정
 ```
 
@@ -75,12 +77,13 @@ cargo fmt --all           # 포맷 자동 수정
 |---|---|---|
 | fmt | rustfmt | 포맷 (`rustfmt.toml`) |
 | clippy | clippy `-D warnings` | 버그 패턴, 그리고 CLAUDE.md 규칙 위반: `unwrap`, `println!`, `dbg!`, `todo!` 등 (`Cargo.toml`의 `[workspace.lints]`) |
-| test | cargo-nextest + doctest | 테스트 실패 |
+| test | cargo-nextest + doctest | 테스트 실패. DB 테스트(`#[sqlx::test]`)가 있어서 PostgreSQL이 떠 있어야 한다 |
+| sqlx | sqlx-cli | 마이그레이션 적용 후 `.sqlx/`가 스키마와 맞는지 (`cargo sqlx prepare --check`) |
 | deny | cargo-deny | 보안 권고, 허용하지 않은 라이선스, 출처 불명 의존성 (`deny.toml`) |
 | shear | cargo-shear | `Cargo.toml`에 선언했지만 쓰지 않는 의존성 |
 
 Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
-- **PostToolUse** (Edit · Write · MultiEdit): 수정한 `.rs` 파일을 즉시 rustfmt로 정리한다. 그래서 편집 직후 파일 내용이 바뀔 수 있다. 이어서 같은 부분을 고칠 때는 파일을 다시 읽는다.
+- **PostToolUse** (Edit · Write · MultiEdit): 수정한 `.rs` 파일을 즉시 rustfmt로 정리한다. 그래서 편집 직후 파일 내용이 바뀔 수 있다. 이어서 같은 부분을 고칠 때는 파일을 다시 읽는다. `mod x;`를 선언한 파일을 하위 파일보다 먼저 쓰면 그 시점의 rustfmt는 실패하고 조용히 넘어간다. 그런 포맷 누락은 Stop 훅의 fmt 검사가 잡으므로 `cargo fmt --all`로 정리한다.
 - **Stop**: 응답을 끝내기 전에 `scripts/check.sh fast`를 돌린다. 실패하면 오류가 돌아오므로 **고친 뒤에** 마무리한다. 두 번째에도 실패하면 막지 않고 사용자에게 경고만 표시된다.
 - Stop 훅은 빠른 검사만 한다. 기능을 끝냈다고 보고하기 전에는 `scripts/check.sh`(전체)를 직접 돌려 통과를 확인한다.
 
@@ -88,18 +91,24 @@ Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
 - 린트를 끄는 `#[allow(...)]`는 꼭 필요할 때만, 가장 좁은 범위(함수 · 문장)에 붙이고 이유를 주석으로 남긴다. `[workspace.lints]`를 느슨하게 바꾸는 것은 사용자와 상의한다.
 - 의존성을 추가하면 `Cargo.lock`도 함께 커밋한다 (모든 검사가 `--locked`로 돈다).
 - 컴파일러 버전은 `rust-toolchain.toml`에 고정되어 있다. 올릴 때는 버전을 바꾸고 `scripts/check.sh` 통과를 확인한 뒤 별도 커밋으로 올린다.
-- 필요한 도구: `brew install cargo-nextest cargo-deny cargo-shear actionlint`
+- 필요한 도구: `brew install cargo-nextest cargo-deny cargo-shear actionlint sqlx-cli` (sqlx-cli는 sqlx 크레이트와 같은 0.9.0)
 
 ## 그 밖의 명령어
 
 ```bash
-docker compose up -d --wait      # postgres(:5432), otel-lgtm(Grafana :3000, OTLP :4317/4318)
-docker compose down              # 정지 (-v를 붙이면 DB 데이터까지 삭제)
-cargo run -p mock-provider       # mock 업체 서버 (:9090). RUST_LOG=debug로 장애 주입 로그 확인
-actionlint                       # .github/workflows 검사
+cp .env.example .env                       # 처음 한 번. DATABASE_URL 등 (.env는 커밋하지 않음)
+docker compose up -d --wait                # postgres(:5432), otel-lgtm(Grafana :3000, OTLP :4317/4318)
+docker compose down                        # 정지 (-v를 붙이면 DB 데이터까지 삭제)
+cargo run -p mock-provider                 # mock 업체 서버 (:9090). RUST_LOG=debug로 장애 주입 로그 확인
+cargo run -p booking-server -- serve       # 예약 서버 (:8080, API + 워커). 시작할 때 마이그레이션 적용
+cargo run -p booking-server -- create-client --name <이름>   # API 키 발급 (stdout에 한 번만 출력)
+sqlx migrate add <설명>                     # 새 마이그레이션 파일 (migrations/)
+cargo sqlx prepare --workspace -- --all-targets   # 쿼리를 바꾼 뒤 .sqlx/ 갱신 (DB 필요)
+actionlint                                 # .github/workflows 검사
 ```
 
 - 셸 환경에 따라 `cargo`가 PATH에 없을 수 있다. 그럴 때는 `. "$HOME/.cargo/env"`를 먼저 실행한다.
+- `cargo nextest`를 직접 돌릴 때는 `DATABASE_URL`이 환경 변수로 있어야 한다 (`set -a; . ./.env; set +a`). `scripts/check.sh`는 기본값을 알아서 넣는다.
 - mock 업체의 장애 설정은 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다.
 
 ## 로컬 포트

@@ -16,7 +16,9 @@ pub enum ProviderError {
     /// 응답 시간 초과. 요청이 업체에 닿았는지 알 수 없다
     Timeout,
     /// 연결 실패. 요청이 업체에 닿지 않았다
-    Connect,
+    Connect { detail: String },
+    /// 요청을 보내는 중이나 응답을 받는 중에 연결이 끊김. 업체가 처리했는지 알 수 없다 (Phase 2에서 추가)
+    Transport { detail: String },
     /// 업체가 호출 제한을 알림 (alpha: 429, beta: 503 + Retry-After)
     RateLimited { retry_after: Option<Duration> },
     /// 업체 서버 오류 (5xx)
@@ -40,6 +42,7 @@ pub enum ProviderError {
 | `rejected` | ❌ | 성공 | 업무적 거절은 업체가 정상이라는 뜻 |
 | `timeout` | 멱등 안전할 때만 | 실패 | §5 참고 |
 | `connect_error` | ✅ | 실패 | 요청이 가지 않았으므로 항상 안전 |
+| `transport_error` | 멱등 안전할 때만 | 실패 | 타임아웃과 같이 결과 불명 |
 | `server_error` | 멱등 안전할 때만 | 실패 | 5xx여도 업체가 처리했을 가능성이 있음 |
 | `rate_limited` | Retry-After ≤ 1초일 때만 | 제외 | 업체 pause 설정 (§6) |
 | `client_error` | ❌ | 제외 | 알림 대상 (우리 버그 가능성) |
@@ -48,6 +51,16 @@ pub enum ProviderError {
 | `throttled` | ❌ | - | 작업 수준에서 재예약 |
 
 "멱등 안전"하다는 것은 조회 호출(availability, find, list)이거나, 업체가 멱등키를 지원하는 생성 · 취소 호출이라는 뜻이다.
+
+**Phase 2 구현 상태**: 호출 내 재시도는 아직 없고, 워커가 작업 수준에서만 다시 시도한다. 판단은 `crates/booking-server/src/worker/submit.rs`의 `decide` 함수 하나에 모여 있다.
+
+| 결과 | 워커의 처리 |
+|---|---|
+| 성공 | `confirmed` |
+| `rejected` | `rejected` |
+| `client_error` | 포기 (`failed`) |
+| `connect_error`, `rate_limited` | 작업 재예약 (요청이 가지 않았으므로 항상 안전) |
+| `timeout`, `transport_error`, `server_error`, `decode_error` | 멱등키를 지원하는 업체면 작업 재예약, 아니면 `unknown` (다시 보내지 않음) |
 
 ## 2. 파이프라인 구성
 
