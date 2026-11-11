@@ -9,7 +9,7 @@
 | ID | UUID v7 문자열 |
 | 에러 | RFC 9457 Problem Details (`application/problem+json`). ASP.NET Core의 `ProblemDetails`와 같은 형식 |
 | 페이지네이션 | 커서 방식: `?limit=50&cursor=<불투명 문자열>` → 응답에 `next_cursor` |
-| 추적 | 모든 응답 헤더에 `X-Trace-Id`. 에러 본문에도 `trace_id` (OpenTelemetry를 붙이는 Phase 4에서 추가) |
+| 추적 | 응답 헤더에 `X-Trace-Id`, 에러 본문에도 같은 값의 `trace_id` (헬스 체크 제외). 요청에 W3C `traceparent` 헤더를 실어 보내면 그 trace에 이어 붙는다 |
 | 인증 | `X-Api-Key` 헤더. 키는 `booking-server create-client --name <이름>`으로 발급하며, 발급할 때 한 번만 보여 준다 |
 | 문서 | `/openapi.json`, `/docs` (Swagger UI). utoipa로 코드에서 생성 |
 
@@ -23,6 +23,8 @@
   "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
 }
 ```
+
+`X-Trace-Id`는 그 요청의 처리 과정을 Grafana(Tempo)에서 찾는 열쇠다. 문의를 받을 때 이 값을 함께 받으면 어떤 DB 쿼리와 업체 호출이 있었는지 바로 볼 수 있다. 예약 접수의 경우 업체 호출은 워커가 따로 하므로, 접수 요청의 trace에는 접수까지만 있고 업체 호출은 그 예약의 작업 trace에 있다 (예약 ID로 찾는다: [05 §3](05-observability-and-analytics.md#3-추적-traces)).
 
 ## 2. 예약 API (`/v1`, 클라이언트용)
 

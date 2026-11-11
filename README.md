@@ -40,6 +40,16 @@ docker compose exec postgres psql -U booking -c \
   "SELECT outcome, count(*), round(avg(duration_ms)) AS avg_ms FROM provider_calls GROUP BY 1 ORDER BY 2 DESC"
 ```
 
+### Grafana에서 보기
+
+두 서버는 추적 · 메트릭 · 로그를 OpenTelemetry로 내보낸다. http://localhost:3000 (로그인 없음)의 Dashboards → **Booking** 폴더에 대시보드 세 개가 있다.
+
+- **Provider Overview**: 업체별 호출량, 성공률, p50/p95/p99, 호출 제한, 서킷 상태. 아래쪽 "느린 업체 호출" 표에서 행을 누르면 그 호출의 trace가 열리고, mock 업체 내부에서 지연된 구간(`chaos.delay`)까지 이어서 볼 수 있다.
+- **Booking Pipeline**: 상태 전이 흐름, 접수 → 확정 시간, 대기 · dead 작업 수
+- **Service**: API 요청 수 · 오류 비율 · 응답 시간, tokio 런타임, 경고 · 오류 로그
+
+응답 헤더의 `X-Trace-Id`나 예약 ID로 trace를 찾을 수 있다 (Explore → Tempo → `{ span.booking_id = "<예약 ID>" }`). 대시보드와 알림 규칙은 [observability/](observability/README.md)에서 코드로 관리한다.
+
 품질 검사는 `scripts/check.sh`로 돌립니다 (CI와 같은 명령, PostgreSQL 필요).
 
 ## 문서
@@ -48,4 +58,4 @@ docker compose exec postgres psql -U booking -c \
 
 ## 진행 상태
 
-Phase 3 (장애 대응 계층: 재시도 · 서킷 브레이커 · rate limit · bulkhead · 결과 불명 처리 · 호출 기록)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.
+Phase 4 (관측: OpenTelemetry 추적 · 메트릭 · 로그, 서비스 사이로 이어지는 trace, Grafana 대시보드 · 알림 규칙, tokio-console 개발 모드)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.

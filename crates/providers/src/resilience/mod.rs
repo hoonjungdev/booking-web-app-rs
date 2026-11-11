@@ -11,8 +11,11 @@
 //!         ├─ [bulkhead]        업체별 동시 실행 수 제한 (최대 max_wait_ms 대기, 넘으면 Throttled)
 //!         ├─ [시도 타임아웃]   attempt_timeout_ms (남은 예산이 더 짧으면 그만큼)
 //!         ├─ 어댑터 호출 → 결과 분류
-//!         └─ 기록: 서킷 집계, 429면 업체 pause, provider_calls 기록
+//!         └─ 기록: 서킷 집계, 429면 업체 pause, provider_calls 기록, 지표
 //! ```
+//!
+//! 추적(trace)에서는 호출 하나가 `provider.call` span, 그 안의 시도 하나하나가 `provider.attempt` span이 된다.
+//! 재시도가 있었는지, 어느 시도가 얼마나 걸렸는지, 관문에서 막혔는지가 trace 한 장에 보인다.
 //!
 //! Polly로 `HttpClient`를 감싸는 것과 같은 구조다. 어댑터는 HTTP ↔ 도메인 변환과 응답 분류만 하고,
 //! 재시도 · 서킷 · rate limit은 모두 여기서 한다.
@@ -38,6 +41,7 @@ use governor::{
 };
 use rand::RngExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tracing::{Span, field::Empty};
 
 pub use circuit::{CircuitBreaker, CircuitState, Permit};
 pub use retry::{MAX_IN_CALL_RETRY_AFTER, backoff_delay, may_retry};
@@ -45,6 +49,8 @@ pub use retry::{MAX_IN_CALL_RETRY_AFTER, backoff_delay, may_retry};
 use crate::{
     AdapterReply, CallRecord, CallRecorder, Capabilities, CircuitVerdict, CreateBooking,
     ProviderAdapter, ProviderBooking, ProviderError, ProviderPolicy, ResponseMeta,
+    metrics::{self, ThrottleSource},
+    trace,
 };
 
 /// 업체가 `Retry-After` 없이 호출 한도 초과를 알렸을 때 쉬는 시간
@@ -61,6 +67,9 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// 모든 호출 종류. 종류를 추가하면 여기에도 넣는다.
+    pub const ALL: [Self; 2] = [Self::CreateBooking, Self::FindBooking];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CreateBooking => "create_booking",
@@ -98,8 +107,12 @@ pub struct ResilientProvider {
     limiter: Limiter,
     /// 동시 호출 수 제한 (≈ C#의 `SemaphoreSlim`)
     bulkhead: Semaphore,
+    /// bulkhead의 전체 자리 수
+    max_concurrency: usize,
     /// 업체가 쉬라고 한 시각까지 (`Retry-After`)
     paused_until: Mutex<Option<Instant>>,
+    /// 업체가 마지막으로 알려 준 남은 호출 수 (`X-RateLimit-Remaining`)
+    rate_limit_remaining: Mutex<Option<u32>>,
     recorder: CallRecorder,
 }
 
@@ -115,11 +128,15 @@ impl ResilientProvider {
         let per_second = NonZeroU32::new(policy.rate_limit.per_second).unwrap_or(NonZeroU32::MIN);
         let burst = NonZeroU32::new(policy.rate_limit.burst).unwrap_or(NonZeroU32::MIN);
         let quota = Quota::per_second(per_second).allow_burst(burst);
+        let max_concurrency = policy.bulkhead.max_concurrency.max(1) as usize;
+        metrics::register_provider(&id);
         Self {
             breaker: Mutex::new(CircuitBreaker::new(policy.circuit_breaker)),
             limiter: RateLimiter::direct_with_clock(quota, MonotonicClock),
-            bulkhead: Semaphore::new(policy.bulkhead.max_concurrency.max(1) as usize),
+            bulkhead: Semaphore::new(max_concurrency),
+            max_concurrency,
             paused_until: Mutex::new(None),
+            rate_limit_remaining: Mutex::new(None),
             id,
             adapter,
             policy,
@@ -153,6 +170,17 @@ impl ResilientProvider {
         lock(&self.paused_until).filter(|until| *until > now)
     }
 
+    /// 지금 업체를 부르고 있는 호출 수 (bulkhead에서 나가 있는 자리 수)
+    pub fn in_flight(&self) -> usize {
+        self.max_concurrency
+            .saturating_sub(self.bulkhead.available_permits())
+    }
+
+    /// 업체가 마지막 응답에서 알려 준 남은 호출 수. 아직 받은 적이 없으면 `None`.
+    pub fn rate_limit_remaining(&self) -> Option<u32> {
+        *lock(&self.rate_limit_remaining)
+    }
+
     /// 업체에 예약을 만든다
     pub async fn create_booking(
         &self,
@@ -180,7 +208,40 @@ impl ResilientProvider {
         .await
     }
 
-    /// 모든 호출이 지나가는 재시도 루프.
+    /// 모든 호출이 지나가는 입구. `provider.call` span을 열고 재시도 루프를 돌린다.
+    ///
+    /// `#[tracing::instrument]`: 이 함수가 실행되는 동안 span을 연다. `skip_all`은 "인자를 span에 자동으로 기록하지 않는다"는
+    /// 뜻이다 (인자에 고객 정보가 들어 있을 수 있다). 남길 값은 `fields(..)`에 직접 고른다.
+    /// `Option` 값은 `Some`일 때만 기록된다.
+    #[tracing::instrument(
+        name = "provider.call",
+        skip_all,
+        fields(
+            provider = %self.id,
+            operation = operation.as_str(),
+            booking_id = ctx.booking_id.map(tracing::field::display),
+            job_id = ctx.job_id,
+            otel.status_code = Empty,
+        )
+    )]
+    async fn call<T, F, Fut>(
+        &self,
+        operation: Operation,
+        ctx: CallContext,
+        send: F,
+    ) -> Result<T, ProviderError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = AdapterReply<T>>,
+    {
+        let result = self.retry_loop(operation, ctx, send).await;
+        if result.as_ref().is_err_and(is_failure) {
+            Span::current().record("otel.status_code", "error");
+        }
+        result
+    }
+
+    /// 재시도 루프.
     ///
     /// 제네릭 함수다 (≈ C#의 `Task<T> CallAsync<T>(Func<Task<Reply<T>>> send)`).
     /// - `T`: 호출이 성공하면 돌려줄 값의 타입 (예약 생성은 `ProviderBooking`, 조회는 `Option<ProviderBooking>`)
@@ -193,12 +254,7 @@ impl ResilientProvider {
     /// 재시도가 관문에서 막혔는데 앞선 시도가 업체까지 갔다면, 막힌 실패 대신 **앞선 시도의 실패**를 돌려준다.
     /// 워커는 `CircuitOpen` · `Throttled`를 "부르지 않았다"로 보고 시도 횟수를 되돌리는데, 실제로 부른 호출까지
     /// 되돌리면 업체가 계속 죽어 있을 때 작업이 끝없이 미뤄지기 때문이다 (docs/03-resilience.md §4).
-    #[tracing::instrument(
-        name = "provider.call",
-        skip_all,
-        fields(provider = %self.id, operation = operation.as_str())
-    )]
-    async fn call<T, F, Fut>(
+    async fn retry_loop<T, F, Fut>(
         &self,
         operation: Operation,
         ctx: CallContext,
@@ -255,12 +311,21 @@ impl ResilientProvider {
                 "같은 호출 안에서 다시 시도한다"
             );
             last_called = Some(error);
+            metrics::retried(&self.id, operation.as_str());
             tokio::time::sleep(wait).await;
             attempt += 1;
         }
     }
 
-    /// 시도 한 번: 관문을 통과하면 어댑터를 부르고, 결과를 서킷 · pause · 호출 기록에 반영한다
+    /// 시도 한 번: 관문을 통과하면 어댑터를 부르고, 결과를 서킷 · pause · 호출 기록에 반영한다.
+    ///
+    /// span의 `outcome`은 끝나야 알 수 있으므로 `Empty`로 자리만 잡아 두고 `record`에서 채운다.
+    #[tracing::instrument(
+        name = "provider.attempt",
+        skip_all,
+        // `attempt = attempt`처럼 값을 적어야 한다. 이름만 쓰면(`fields(attempt)`) 값이 빈 필드가 된다.
+        fields(attempt = attempt, outcome = Empty, otel.status_code = Empty)
+    )]
     async fn attempt<T, F, Fut>(
         &self,
         operation: Operation,
@@ -453,6 +518,27 @@ impl ResilientProvider {
             duration_ms = duration.as_millis() as u64,
             "provider attempt finished"
         );
+        // 지금 span은 이 시도의 `provider.attempt`다 (이 함수는 `attempt` 안에서만 불린다)
+        let span = Span::current();
+        span.record("outcome", outcome);
+        if error.is_some_and(is_failure) {
+            span.record("otel.status_code", "error");
+        }
+
+        metrics::attempt_finished(&self.id, info.operation.as_str(), outcome, duration);
+        match error {
+            Some(ProviderError::RateLimited { .. }) => {
+                metrics::throttled(&self.id, ThrottleSource::Remote);
+            }
+            Some(ProviderError::Throttled { .. }) => {
+                metrics::throttled(&self.id, ThrottleSource::Local);
+            }
+            _ => {}
+        }
+        if let Some(remaining) = meta.rate_limit_remaining {
+            *lock(&self.rate_limit_remaining) = Some(remaining);
+        }
+
         let retry_after = match error {
             Some(ProviderError::RateLimited { retry_after }) => *retry_after,
             _ => None,
@@ -469,9 +555,16 @@ impl ResilientProvider {
             http_status: meta.http_status,
             rate_limit_remaining: meta.rate_limit_remaining,
             retry_after,
-            error_detail: error.map(ToString::to_string),
+            // 호출 기록에만 업체가 보낸 글자(4xx 본문 등)를 남긴다. 로그 · span에는 메시지만 나간다.
+            error_detail: error.map(ProviderError::detail),
+            trace_id: trace::current_trace_id(),
         });
     }
+}
+
+/// trace에서 "실패"로 표시할 결과인가. 업무적 거절(슬롯 마감 등)은 업체가 정상으로 답한 것이라 실패로 치지 않는다.
+fn is_failure(error: &ProviderError) -> bool {
+    !matches!(error, ProviderError::Rejected { .. })
 }
 
 /// 시도 하나를 기록할 때 쓰는 정보

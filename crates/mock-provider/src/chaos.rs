@@ -26,6 +26,7 @@ use axum::{
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::Instrument;
 
 use crate::{
     Provider, lock,
@@ -434,7 +435,11 @@ pub async fn middleware(State(ctx): State<ChaosContext>, request: Request, next:
     }
 
     if !plan.latency.is_zero() {
-        tokio::time::sleep(plan.latency).await;
+        // 주입한 지연을 span으로 남긴다. 호출한 쪽의 trace에서 "업체 안에서 이만큼 기다렸다"가 한 줄로 보인다.
+        let latency_ms = plan.latency.as_millis() as u64;
+        tokio::time::sleep(plan.latency)
+            .instrument(tracing::info_span!("chaos.delay", latency_ms))
+            .await;
     }
 
     let mut response = match plan.fault {
@@ -457,7 +462,9 @@ pub async fn middleware(State(ctx): State<ChaosContext>, request: Request, next:
 /// 응답을 오래 붙잡아 클라이언트 타임아웃을 일으킨다.
 /// 클라이언트가 먼저 연결을 끊으면 axum이 이 Future를 버리므로 대기도 함께 끝난다.
 async fn hang() -> Response {
-    tokio::time::sleep(HANG_DURATION).await;
+    tokio::time::sleep(HANG_DURATION)
+        .instrument(tracing::info_span!("chaos.hang"))
+        .await;
     error_response(StatusCode::GATEWAY_TIMEOUT, "timeout", "응답 시간 초과")
 }
 

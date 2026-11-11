@@ -1,0 +1,253 @@
+# 알림 규칙 (docs/05-observability-and-analytics.md §8). Grafana가 시작할 때 등록한다.
+#
+# 규칙 하나는 두 단계로 이루어진다.
+#   A: Prometheus에 물어 값을 얻는다 (시계열마다 값 하나)
+#   C: 그 값이 기준을 넘는지 본다 (threshold)
+# 기준을 넘은 상태가 `for` 동안 이어지면 알림이 울린다(Firing). 그 전까지는 Pending이다.
+#
+# 로컬에는 알림을 받을 곳(메일 · 메신저)을 설정하지 않았다. 울린 알림은 Grafana의 Alerting → Alert rules 화면에서 본다.
+# "대사에서 이중 예약 의심 발견" 알림은 대사 작업을 만드는 Phase 6에서 추가한다.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: booking
+    folder: Booking
+    # 30초마다 평가한다
+    interval: 30s
+    rules:
+      # 서킷이 열려 있고 **그 때문에 막히는 호출이 계속 있을 때** 울린다.
+      # 서킷 상태만 보면 안 된다: 서킷은 다음 호출이 올 때에야 Open에서 벗어나므로, 업체가 복구됐어도
+      # 처리할 예약이 없으면 지표는 계속 2(open)다. 그 상태로 울리면 "업체가 아직 죽어 있다"는 거짓 경보가 된다.
+      - uid: booking-circuit-open
+        title: 서킷이 5분 넘게 열려 있음
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              # 앞 줄: 서킷이 열려 있다 (0 = closed, 1 = half_open, 2 = open)
+              # 뒷줄: 최근 5분 동안 서킷에 막혀 부르지 못한 호출이 있다
+              expr: |-
+                (max by (provider) (provider_circuit_state) == 2)
+                and on (provider)
+                (sum by (provider) (increase(provider_call_duration_seconds_count{outcome="circuit_open"}[5m])) > 0)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [1.5] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 5m
+        # 조건에 맞는 업체가 없으면 결과가 비어 있다(= 정상). 지표가 아예 없을 때(서버가 꺼져 있음)도 울리지 않는다.
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "업체 {{ $labels.provider }}의 서킷이 5분 넘게 열려 있다"
+          description: "업체가 계속 실패해서 호출을 막고 있고, 막힌 호출이 계속 들어오고 있다. 그동안 예약은 pending으로 쌓이고, 기한(deadline_at)이 지나면 failed가 된다. Provider Overview 대시보드에서 결과별 비율과 실패한 호출의 trace를 확인한다."
+
+      - uid: booking-dead-jobs
+        title: dead 작업이 있음
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              expr: max by (kind) (jobs_dead)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.kind }} 작업 중 포기한(dead) 것이 있다"
+          description: "재시도를 다 쓰거나 기한이 지나 포기한 작업이다. 해당 예약은 failed 상태로 관리자 확인을 기다린다. Booking Pipeline 대시보드의 '포기한 작업' 표에서 trace를 확인한다."
+
+      - uid: booking-unknown-stuck
+        title: 결과 불명 예약이 10분 넘게 남아 있음
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              # 결과 불명 상태로 가장 오래 머문 예약의 경과 시간 (초)
+              expr: max(booking_unknown_oldest_age_seconds)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [600] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "결과 불명(unknown) 상태가 10분 넘게 풀리지 않은 예약이 있다"
+          description: "업체에 예약이 생겼는지 모르는 상태다. resolve_unknown 작업이 업체 조회에 계속 실패하고 있을 수 있다 (서킷 열림, 업체 장애). 이중 예약 위험이 있으므로 직접 다시 제출하지 말고 업체에서 먼저 조회한다."
+
+      - uid: booking-rate-limited
+        title: 업체 호출의 5% 넘게 호출 제한에 걸림
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              # 실제로 부른 시도 중 업체가 429 · 503(Retry-After)으로 답한 비율 (10분)
+              expr: |-
+                sum by (provider) (rate(provider_call_duration_seconds_count{outcome="rate_limited"}[10m]))
+                /
+                sum by (provider) (rate(provider_call_duration_seconds_count{outcome!~"circuit_open|throttled"}[10m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [0.05] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "업체 {{ $labels.provider }} 호출의 5% 넘게 호출 제한(429 · 503)에 걸렸다 (10분)"
+          description: "우리 쪽 rate limiter 설정(policy.rate_limit)이 업체의 실제 한도보다 느슨하다. 초당 허용 수를 낮춘다."
+
+      - uid: booking-job-lag
+        title: 작업 지연 p95가 30초를 넘음
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              expr: histogram_quantile(0.95, sum by (le, kind) (rate(jobs_lag_seconds_bucket[5m])))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [30] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.kind }} 작업이 실행 시각보다 30초 넘게 늦게 시작되고 있다 (p95)"
+          description: "워커가 작업을 제때 가져가지 못한다. 워커가 멈췄거나, 느린 업체 호출에 워커가 모두 묶여 있을 수 있다. Booking Pipeline 대시보드의 대기 작업 수와 Provider Overview의 지연을 함께 본다."
+
+      - uid: booking-recorder-dropped
+        title: 업체 호출 기록을 버림
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: prometheus }
+              editorMode: code
+              expr: sum(increase(provider_calls_recorder_dropped_total[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              datasource: { type: __expr__, uid: __expr__ }
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+        annotations:
+          summary: "호출 기록 채널이 가득 차서 기록을 버렸다"
+          description: "예약 처리에는 영향이 없다 (기록은 분석용이다). 다만 그 구간의 provider_calls 통계는 실제보다 적게 나온다. DB 저장이 호출량을 따라가지 못한 것이므로 DB 상태를 확인한다."

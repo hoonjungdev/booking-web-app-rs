@@ -11,10 +11,21 @@
 //! | [`registry`] | 업체 ID → 장애 대응 파이프라인으로 감싼 업체 (`ResilientProvider`) |
 //! | [`worker`] | 작업 큐 처리 (업체에 예약 제출, 결과 불명 예약 확인) |
 //! | [`recorder`] | 업체 호출 기록을 모아 `provider_calls`에 저장 |
+//! | [`metrics`] | 예약 · 작업 큐 · 업체 상태 지표 |
+//! | [`trace`] | 접수 요청과 작업 처리를 trace로 잇기 |
 
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod metrics;
 pub mod recorder;
 pub mod registry;
+pub mod trace;
 pub mod worker;
+
+/// `RUST_LOG`가 없을 때 쓰는 로그 필터. 콘솔 로그와 OpenTelemetry로 내보내는 span · 로그에 함께 적용된다.
+///
+/// 우리 크레이트는 debug까지, 그 밖의 라이브러리는 info부터 남긴다. `sqlx`는 쿼리마다 로그를 남기므로 warn으로 줄인다.
+/// 통합 테스트(`tests/telemetry.rs`)도 이 값을 써서, 실제 서버 설정에서 보이는 span을 검증한다.
+pub const DEFAULT_LOG_FILTER: &str =
+    "info,booking_server=debug,providers=debug,telemetry=debug,sqlx=warn";

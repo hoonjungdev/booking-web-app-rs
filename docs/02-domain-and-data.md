@@ -239,6 +239,17 @@ CREATE TABLE reconciliation_issues (
 - `jobs.kind`에 `resolve_unknown`이 추가되었다. `jobs.payload`는 작업별 진행 상황(지금은 `resolve_unknown`이 "업체에 없음"을 확인한 횟수)을 담는다.
 - 예약 상태 전이와 "그 상태를 처리할 다음 작업" 등록을 한 트랜잭션으로 묶는다: `unknown`이 되면 `resolve_unknown`, `unknown → pending`이 되면 `submit_booking`.
 
+### 구현 메모 (Phase 4)
+- 처음부터 스키마에 있던 trace 컬럼을 채운다. 값은 booking-server가 만들고, db 크레이트는 해석하지 않고 저장만 한다 (`db::TraceRef`).
+  | 컬럼 | 내용 |
+  |---|---|
+  | `booking_events.trace_id` | 그 상태 변경을 일으킨 trace. 접수는 요청의 trace, 확정 · 실패는 작업의 trace |
+  | `jobs.trace_context` | 작업을 등록한 쪽의 trace 문맥 `{"traceparent": "00-<trace id>-<span id>-01"}`. 워커가 작업 span에 link로 건다 |
+  | `provider_calls.trace_id` | 그 호출 시도가 속한 trace |
+- OpenTelemetry를 설치하지 않은 곳(테스트 등)에서는 세 컬럼 모두 NULL이다.
+- `migrations/20261112000001_add_jobs_dead_index.sql`: dead 작업용 부분 인덱스 `jobs_dead_idx`. `jobs.dead` 지표를 내려고 몇 초마다 세는 조회가 끝난 작업이 쌓여도 느려지지 않게 한다 (Phase 5의 dead 작업 목록도 쓴다).
+- `db::jobs::claim_next`가 작업을 가져가면서 "실행하기로 한 시각보다 얼마나 밀렸는지"(`now() - run_at`)를 함께 돌려준다 (`jobs.lag` 지표).
+
 ## 5. 작업 큐 동작
 
 별도 메시지 브로커(RabbitMQ, Kafka) 없이 PostgreSQL 테이블로 작업 큐를 만든다. → [D-03](decisions.md#d-03-예약-생성은-비동기202--postgresql-작업-큐)

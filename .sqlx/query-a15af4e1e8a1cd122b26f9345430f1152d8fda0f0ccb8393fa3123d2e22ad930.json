@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, provider_id, operation, booking_id, job_id, attempt, started_at, duration_ms,\n                outcome, http_status, rate_limit_remaining, retry_after_ms, error_detail\n         FROM provider_calls WHERE booking_id = $1 ORDER BY id",
+  "query": "SELECT id, provider_id, operation, booking_id, job_id, attempt, started_at, duration_ms,\n                outcome, http_status, rate_limit_remaining, retry_after_ms, error_detail, trace_id\n         FROM provider_calls WHERE booking_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -145,6 +145,17 @@
             "name": "error_detail"
           }
         }
+      },
+      {
+        "ordinal": 13,
+        "name": "trace_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "provider_calls",
+            "name": "trace_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -165,8 +176,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "82f22154eacbd1c9ccc33e7d39f25f491f5775a1e43f43d31005f09911989181"
+  "hash": "a15af4e1e8a1cd122b26f9345430f1152d8fda0f0ccb8393fa3123d2e22ad930"
 }

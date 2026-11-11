@@ -17,10 +17,24 @@ async-trait = "0.1.92"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
+# tokio-console 개발 모드에서만 쓴다 (telemetry의 `tokio-console` feature, docs/05-observability-and-analytics.md §9)
+console-subscriber = "0.5.0"
 dotenvy = "0.15.7"
 figment = { version = "0.10.19", features = ["env"] }
 # 업체 호출 rate limit (GCRA 토큰 버킷). 기본 기능의 dashmap(키별 limiter) · quanta(고속 시계) · jitter는 쓰지 않는다.
 governor = { version = "0.10.4", default-features = false, features = ["std"] }
+# OpenTelemetry: 추적 · 메트릭 · 로그를 OTLP로 내보낸다 (docs/05-observability-and-analytics.md).
+# - `opentelemetry`는 계측 API다. 라이브러리 크레이트(providers)는 이것만 쓴다 (≈ .NET의 System.Diagnostics.Metrics / ActivitySource).
+# - `opentelemetry_sdk` · `opentelemetry-otlp`는 실제 수집 · 전송 구현이다. telemetry 크레이트만 쓴다 (docs/decisions.md D-20).
+# opentelemetry 계열은 버전을 함께 올린다. tracing-opentelemetry는 대응하는 버전이 따로 있다 (0.34 ↔ opentelemetry 0.33).
+opentelemetry = "0.33.1"
+# tracing 이벤트 → OpenTelemetry 로그
+opentelemetry-appender-tracing = "0.33.1"
+# HTTP 헤더 ↔ trace 정보(`traceparent`) 변환 도우미
+opentelemetry-http = "0.33.1"
+# 기본 기능: HTTP + protobuf 전송, 전용 스레드에서 도는 reqwest blocking 클라이언트 (gRPC · tonic 없이 가볍다)
+opentelemetry-otlp = "0.33.1"
+opentelemetry_sdk = "0.33.1"
 rand = "0.10.3"
 # TLS 없이 http만 쓴다. 실제 업체(https)와 연동할 때 TLS feature를 추가한다.
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
@@ -33,8 +47,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tokio-util = "0.7.20"
 tower = "0.5.3"
-tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
+# tracing span → OpenTelemetry span. 기본 기능 중 MetricsLayer(이벤트로 메트릭 만들기)는 쓰지 않는다.
+tracing-opentelemetry = { version = "0.34.0", default-features = false, features = ["tracing-log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.29.2", features = ["v7", "serde"] }
 

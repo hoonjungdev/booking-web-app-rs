@@ -5,9 +5,11 @@
 
 mod common;
 
+use std::time::Duration;
+
 use db::{
-    PgPool,
-    bookings::{self, AcceptOutcome, Transitioned},
+    PgPool, TraceRef,
+    bookings::{self, AcceptOutcome, NewBooking, Transitioned},
     jobs,
 };
 use domain::{BookingEvent, BookingStatus, RejectReason};
@@ -101,6 +103,7 @@ async fn 상태_전이는_도메인_규칙을_따르고_이력을_남긴다(pool
         BookingStatus::Pending,
         &confirmed,
         "worker",
+        None,
     )
     .await
     .unwrap();
@@ -120,6 +123,7 @@ async fn 상태_전이는_도메인_규칙을_따르고_이력을_남긴다(pool
         BookingStatus::Pending,
         &rejected,
         "worker",
+        None,
     )
     .await
     .unwrap();
@@ -132,6 +136,7 @@ async fn 상태_전이는_도메인_규칙을_따르고_이력을_남긴다(pool
         BookingStatus::Confirmed,
         &rejected,
         "worker",
+        None,
     )
     .await;
     assert!(matches!(result, Err(db::DbError::InvalidTransition(_))));
@@ -159,5 +164,88 @@ async fn 다른_클라이언트의_예약은_보이지_않는다(pool: PgPool) {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 접수와_전이를_일으킨_trace를_이력과_작업에_남긴다(pool: PgPool) {
+    let client = common::create_client(&pool, "app").await;
+    let request_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let context = serde_json::json!({
+        "traceparent": format!("00-{request_trace}-00f067aa0ba902b7-01")
+    });
+    let new = NewBooking {
+        trace: TraceRef {
+            trace_id: Some(request_trace.into()),
+            context: Some(context.clone()),
+        },
+        ..common::new_booking(client, "key-1", b"hash-1")
+    };
+    bookings::accept(&pool, &new).await.unwrap();
+
+    // 작업을 가져가면 등록한 쪽의 trace 문맥이 함께 나온다 (워커가 link를 걸 때 쓴다)
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.trace_context, Some(context));
+
+    // 워커는 자기 trace에서 상태를 바꾼다
+    let job_trace = "0af7651916cd43dd8448eb211c80319c";
+    let mut conn = pool.acquire().await.unwrap();
+    let confirmed = BookingEvent::ProviderConfirmed {
+        provider_booking_id: "rsv_1".into(),
+    };
+    bookings::transition(
+        &mut conn,
+        new.id,
+        BookingStatus::Pending,
+        &confirmed,
+        "worker",
+        Some(job_trace),
+    )
+    .await
+    .unwrap();
+
+    let traces: Vec<_> = bookings::events(&pool, new.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.trace_id)
+        .collect();
+    assert_eq!(
+        traces,
+        vec![Some(request_trace.to_owned()), Some(job_trace.to_owned())]
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 결과_불명으로_가장_오래_머문_시간을_알려_준다(pool: PgPool) {
+    assert_eq!(
+        bookings::oldest_unknown_age(&pool).await.unwrap(),
+        Duration::ZERO,
+        "결과 불명 예약이 없으면 0"
+    );
+
+    let client = common::create_client(&pool, "app").await;
+    for (key, minutes_ago) in [("key-1", 3), ("key-2", 12)] {
+        let new = common::new_booking(client, key, key.as_bytes());
+        bookings::accept(&pool, &new).await.unwrap();
+        // 준비: 몇 분 전에 결과 불명이 된 것으로 만든다
+        sqlx::query(
+            "UPDATE bookings SET status = 'unknown',
+                    updated_at = now() - make_interval(mins => $2) WHERE id = $1",
+        )
+        .bind(new.id.as_uuid())
+        .bind(minutes_ago)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let age = bookings::oldest_unknown_age(&pool).await.unwrap();
+    assert!(
+        (Duration::from_secs(12 * 60)..Duration::from_secs(13 * 60)).contains(&age),
+        "가장 오래된 것(12분 전) 기준이어야 한다: {age:?}"
     );
 }

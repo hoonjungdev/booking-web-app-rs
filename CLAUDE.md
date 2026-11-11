@@ -34,13 +34,14 @@
 - `domain`에는 I/O(DB, HTTP, 파일, 시계 직접 호출)를 넣지 않는다. 순수 로직과 타입만 둔다.
 - `mock-provider`는 `domain`을 포함한 우리 크레이트에 의존하지 않는다 (진짜 외부 업체처럼 독립).
 - 어댑터는 HTTP ↔ 도메인 변환과 응답 분류만 한다. 재시도 · 서킷 · rate limit은 `ResilientProvider`가 맡는다.
+- OpenTelemetry SDK와 exporter는 `telemetry` 크레이트에만 둔다. `providers` · `booking-server`의 계측 코드는 `tracing` 매크로와 `opentelemetry`(API) 계측기만 쓰고, `db` · `domain`은 OpenTelemetry를 모른다 (trace ID는 문자열 · JSON으로 받아 저장만 한다). → `docs/decisions.md` D-20
 
 ## 반드시 지킬 불변 조건
 
 - **이중 예약 0건**: 멱등키를 지원하지 않는 업체에는 타임아웃 · 5xx 뒤에 생성 요청을 그냥 재시도하지 않는다. `unknown` → 조회 절차를 거친다 (`docs/03-resilience.md` §5).
 - **유실 0건**: 예약 저장, 상태 이력, 작업 등록은 한 트랜잭션으로 묶는다.
 - **상태 전이**는 `domain`의 전이 함수를 거치고, SQL은 `WHERE id = $1 AND status = $expected`로 낙관적 동시성을 지킨다. 전이할 때마다 `booking_events`에 기록한다.
-- **관측이 서비스를 느리게 하면 안 된다**: 호출 기록은 채널로 비동기 배치 저장하고, 채널이 가득 차면 버린다 (막지 않는다).
+- **관측이 서비스를 느리게 하면 안 된다**: 호출 기록은 채널로 비동기 배치 저장하고, 채널이 가득 차면 버린다 (막지 않는다). 추적 · 메트릭 · 로그도 SDK의 전용 스레드가 내보낸다. 요청 처리 경로와 지표 콜백에서 DB · 네트워크를 기다리지 않는다.
 
 ## 코딩 규칙
 
@@ -48,8 +49,12 @@
 - 에러: 라이브러리 크레이트는 `thiserror`로 타입을 정의하고, 실행 파일의 최상위에서만 `anyhow`를 쓴다.
 - 테스트가 아닌 코드에서 `unwrap()` / `expect()`를 쓰지 않는다. 정말 불가능한 경우만 `expect("이유")`로 이유를 남긴다.
 - 출력은 `println!` 대신 `tracing` 매크로(`info!`, `warn!` …)에 구조화 필드로 남긴다.
-- 고객 이름 · 전화번호 같은 개인정보는 로그와 span 속성에 넣지 않는다.
-- 메트릭 라벨에 `booking_id`처럼 값이 끝없이 늘어나는 것을 넣지 않는다.
+- 고객 이름 · 전화번호 같은 개인정보는 로그와 span 속성에 넣지 않는다. 업체가 보낸 글자(오류 본문 등)도 같다: 요청 값을 되돌려 줄 수 있으므로 오류 메시지(`Display`) · 로그 · span에 넣지 않고, `ProviderError::detail()`로 꺼내 호출 기록(`provider_calls.error_detail`)에만 남긴다.
+- 메트릭 라벨에 `booking_id`처럼 값이 끝없이 늘어나는 것을 넣지 않는다. span 이름도 같다 (`POST /v1/bookings/{id}`처럼 틀을 쓰고, ID는 속성에 넣는다).
+- span을 여는 `#[tracing::instrument]`에는 `skip_all`을 붙이고 남길 값만 `fields(..)`에 고른다 (인자에 고객 정보가 있을 수 있다). 워커가 할 일이 없을 때도 계속 부르는 함수(`db::jobs::claim_next`)에는 span을 열지 않는다.
+- 지표를 추가하거나 이름 · 라벨을 바꾸면 `docs/05-observability-and-analytics.md` §4 표, `observability/`의 대시보드 · 알림 규칙, `crates/booking-server/tests/telemetry.rs`를 함께 고친다. 초 단위 히스토그램에는 버킷 경계를 직접 지정한다 (기본 버킷은 밀리초 기준).
+- tracing layer에 per-layer filter(`Layer::with_filter`)를 걸지 않는다. sqlx의 `tracing::enabled!` 검사와 만나 span · 로그가 무작위로 빠진다 (`docs/decisions.md` D-22). 필터는 전역으로 건다 (`telemetry::filter`): 로그는 `RUST_LOG`를 따르고, span은 info 이상이면 항상 만든다. 그래서 추적에 남길 span은 info 수준(기본값)으로 만든다.
+- 응답을 받은 "뒤에" 기록하는 코드는 타임아웃으로 Future가 버려지면 실행되지 않는다. 버려져도 남겨야 하는 기록(걸린 시간, 오류 표시)은 `Drop`에 둔다 (`telemetry::http::RequestRecord`, `providers::trace::Pending`).
 - 시각은 UTC(`DateTime<Utc>`, DB는 `timestamptz`), ID는 UUID v7.
 - DB 쿼리는 `db` 크레이트에 두고 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`로 `.sqlx/`를 갱신해서 함께 커밋한다 (`scripts/check.sh`는 `.sqlx/`로 오프라인 검사하므로, 갱신하지 않으면 컴파일 에러가 난다). 테스트에서 준비용으로만 쓰는 SQL은 검사 없는 `sqlx::query(...)`를 써도 된다.
 - 예약 상태는 `db::bookings::transition`(내부에서 `BookingStatus::apply` 호출)으로만 바꾼다. `bookings.status`를 직접 UPDATE하지 않는다 (테스트 준비 코드 제외).
@@ -99,17 +104,25 @@ Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
 cp .env.example .env                       # 처음 한 번. DATABASE_URL 등 (.env는 커밋하지 않음)
 docker compose up -d --wait                # postgres(:5432), otel-lgtm(Grafana :3000, OTLP :4317/4318)
 docker compose down                        # 정지 (-v를 붙이면 DB 데이터까지 삭제)
-cargo run -p mock-provider                 # mock 업체 서버 (:9090). RUST_LOG=debug로 장애 주입 로그 확인
+cargo run -p mock-provider                 # mock 업체 서버 (:9090). 장애 주입 로그(debug)는 기본 설정에서 보인다
 cargo run -p booking-server -- serve       # 예약 서버 (:8080, API + 워커). 시작할 때 마이그레이션 적용
+OTEL_SDK_DISABLED=true cargo run -p booking-server -- serve   # 추적 · 메트릭 · 로그를 내보내지 않고 실행 (콘솔 로그만)
 cargo run -p booking-server -- create-client --name <이름>   # API 키 발급 (stdout에 한 번만 출력)
 sqlx migrate add <설명>                     # 새 마이그레이션 파일 (migrations/)
 cargo sqlx prepare --workspace -- --all-targets   # 쿼리를 바꾼 뒤 .sqlx/ 갱신 (DB 필요)
 actionlint                                 # .github/workflows 검사
+
+# tokio-console 개발 모드 (docs/05-observability-and-analytics.md §9). 설치: brew install tokio-console
+RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/console \
+  cargo run -p booking-server --features tokio-console -- serve     # 다른 터미널에서 `tokio-console`
+docker compose up -d --force-recreate otel-lgtm   # 알림 규칙(observability/…/alerting)을 고친 뒤 다시 읽히기
 ```
 
 - 셸 환경에 따라 `cargo`가 PATH에 없을 수 있다. 그럴 때는 `. "$HOME/.cargo/env"`를 먼저 실행한다.
 - `cargo nextest`를 직접 돌릴 때는 `DATABASE_URL`이 환경 변수로 있어야 한다 (`set -a; . ./.env; set +a`). `scripts/check.sh`는 기본값을 알아서 넣는다.
 - mock 업체의 장애 설정은 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다.
+- 두 서버는 추적 · 메트릭 · 로그를 OTLP로 `http://localhost:4318`(docker compose의 otel-lgtm)에 내보낸다. Grafana(http://localhost:3000)의 Dashboards → Booking 폴더에서 본다. 수집기가 꺼져 있어도 서버는 돌고, 콘솔에 내보내기 실패 경고만 남는다.
+- 대시보드 JSON(`observability/grafana/dashboards/`)은 고치면 10초 안에 Grafana가 다시 읽는다. 고치는 방법은 `observability/README.md`.
 
 ## 로컬 포트
 
@@ -119,5 +132,6 @@ actionlint                                 # .github/workflows 검사
 | mock-provider | 9090 |
 | PostgreSQL | 5432 |
 | Grafana | 3000 |
-| OTLP | 4317 (gRPC), 4318 (HTTP) |
+| OTLP | 4317 (gRPC), 4318 (HTTP, 서버가 쓰는 쪽) |
+| tokio-console (개발 모드에서만) | 6669 |
 | Vite 개발 서버 | 5173 |

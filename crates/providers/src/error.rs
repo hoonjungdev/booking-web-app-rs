@@ -1,6 +1,10 @@
 //! 업체 호출 실패 분류 (docs/03-resilience.md §1)
 //!
 //! 이후의 판단(재시도할지, 결과 불명으로 볼지, 서킷에 실패로 셀지)은 모두 이 분류만 보고 한다.
+//!
+//! **업체가 보낸 글자는 오류 메시지(`Display`)에 넣지 않는다.** 오류 메시지는 로그 · 추적 · 예약의 실패 사유로
+//! 퍼져 나가는데, 업체가 오류 본문에 요청 값(고객 이름 · 전화번호)을 되돌려 줄 수 있기 때문이다.
+//! 원인을 찾는 데 필요한 그 내용은 [`ProviderError::detail`]로 꺼내 DB의 호출 기록에만 남긴다.
 
 use std::time::{Duration, Instant};
 
@@ -28,11 +32,11 @@ pub enum ProviderError {
     /// 업무적 거절 (슬롯 마감 등). 기술적으로는 정상 응답
     #[error("업체가 거절함: {}", reason.code())]
     Rejected { reason: RejectReason },
-    /// 예상하지 못한 4xx. 대개 우리 쪽 버그
-    #[error("예상하지 못한 응답 (HTTP {status}): {body}")]
+    /// 예상하지 못한 4xx. 대개 우리 쪽 버그. `body`는 업체가 보낸 본문이라 메시지에 넣지 않는다
+    #[error("예상하지 못한 응답 (HTTP {status})")]
     Client { status: u16, body: String },
-    /// 응답 형식이 계약과 다름
-    #[error("응답 형식 오류: {detail}")]
+    /// 응답 형식이 계약과 다름. `detail`에는 응답 내용 일부가 들어갈 수 있어 메시지에 넣지 않는다
+    #[error("응답 형식 오류")]
     Decode { detail: String },
     /// 서킷이 열려 있어서 호출하지 않음. `retry_at`이 지나면 다시 시도해 볼 수 있다
     #[error("서킷이 열려 있어 호출하지 않음")]
@@ -67,6 +71,18 @@ impl ProviderError {
             Self::Decode { .. } => "decode_error",
             Self::CircuitOpen { .. } => "circuit_open",
             Self::Throttled { .. } => "throttled",
+        }
+    }
+
+    /// 호출 기록(`provider_calls.error_detail`)에 남길 자세한 내용: 메시지 + 업체가 보낸 글자.
+    ///
+    /// 여기서 나온 값은 로그나 span에 넣지 않는다 (모듈 설명 참고). DB의 호출 기록에만 쓴다.
+    /// 그곳은 고객 정보가 원래 저장되는 곳이고, 30일 뒤에 지운다.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Client { body, .. } => format!("{self}: {body}"),
+            Self::Decode { detail } => format!("{self}: {detail}"),
+            other => other.to_string(),
         }
     }
 
@@ -179,6 +195,34 @@ mod tests {
             assert_eq!(error.outcome(), outcome);
             assert_eq!(error.definitely_not_processed(), not_processed, "{outcome}");
             assert_eq!(error.circuit_verdict(), verdict, "{outcome}");
+        }
+    }
+
+    #[test]
+    fn 업체가_보낸_글자는_메시지에_넣지_않고_호출_기록용_내용에만_넣는다() {
+        // 업체가 검증 오류 본문에 요청 값을 되돌려 준 경우
+        let echoed = r#"{"error":{"code":"invalid","message":"홍길동 010-1234-5678"}}"#;
+        let client = ProviderError::Client {
+            status: 422,
+            body: echoed.into(),
+        };
+        assert_eq!(client.to_string(), "예상하지 못한 응답 (HTTP 422)");
+        assert!(client.detail().contains(echoed));
+
+        let decode = ProviderError::Decode {
+            detail: r#"invalid type: string "홍길동", expected u32"#.into(),
+        };
+        assert_eq!(decode.to_string(), "응답 형식 오류");
+        assert!(decode.detail().contains("홍길동"));
+
+        // 업체가 보낸 글자가 없는 분류는 메시지와 같다
+        for error in all_errors() {
+            if !matches!(
+                error,
+                ProviderError::Client { .. } | ProviderError::Decode { .. }
+            ) {
+                assert_eq!(error.detail(), error.to_string());
+            }
         }
     }
 

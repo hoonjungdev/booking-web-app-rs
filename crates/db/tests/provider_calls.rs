@@ -23,6 +23,7 @@ fn call(booking_id: Option<domain::BookingId>, attempt: i32, outcome: &str) -> N
         rate_limit_remaining: None,
         retry_after_ms: None,
         error_detail: None,
+        trace_id: None,
     }
 }
 
@@ -41,6 +42,7 @@ async fn 여러_건을_한_번에_넣고_예약별로_읽는다(pool: PgPool) {
         http_status: Some(429),
         rate_limit_remaining: Some(0),
         retry_after_ms: Some(1000),
+        trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
         ..call(Some(new.id), 2, "rate_limited")
     };
     // 예약과 상관없는 호출 (값이 비어 있는 칸은 NULL로 들어간다)
@@ -67,6 +69,7 @@ async fn 여러_건을_한_번에_넣고_예약별로_읽는다(pool: PgPool) {
         assert_eq!(record.rate_limit_remaining, expected.rate_limit_remaining);
         assert_eq!(record.retry_after_ms, expected.retry_after_ms);
         assert_eq!(record.error_detail, expected.error_detail);
+        assert_eq!(record.trace_id, expected.trace_id);
     }
 }
 

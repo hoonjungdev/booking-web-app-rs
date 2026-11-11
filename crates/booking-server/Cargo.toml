@@ -9,6 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# tokio-console 개발 모드 (docs/05-observability-and-analytics.md §9). telemetry 크레이트의 같은 feature를 켠다.
+tokio-console = ["telemetry/tokio-console"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -18,6 +22,8 @@ db.workspace = true
 domain.workspace = true
 dotenvy.workspace = true
 figment.workspace = true
+# 메트릭 계측기 (Counter · Histogram · Gauge). SDK 설정은 telemetry 크레이트가 맡는다.
+opentelemetry.workspace = true
 providers.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -29,11 +35,12 @@ thiserror.workspace = true
 # sync: 호출 기록 채널(mpsc)
 tokio = { workspace = true, features = ["sync"] }
 tokio-util.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 mock-provider.workspace = true
+# testing: span · 메트릭을 메모리에 모아 확인한다 (tests/telemetry.rs)
+telemetry = { workspace = true, features = ["testing"] }
 tower = { workspace = true, features = ["util"] }

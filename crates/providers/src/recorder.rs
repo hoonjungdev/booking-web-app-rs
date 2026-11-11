@@ -43,6 +43,8 @@ pub struct CallRecord {
     /// 업체가 `Retry-After`로 알려 준 대기 시간
     pub retry_after: Option<Duration>,
     pub error_detail: Option<String>,
+    /// 이 시도가 속한 trace. 관리자 화면의 호출 기록에서 Grafana의 trace로 넘어갈 때 쓴다.
+    pub trace_id: Option<String>,
 }
 
 /// 호출 기록을 보내는 쪽. 복제해서 업체마다 하나씩 나눠 준다.
@@ -58,6 +60,7 @@ pub struct CallRecorder {
 /// 최대 `capacity`건을 쌓아 둘 수 있는 기록 채널을 만든다
 pub fn call_recorder(capacity: usize) -> (CallRecorder, mpsc::Receiver<CallRecord>) {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
+    crate::metrics::register_recorder();
     let recorder = CallRecorder {
         sender,
         dropped: Arc::new(AtomicU64::new(0)),
@@ -78,6 +81,7 @@ impl CallRecorder {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 let before = self.dropped.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::record_dropped();
                 // 버릴 때마다 로그를 남기면 그것도 부하가 되므로 처음과 1000건마다만 남긴다
                 if before.is_multiple_of(1000) {
                     tracing::warn!(
@@ -115,6 +119,7 @@ mod tests {
             rate_limit_remaining: Some(9),
             retry_after: None,
             error_detail: None,
+            trace_id: None,
         }
     }
 

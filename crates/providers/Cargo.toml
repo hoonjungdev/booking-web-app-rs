@@ -14,6 +14,10 @@ async-trait.workspace = true
 chrono.workspace = true
 domain.workspace = true
 governor.workspace = true
+# 계측 API만 쓴다 (메트릭 계측기, trace 정보 전파). 어디로 내보낼지는 실행 파일이 telemetry 크레이트로 정한다.
+opentelemetry.workspace = true
+# 요청 헤더에 `traceparent`를 넣는 도우미
+opentelemetry-http.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

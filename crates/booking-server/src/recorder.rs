@@ -69,6 +69,7 @@ fn to_row(record: CallRecord) -> NewProviderCall {
             .retry_after
             .map(|wait| saturating_i32(wait.as_millis())),
         error_detail: record.error_detail,
+        trace_id: record.trace_id,
     }
 }
 
@@ -99,6 +100,7 @@ mod tests {
             rate_limit_remaining: Some(u32::MAX),
             retry_after: Some(Duration::from_secs(1)),
             error_detail: Some("호출 한도 초과".into()),
+            trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
         };
         let row = to_row(record);
         assert_eq!(row.provider_id, "alpha");
@@ -111,5 +113,9 @@ mod tests {
             "너무 큰 값은 자른다"
         );
         assert_eq!(row.retry_after_ms, Some(1_000));
+        assert_eq!(
+            row.trace_id.as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
     }
 }

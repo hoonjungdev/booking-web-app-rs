@@ -98,3 +98,42 @@
 - 상태: 채택 ([03 §8](03-resilience.md#8-bulkhead-격리)의 일부를 뒤로 미룸)
 - 이유: 지금은 업체가 alpha 하나뿐이라 업체 사이의 격리를 만들어도 시험할 수 없다. 업체 쪽 bulkhead(Semaphore)는 Phase 3에서 구현해서, 한 업체에 대한 동시 호출 수는 이미 제한된다.
 - 결과: Phase 6 전까지는 한 업체가 느려지면 워커 루프(기본 4개)가 모두 그 업체 호출에 묶일 수 있다 (호출 예산 15초가 상한). 서킷이 열리면 호출이 바로 끝나므로 풀린다. "한 업체만 장애" 시나리오 테스트도 Phase 6에서 추가한다.
+
+### D-20. 라이브러리 크레이트는 OpenTelemetry API만 쓰고, SDK 구성은 telemetry 크레이트에만 둔다
+- 상태: 채택
+- 이유: OpenTelemetry는 **계측 API**(`opentelemetry` 크레이트)와 **수집 · 전송 구현**(`opentelemetry_sdk`, `opentelemetry-otlp`)을 나눠 놓았다. 라이브러리는 API로 값을 기록만 하고, 어디로 내보낼지는 실행 파일이 정한다. .NET에서 라이브러리가 `System.Diagnostics.Metrics.Meter` · `ActivitySource`만 쓰고 OpenTelemetry SDK는 앱이 구성하는 것과 같다. 이렇게 하면 `providers`가 `telemetry`(axum · SDK · exporter를 끌고 온다)에 의존하지 않아도 되고, SDK를 설치하지 않은 테스트에서는 계측 코드가 아무 일도 하지 않는다.
+- 구성
+  - `providers`: `opentelemetry`(API) + `opentelemetry-http`(헤더에 `traceparent` 넣기). 시도마다 쌓이는 지표(시간, 재시도, 호출 제한, 버린 기록)를 직접 기록하고, 업체 요청에 trace 정보를 싣는다.
+  - `booking-server`: `opentelemetry`(API)로 예약 · 작업 큐 지표를 기록한다. 서킷 · pause · 동시 실행 수 같은 **현재 상태**는 `ResilientProvider`가 값을 내주고(`circuit_state()`, `paused_until()`, `in_flight()`, `rate_limit_remaining()`), 서버가 지표를 내보낼 때마다 읽어 간다. 같은 값을 Phase 5의 관리자 API(업체 런타임 상태)도 쓴다.
+  - `db`, `domain`: OpenTelemetry를 모른다. trace ID는 문자열과 JSON으로 받아 저장만 한다 (`db::TraceRef`).
+  - `telemetry`: SDK · exporter · tracing layer 조립, HTTP 서버 미들웨어, trace 전파 도우미.
+- 결과: `providers`는 "지금 OpenTelemetry Context"에서 trace 정보를 읽는다. tracing span에 들어가면 그 span이 지금 Context가 되는 것은 `tracing-opentelemetry`의 기본 동작(context activation)이다. 통합 테스트(`tests/telemetry.rs`)가 업체 쪽 span이 같은 trace로 이어지는지 검사하므로, 이 동작이 꺼지면 테스트가 실패한다.
+- 대안: 지표를 trait(관찰자)으로 뒤집어 서버가 구현 (호출 기록 채널처럼. 지표마다 메서드가 늘고 얻는 것이 없다), `providers` → `telemetry` 의존 (의존 방향이 늘고 무거워진다), tracing 이벤트로 지표 만들기(`MetricsLayer`. 버킷 지정과 관측형 gauge를 쓸 수 없다)
+
+### D-21. OTLP는 HTTP/protobuf로 보내고, 내보내기는 SDK의 전용 스레드에 맡긴다
+- 상태: 채택
+- 이유: `opentelemetry-otlp`의 기본 구성이다. gRPC(tonic)를 쓰지 않아 의존성이 가볍고, 내보내기가 tokio 런타임과 분리된다. SDK가 신호마다 전용 스레드를 띄워 그 안에서 blocking HTTP 클라이언트로 보내므로, 요청을 처리하는 태스크는 메모리 큐에 넣기만 한다 ("관측이 서비스를 느리게 하면 안 된다").
+- 결과: 수집기 주소의 기본값은 `http://localhost:4318`이다 (gRPC 포트 4317이 아니다). 메트릭은 10초마다 내보낸다 (SDK 기본값 60초는 로컬에서 대시보드를 보며 실험하기에 길다. `OTEL_METRIC_EXPORT_INTERVAL`로 바꾼다).
+- 대안: gRPC (tonic과 tokio 런타임이 필요하고, 얻는 것은 스트리밍 정도인데 지금은 쓸 일이 없다)
+
+### D-22. 로그 필터는 전역으로 걸고, per-layer filter는 tokio-console 모드에서만 쓴다
+- 상태: 채택
+- 배경: tracing-subscriber에서 필터를 거는 방법은 둘이다. **전역 필터**는 걸린 span · 이벤트를 어느 layer에도 보내지 않는다. **per-layer filter**는 layer마다 따로 거른다 (예: 콘솔은 info, OpenTelemetry는 debug).
+- 이유: per-layer filter를 쓰면 span과 로그가 **가끔 사라진다**. per-layer filter는 "이번 이벤트를 어느 layer가 껐는지"를 스레드별 상태에 적어 두는데, 이벤트를 남기지 않고 "이 수준이 켜져 있나?"만 묻는 코드(`tracing::enabled!`, `log::log_enabled!`)가 있으면 그 상태가 지워지지 않고 남아 같은 스레드의 다음 span · 이벤트가 버려진다. sqlx가 쿼리마다 이렇게 묻기 때문에, 처음 구현했을 때 요청 span과 로그가 무작위로 빠졌다 (응답에 `X-Trace-Id`가 붙었다 안 붙었다 했다). 전역 필터에는 이 상태가 없다.
+- 결과: 전역 필터 하나로는 "콘솔은 warn, 추적은 info"처럼 나눠 걸 수 없다. 그대로 두면 로그를 줄이려고 `RUST_LOG=warn`으로 올렸을 때 span까지 꺼져 추적과 `X-Trace-Id`가 사라진다. 그래서 전역 필터를 직접 만들었다 (`telemetry::filter::GlobalFilter`): **이벤트(로그)는 `RUST_LOG`를 따르고, span은 info 이상이면 항상 통과**시킨다. 콘솔 로그와 Loki로 가는 로그에는 같은 필터가 적용된다.
+- 결과: 내보내는 과정에서 생긴 로그가 다시 내보내지는 되먹임도 per-layer filter 없이 막아야 한다. SDK는 자기 내보내기 스레드에서 생긴 로그만 거르고, exporter의 HTTP 클라이언트(별도 스레드)가 남기는 로그는 거르지 못한다. 로그 브리지를 감싸는 평범한 layer(`WithoutExporterLogs`)가 그 대상(`reqwest` · `hyper` · `h2` · `opentelemetry`)의 로그를 넘기지 않는다.
+- 예외: tokio-console은 `RUST_LOG`와 상관없이 런타임 내부 이벤트(`tokio=trace`)를 모두 받아야 해서, 그 모드(`tokio-console` feature)에서만 우리 layer들에 per-layer filter를 건다. 위 문제를 피하려고 필터를 매번 다시 평가하게 한다 (`dynamic_filter_fn`. 남은 상태를 덮어쓴다). 그만큼 느려지므로 개발 모드에 한정한다. 이 모드에서는 span도 `RUST_LOG`를 따른다.
+- 대안: 모든 빌드에서 per-layer filter + 우회책 (tracing-subscriber 내부 동작에 기대는 범위가 넓어지고, 모든 이벤트에서 필터를 다시 평가한다)
+
+### D-23. 알림을 계산할 수 있도록 지표를 보완한다 (긴 버킷, `booking.unknown.oldest_age`)
+- 상태: 채택 ([05 §4](05-observability-and-analytics.md#4-메트릭-목록)의 버킷과 지표 목록을 보완)
+- 이유: 처음 설계의 지표만으로는 [05 §8](05-observability-and-analytics.md#8-대시보드와-알림)의 알림 둘을 계산할 수 없었다.
+  - "작업 지연 p95가 30초 초과": 히스토그램 버킷이 10초에서 끝나면 그 위의 값은 모두 한 칸에 들어가서, p95가 10초보다 크다는 것까지만 알 수 있다. → `jobs.lag`와 `booking.time_to_final`에는 30분까지 이어지는 버킷을 쓴다.
+  - "`unknown` 상태가 10분 넘게 유지": 상태 전이 횟수(`booking.transitions`)로는 "지금 unknown인 예약이 얼마나 오래됐는지"를 알 수 없다. → 가장 오래된 unknown 예약의 경과 시간을 gauge(`booking.unknown.oldest_age`)로 추가했다. `bookings (status, updated_at)` 인덱스로 한 건만 찾는다.
+- 결과: 히스토그램 버킷이 두 벌이다 (짧은 호출용 · 긴 흐름용). `tokio.runtime.*` 지표도 추가했다 (Service 대시보드의 런타임 패널용).
+- 같은 이유로 "서킷이 5분 넘게 Open" 알림은 서킷 상태 값만 보지 않고 "서킷에 막힌 호출이 계속 있는가"를 함께 본다. 서킷은 다음 호출이 올 때에야 Open에서 벗어나므로, 상태 값만 보면 업체가 복구된 뒤에도 (처리할 예약이 없는 동안) 계속 울린다.
+
+### D-24. 헬스 체크 요청은 추적과 지표에서 뺀다
+- 상태: 채택 ([04 §1](04-api.md#1-공통-규약)의 "모든 응답 헤더에 `X-Trace-Id`"에 예외를 둠)
+- 이유: `/healthz` · `/readyz`는 배포 환경에서 몇 초마다 불린다. 계측하면 trace 목록이 헬스 체크로 채워지고, API 요청 수 · 지연 지표가 실제 요청이 아닌 값에 묻힌다.
+- 결과: 헬스 체크 응답에는 `X-Trace-Id`가 없고 `http.server.request.duration`에도 잡히지 않는다. 라우터에서 계측 layer를 건 **뒤에** 헬스 체크 라우트를 등록하는 것으로 구현했다 (`api::router`).

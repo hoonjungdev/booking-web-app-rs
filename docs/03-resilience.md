@@ -52,6 +52,8 @@ pub enum ProviderError {
 
 "멱등 안전"하다는 것은 조회 호출(availability, find, list)이거나, 업체가 멱등키를 지원하는 생성 · 취소 호출이라는 뜻이다.
 
+오류 메시지에는 업체가 보낸 글자를 넣지 않는다 (Phase 4). `client_error`의 본문과 `decode_error`의 내용에는 업체가 되돌려 준 고객 정보가 들어 있을 수 있는데, 오류 메시지는 로그 · 추적 · 예약의 실패 사유(`status_reason`)로 퍼져 나간다. 그 내용은 `ProviderError::detail()`로 꺼내 호출 기록(`provider_calls.error_detail`)에만 남긴다.
+
 **구현 (Phase 3)**: 분류와 분류별 판단(처리 안 됐다고 확신할 수 있는지, 서킷 집계)은 `crates/providers/src/error.rs`, 호출 내 재시도 판단은 `crates/providers/src/resilience/retry.rs`의 `may_retry`에 있다. 워커는 호출 내 재시도까지 끝난 **최종 결과**를 보고 작업 수준에서 판단한다 (`crates/booking-server/src/worker/submit.rs`의 `decide`, 조회는 `resolve.rs`의 `decide_resolution`).
 
 | 최종 결과 | 워커의 처리 |
@@ -93,7 +95,7 @@ Polly가 권장하는 순서(Retry → CircuitBreaker → Timeout)와 같은 이
 - 호출 한 번은 최대 `call_budget_ms + rate_limit.max_wait_ms + bulkhead.max_wait_ms`가 걸린다. 워커의 lease가 이보다 짧으면 호출 도중 다른 워커가 같은 작업을 다시 가져가므로, 서버가 시작할 때 lease가 이 값 + 5초 이상인지 검사하고 아니면 시작하지 않는다.
 - 업체가 처리했을지 모르는 실패 뒤에는 멱등 안전할 때만 다시 보낸다. 그래서 멱등키 없는 업체의 생성 요청은 한 호출 안에서 두 번 나가지 않고, 그 실패가 그대로 워커에 전달된다.
 - 어댑터는 결과와 함께 응답 메타(HTTP 상태, `X-RateLimit-Remaining`)를 돌려준다. `ResilientProvider`가 메타는 호출 기록에 쓰고 결과만 바깥에 넘긴다 ([D-17](decisions.md#d-17-어댑터는-결과와-함께-응답-메타를-돌려준다)).
-- 메트릭은 Phase 4에서 붙인다. 지금은 로그와 `provider_calls`로 확인한다.
+- 메트릭과 추적 (Phase 4): 호출 하나가 `provider.call` span, 그 안의 시도 하나하나가 `provider.attempt` span이다. 시도가 끝날 때 `provider.call.duration`(결과별), 재시도할 때 `provider.call.retries`, 호출 제한에 걸리면 `provider.throttled`를 기록한다. 서킷 상태 · pause · 동시 실행 수 · 업체가 알려 준 남은 호출 수는 `ResilientProvider`가 현재 값을 내주고 서버가 지표로 내보낸다 ([05 §3 · §4](05-observability-and-analytics.md#3-추적-traces), [D-20](decisions.md#d-20-라이브러리-크레이트는-opentelemetry-api만-쓰고-sdk-구성은-telemetry-크레이트에만-둔다)).
 
 ## 3. 업체별 정책 (기본값)
 
@@ -192,7 +194,7 @@ stateDiagram-v2
 - 반만 열린 상태에서 시험 호출 자리가 모두 나가 있으면 `CircuitOpen`을 돌려준다 (다시 와 볼 시각: 1초 뒤, `open_ms`가 더 짧으면 그만큼). 시험 호출이 관문(rate limiter 등)에서 막혀 부르지 못하면 자리를 돌려받는다.
 - 시험 호출이 모두 나간 채 `open_ms`가 지나도록 결과가 다 돌아오지 않으면(호출이 취소되거나 패닉한 경우) 시험을 처음부터 다시 시작한다. 그러지 않으면 시험 자리가 영영 막혀 서버를 다시 띄울 때까지 그 업체를 부를 수 없다.
 - 호출 허락에 "상태 세대"를 붙인다. 다른 상태일 때 시작한 호출의 늦은 결과는 집계하지 않는다 (예: Closed일 때 나간 느린 호출의 성공이 Half-Open의 시험 호출 성공으로 잘못 세지지 않게).
-- 상태가 바뀌면 로그를 남긴다. 메트릭(Phase 4), 런타임 상태 API와 강제 열기 · 닫기(Phase 5)는 아직 없다.
+- 상태가 바뀌면 로그를 남긴다. 현재 상태는 `provider.circuit.state` 지표로 내보낸다 (Phase 4. Grafana의 서킷 상태 타임라인과 "5분 넘게 Open" 알림이 이 값을 쓴다). 런타임 상태 API와 강제 열기 · 닫기(Phase 5)는 아직 없다.
 
 ## 8. Bulkhead (격리)
 

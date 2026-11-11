@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdapterReply, BuildError, Capabilities, CreateBooking, ProviderAdapter, ProviderBooking,
-    ProviderError, ProviderPolicy, ResponseMeta,
+    ProviderError, ProviderPolicy, ResponseMeta, trace,
 };
 
 /// 에러 본문을 기록할 때 이 길이까지만 남긴다
@@ -55,13 +55,14 @@ impl AlphaAdapter {
             client_reference: reference.clone(),
         };
 
-        let response = self
+        let request = self
             .http
             .post(format!("{}/reservations", self.base_url))
             // 우리 예약 ID를 멱등키로 보낸다. 같은 예약을 다시 보내도 업체가 하나만 만든다.
             .header("Idempotency-Key", &reference)
-            .json(&body)
-            .send()
+            .json(&body);
+        // `trace::send`: 그냥 `.send()`와 같지만, 요청에 trace 정보를 실어 업체 쪽 처리까지 한 trace로 이어지게 한다
+        let response = trace::send(request, "/reservations")
             .await
             .map_err(|e| classify_transport(&e))?;
         *meta = read_meta(&response);
@@ -90,13 +91,11 @@ impl AlphaAdapter {
         meta: &mut ResponseMeta,
     ) -> Result<Option<ProviderBooking>, ProviderError> {
         // 참조값은 UUID라 URL에 그대로 넣어도 되는 문자(16진수와 '-')만 있다
-        let response = self
-            .http
-            .get(format!(
-                "{}/reservations?client_reference={reference}",
-                self.base_url
-            ))
-            .send()
+        let request = self.http.get(format!(
+            "{}/reservations?client_reference={reference}",
+            self.base_url
+        ));
+        let response = trace::send(request, "/reservations")
             .await
             .map_err(|e| classify_transport(&e))?;
         *meta = read_meta(&response);

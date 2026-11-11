@@ -16,10 +16,11 @@ use domain::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::{Span, field::Empty};
 use uuid::Uuid;
 
 use super::{ApiError, ApiState};
-use crate::auth::AuthenticatedClient;
+use crate::{auth::AuthenticatedClient, metrics, trace};
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
@@ -71,6 +72,14 @@ impl From<&Booking> for BookingResponse {
 ///
 /// `body`를 `Result<Json<_>, JsonRejection>`으로 받으면 본문 해석 실패를 직접 처리할 수 있다.
 /// 그냥 `Json<_>`으로 받으면 axum이 일반 텍스트로 거절해 버려 Problem Details 형식을 지킬 수 없다.
+///
+/// `skip_all`이 중요하다: 인자(`body`)에는 고객 이름 · 전화번호가 들어 있어서 span에 기록하면 안 된다.
+/// 예약 ID는 접수한 뒤에야 알 수 있으므로 `Empty`로 자리만 잡아 두고 나중에 채운다.
+#[tracing::instrument(
+    name = "booking.accept",
+    skip_all,
+    fields(booking_id = Empty, provider = Empty)
+)]
 pub async fn create(
     State(state): State<ApiState>,
     client: AuthenticatedClient,
@@ -94,6 +103,7 @@ pub async fn create(
     request
         .validate(now)
         .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
+    Span::current().record("provider", request.provider.as_str());
 
     let provider = db::providers::find(&state.pool, &request.provider)
         .await?
@@ -109,10 +119,14 @@ pub async fn create(
         request_hash: request_hash(&request)?,
         deadline_at: confirmation_deadline(now, request.slot_start),
         request,
+        // 이 요청의 trace를 상태 이력과 작업에 남긴다. 워커가 작업을 처리할 때 이 trace로 link를 건다.
+        trace: trace::current(),
     };
 
-    let booking = match db::bookings::accept(&state.pool, &new).await? {
+    let outcome = db::bookings::accept(&state.pool, &new).await?;
+    let booking = match outcome {
         AcceptOutcome::Created(booking) => {
+            metrics::booking_accepted(&booking);
             tracing::info!(
                 booking_id = %booking.id,
                 client = %client.name,
@@ -130,6 +144,8 @@ pub async fn create(
             ..
         } => return Err(ApiError::IdempotencyKeyReused),
     };
+    // 같은 멱등키로 다시 온 요청이면 새로 만든 ID가 아니라 기존 예약의 ID다
+    Span::current().record("booking_id", tracing::field::display(booking.id));
 
     let location = format!("/v1/bookings/{}", booking.id);
     Ok((
@@ -140,12 +156,14 @@ pub async fn create(
 }
 
 /// 자기 클라이언트의 예약을 조회한다. 다른 클라이언트의 예약이나 잘못된 ID는 모두 404.
+#[tracing::instrument(name = "booking.get", skip_all, fields(booking_id = Empty))]
 pub async fn get(
     State(state): State<ApiState>,
     client: AuthenticatedClient,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<BookingResponse>, ApiError> {
     let Path(id) = id.map_err(|_| ApiError::BookingNotFound)?;
+    Span::current().record("booking_id", tracing::field::display(id));
     let booking = db::bookings::find_for_client(&state.pool, client.id, BookingId::from_uuid(id))
         .await?
         .ok_or(ApiError::BookingNotFound)?;

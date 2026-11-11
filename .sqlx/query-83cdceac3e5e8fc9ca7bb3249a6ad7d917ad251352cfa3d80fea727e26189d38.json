@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO provider_calls (provider_id, operation, booking_id, job_id, attempt, started_at,\n                                    duration_ms, outcome, http_status, rate_limit_remaining,\n                                    retry_after_ms, error_detail, trace_id)\n        SELECT * FROM UNNEST($1::text[], $2::text[], $3::uuid[], $4::int8[], $5::int4[],\n                             $6::timestamptz[], $7::int4[], $8::text[], $9::int4[], $10::int4[],\n                             $11::int4[], $12::text[], $13::text[])\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "UuidArray",
+        "Int8Array",
+        "Int4Array",
+        "TimestamptzArray",
+        "Int4Array",
+        "TextArray",
+        "Int4Array",
+        "Int4Array",
+        "Int4Array",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "83cdceac3e5e8fc9ca7bb3249a6ad7d917ad251352cfa3d80fea727e26189d38"
+}
