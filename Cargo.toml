@@ -48,7 +48,7 @@ tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "s
 tokio-util = "0.7.20"
 tower = "0.5.3"
 # 관리자 웹 정적 파일 제공 (ServeDir). reqwest가 이미 쓰는 0.6을 그대로 쓴다.
-tower-http = { version = "0.6.11", features = ["fs"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
 tracing = "0.1.44"
 # tracing span → OpenTelemetry span. 기본 기능 중 MetricsLayer(이벤트로 메트릭 만들기)는 쓰지 않는다.
 tracing-opentelemetry = { version = "0.34.0", default-features = false, features = ["tracing-log"] }
