@@ -94,7 +94,8 @@ job.submit_booking  job_id=… booking_id=…          [새 trace, 위 trace를 
 - **HTTP 전파**: 업체 호출에 W3C `traceparent` 헤더를 붙인다. mock-provider도 계측되어 있으므로 업체 내부 지연까지 한 trace에서 보인다.
 - **작업 큐 전파**: 작업은 몇 분 뒤에 실행될 수도 있으므로 같은 trace에 이어 붙이지 않고 **span link**로 연결한다 (OpenTelemetry가 비동기 메시징에 권장하는 방식).
 - 모든 span에 `booking_id`를 속성으로 넣어서 예약 ID로 검색할 수 있게 한다.
-- 관리자 웹 예약 상세에서 `trace_id`를 누르면 Grafana(Tempo) 화면으로 이동한다.
+- 관리자 웹 예약 상세에서 `trace_id`를 누르면 Grafana(Tempo) 화면으로 이동한다. (Phase 5: 상태 이력 · 업체 호출 기록의 trace ID가 Grafana Explore 링크다. Grafana 주소는 `BOOKING_GRAFANA_URL`, 기본 `http://localhost:3000`)
+- 관리자 API 요청도 추적한다 (Phase 5). 재시도 · 서킷 조작 · 장애 주입 같은 조작 요청의 trace는 상태 이력(`actor=admin`)과 되살린 작업의 link로 이어진다. 화면이 몇 초마다 부르는 조회 요청도 trace가 되어 Tempo의 최근 trace 목록을 채우므로, 업체 호출 · 작업을 볼 때는 span 이름으로 거른다 (`{ name =~ "job.*" }`, `{ name = "provider.attempt" }`). 줄여야 하면 조회 요청만 샘플링에서 빼는 방법을 검토한다 (Phase 7).
 
 **구현 (Phase 4)**: 실제로 만들어지는 span (들여쓰기 = 부모 · 자식)
 
@@ -248,6 +249,13 @@ ORDER BY bucket;
 ```
 `circuit_open`과 `throttled`는 실제로 호출하지 않아 0ms에 가까우므로 지연 통계에서 뺀다. 넣으면 p95가 실제보다 좋아 보인다.
 
+**구현 (Phase 5)**: `db::provider_calls::{timeseries, outcome_counts, summary}`와 관리자 통계 API (`/admin/api/stats/...`, [04 §3](04-api.md#3-관리자-api-adminapi)).
+- 위 쿼리를 둘로 나눴다: 구간별 집계(호출 수 · 재시도 · 분위수 · 최소 남은 호출 수)와 구간 · 결과별 수(`GROUP BY bucket, outcome`). 결과 종류가 정해져 있지 않아도(새 분류가 생겨도) 그대로 `by_outcome`에 담긴다.
+- `date_bin`의 기준 시각을 `'2000-01-01T00:00:00Z'::timestamptz`로 UTC에 못 박았다. 오프셋 없이 쓰면 DB 세션의 시간대를 따른다.
+- 호출이 없는 구간은 쿼리 결과에 없으므로 서버가 0으로 채운다 (차트가 끊기지 않게). 구간 경계는 Unix 시각을 간격으로 내림한 값이라 `date_bin`과 같다.
+- 업체별 요약의 성공률은 대시보드와 같은 정의: (`success` + `rejected`) ÷ 실제로 부른 시도.
+- 관리자 웹 업체 상세의 p95는 이 정확한 값이고, Grafana Provider Overview의 p95는 히스토그램 근사값이다 (§2). 둘을 나란히 보면 버킷 설계가 정확도에 주는 영향이 보인다.
+
 ## 8. 대시보드와 알림
 
 `observability/grafana/`에 대시보드 JSON을 코드로 관리하고, 컨테이너가 시작될 때 자동으로 등록(provisioning)한다.
@@ -259,6 +267,7 @@ ORDER BY bucket;
 | Service | API 요청 수 · 에러율 · 지연, tokio 런타임 지표 |
 
 **구현 (Phase 4)**: 파일 구성과 고치는 방법은 [`observability/README.md`](../observability/README.md)에 있다.
+- Phase 5부터 관리자 웹이 관리자 API를 몇 초마다 부른다. 이 요청도 `http.server.request.duration`에 라우트 틀(`/admin/api/...`)과 함께 남으므로, Service 대시보드의 "예약 API 가용성"(SLO)은 `http_route=~"/v1/.+"`로 예약 API만 센다. 요청 수 · 지연 패널은 서비스 전체(관리자 API 포함)다.
 - Grafana(http://localhost:3000)의 Dashboards → **Booking** 폴더에 세 대시보드가 있다. JSON 파일을 고치면 10초 안에 다시 읽는다.
 - Provider Overview 아래쪽에 **"느린 업체 호출"** · **"실패한 업체 호출"** 표가 있다 (Tempo 검색). 행을 누르면 그 호출의 trace가 열리고, `provider.attempt` 아래에서 mock-provider 내부의 `chaos.delay`까지 이어서 볼 수 있다. Booking Pipeline에는 "포기한 작업" · "최근 작업" 표가, Service에는 경고 · 오류 로그(Loki)가 있다.
 - 성공률은 "업체가 정상으로 답한 비율"로 정의했다: `(success + rejected) ÷ 실제로 부른 시도`. 업무적 거절은 업체가 정상이라는 뜻이라 성공으로 세고, 부르지 않은 시도는 분모에서 뺀다.

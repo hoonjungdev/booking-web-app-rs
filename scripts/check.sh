@@ -5,9 +5,10 @@
 # 사용법:
 #   scripts/check.sh            전체 검사 (all)
 #   scripts/check.sh fast       포맷 + clippy (Stop 훅이 쓰는 빠른 검사)
-#   scripts/check.sh <단계>...  fmt | clippy | test | sqlx | deny | shear 중 골라서 실행
+#   scripts/check.sh <단계>...  fmt | clippy | test | sqlx | deny | shear | api | web 중 골라서 실행
 #
 # DB가 필요한 단계: test(테스트마다 임시 DB를 만든다), sqlx. 먼저 `docker compose up -d --wait`.
+# web 단계는 Node.js와 pnpm이 필요하다 (web/admin/package.json의 packageManager 버전).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -91,20 +92,60 @@ run_shear() {
   cargo shear
 }
 
+# 관리자 웹은 서버 코드에서 만든 API 문서(openapi.json)로 TypeScript 타입을 만든다 (docs/06-admin-frontend.md §4).
+# 서버 API를 바꾸고 문서를 다시 만들지 않으면 화면이 옛 계약으로 빌드되므로, 커밋된 파일이 최신인지 검사한다.
+run_api() {
+  step "api: OpenAPI 문서(web/admin/openapi.json)가 서버 코드와 같은지 검사"
+  local generated
+  generated=$(mktemp)
+  cargo run -q --locked -p booking-server -- openapi >"$generated"
+  if ! diff -q web/admin/openapi.json "$generated" >/dev/null; then
+    diff -u web/admin/openapi.json "$generated" | head -40 >&2 || true
+    rm -f "$generated"
+    printf '%sweb/admin/openapi.json이 서버 코드와 다릅니다.%s 갱신: (cd web/admin && pnpm gen)\n' "$red" "$reset" >&2
+    exit 1
+  fi
+  rm -f "$generated"
+}
+
+run_web() {
+  require pnpm "mise use -g pnpm (또는 npm install -g pnpm)"
+  step "web: 관리자 웹 (API 타입 · 타입 검사 · ESLint · 빌드)"
+  (
+    cd web/admin
+    pnpm install --frozen-lockfile
+    # openapi.json에서 다시 만든 타입이 커밋된 src/api/schema.d.ts와 같은지 본다 (직접 고치지 않는 파일)
+    local generated
+    generated=$(mktemp)
+    pnpm exec openapi-typescript openapi.json -o "$generated" >/dev/null
+    if ! diff -q src/api/schema.d.ts "$generated" >/dev/null; then
+      rm -f "$generated"
+      printf '%ssrc/api/schema.d.ts가 openapi.json과 다릅니다.%s 갱신: (cd web/admin && pnpm gen:api)\n' "$red" "$reset" >&2
+      exit 1
+    fi
+    rm -f "$generated"
+    pnpm typecheck
+    pnpm lint
+    pnpm build
+  )
+}
+
 steps=("$@")
 [[ ${#steps[@]} -eq 0 ]] && steps=(all)
 
 for s in "${steps[@]}"; do
   case "$s" in
     fast)   run_fmt; run_clippy ;;
-    all)    run_fmt; run_clippy; run_test; run_sqlx; run_deny; run_shear ;;
+    all)    run_fmt; run_clippy; run_test; run_sqlx; run_deny; run_shear; run_api; run_web ;;
     fmt)    run_fmt ;;
     clippy) run_clippy ;;
     test)   run_test ;;
     sqlx)   run_sqlx ;;
     deny)   run_deny ;;
     shear)  run_shear ;;
-    *) echo "알 수 없는 단계: $s (fast | all | fmt | clippy | test | sqlx | deny | shear)" >&2; exit 2 ;;
+    api)    run_api ;;
+    web)    run_web ;;
+    *) echo "알 수 없는 단계: $s (fast | all | fmt | clippy | test | sqlx | deny | shear | api | web)" >&2; exit 2 ;;
   esac
 done
 

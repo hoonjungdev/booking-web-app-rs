@@ -250,6 +250,20 @@ CREATE TABLE reconciliation_issues (
 - `migrations/20261112000001_add_jobs_dead_index.sql`: dead 작업용 부분 인덱스 `jobs_dead_idx`. `jobs.dead` 지표를 내려고 몇 초마다 세는 조회가 끝난 작업이 쌓여도 느려지지 않게 한다 (Phase 5의 dead 작업 목록도 쓴다).
 - `db::jobs::claim_next`가 작업을 가져가면서 "실행하기로 한 시각보다 얼마나 밀렸는지"(`now() - run_at`)를 함께 돌려준다 (`jobs.lag` 지표).
 
+### 구현 메모 (Phase 5)
+- 새 마이그레이션은 없다. 관리자 화면의 조회는 기존 인덱스를 쓴다: 예약 목록은 기본 키(UUID v7이라 ID 순서 = 접수 순서)로 커서를 넘기고, dead 작업 목록은 `jobs_dead_idx`, 호출 통계는 `provider_calls_time_idx (provider_id, started_at)`.
+- 목록 조회의 선택 조건은 `($1::text IS NULL OR status = $1)`처럼 쓴다. 조건 조합마다 SQL을 따로 만들지 않고 문장 하나로 `query_as!`의 컴파일 시점 검사를 받는다.
+- 업체별 요약 통계는 업체 ID 목록을 받아 `provider_id = ANY($1)`로 찾는다 (인덱스가 업체 ID부터 시작하므로 시각 조건만 쓰면 테이블 전체를 훑는다).
+- 관리자 재시도 (`booking_server::api::admin::retry`, [D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다)), 한 트랜잭션:
+  1. `bookings::get_for_update`: 예약 행을 잠그고 읽는다 (`SELECT … FOR UPDATE`). 같은 예약에 대한 동시 조작이 차례로 처리된다.
+  2. `jobs::has_active_for_booking`: 대기 · 실행 중인 작업이 있으면 거절 (한 예약에 처리 중인 작업은 하나).
+  3. `bookings::transition(failed → pending, AdminRetry, actor "admin")`, `bookings::set_deadline`(지금부터 다시 계산한 확정 기한).
+  4. `jobs::requeue`: 그 예약의 dead 작업을 같은 행으로 되살린다 (`status = 'queued'`, `run_at = now()`, 종류 · payload · trace 문맥 교체. `WHERE status = 'dead'`라서 두 번 되살리지 않는다). dead 작업이 없으면 `jobs::enqueue_with_payload`로 새로 등록한다.
+  - `attempts`는 되돌리지 않고 `max_attempts = attempts + 8`로 한도를 늘린다. `attempts`가 lease 증표라 같은 번호가 다시 나오면 lease를 잃은 옛 워커의 늦은 쓰기를 막지 못한다 (위 "lease와 fencing").
+- `submit_booking` 작업의 `payload`에 `{"lookup_first": true}`가 있으면 워커가 보내기 전에 업체에서 먼저 찾는다 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)). payload 형식이 깨졌으면 더 조심하는 쪽(조회부터)으로 읽는다.
+- `JobRecord`에 `locked_until` · `created_at` · `updated_at`을 더했다 (관리자 화면의 작업 목록).
+- dead 작업 목록은 전용 쿼리(`status = 'dead'`를 상수로 적은 것)로 읽는다. "조건이 NULL이면 건너뛰는" 쿼리는 prepared statement의 일반 실행 계획에서 부분 인덱스 `jobs_dead_idx`를 쓰지 못해, 끝난 작업이 쌓일수록 느려진다.
+
 ## 5. 작업 큐 동작
 
 별도 메시지 브로커(RabbitMQ, Kafka) 없이 PostgreSQL 테이블로 작업 큐를 만든다. → [D-03](decisions.md#d-03-예약-생성은-비동기202--postgresql-작업-큐)

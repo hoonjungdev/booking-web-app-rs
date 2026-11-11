@@ -10,6 +10,10 @@
 //! 현재 시각(`now`)을 인자로 받는 순수한 상태 머신이다. I/O도 잠금도 없어서 실제로 기다리지 않고
 //! 시간 흐름을 흉내 내 모든 전이를 단위 테스트할 수 있다. 여러 태스크가 함께 쓰도록 잠그는 일은
 //! `ResilientProvider`가 `Mutex`로 맡는다.
+//!
+//! 관리자가 상태를 강제할 수도 있다 ([`CircuitBreaker::control`], Phase 5). 강제된 동안에는 호출 결과를 세지 않고,
+//! `open_ms`가 지나도 상태가 저절로 바뀌지 않는다. `reset`으로 풀면 닫힌 상태에서 처음부터 다시 센다.
+//! (≈ Polly의 `Isolate()` / `Reset()`, Resilience4j의 forced-open · disabled 상태)
 
 use std::{
     collections::VecDeque,
@@ -20,6 +24,49 @@ use crate::{CircuitBreakerPolicy, CircuitVerdict};
 
 /// 반만 열린 상태에서 시험 호출 자리가 모두 찼을 때, 다시 와 보라고 알려 줄 최대 대기 시간
 const HALF_OPEN_BUSY_RETRY: Duration = Duration::from_secs(1);
+
+/// 관리자의 서킷 조작 (`POST /admin/api/providers/{id}/circuit`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitAction {
+    /// 강제로 연다. 풀 때까지(`Reset`) 호출하지 않는다 (업체 점검 공지에 대응)
+    ForceOpen,
+    /// 강제로 닫는다. 풀 때까지 실패가 쌓여도 열리지 않는다 (업체는 정상인데 서킷이 잘못 열릴 때)
+    ForceClose,
+    /// 강제 상태를 풀고, 닫힌 상태에서 최근 결과를 비우고 처음부터 다시 센다
+    Reset,
+}
+
+/// 관리자가 강제로 정해 둔 상태
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedState {
+    Open,
+    Closed,
+}
+
+impl ForcedState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// 지금 서킷 상태를 자세히 본 것 (관리자 화면의 업체 런타임 상태)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitSnapshot {
+    pub state: CircuitState,
+    /// 관리자가 강제로 정한 상태면 `Some`
+    pub forced: Option<ForcedState>,
+    /// 닫힌 상태: 실패율 계산에 쓰는 최근 결과 수와 그중 실패 수
+    pub recent_calls: u32,
+    pub recent_failures: u32,
+    /// 열린 상태: 시험 호출을 시작할 수 있게 되는 시각 (강제로 열렸으면 `None`. 풀 때까지 열려 있다)
+    pub open_until: Option<Instant>,
+    /// 반만 열린 상태: 성공한 시험 호출 수와 결과를 기다리는 시험 호출 수
+    pub probes_succeeded: u32,
+    pub probes_in_flight: u32,
+}
 
 /// 밖에서 보는 서킷 상태
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +116,12 @@ enum State {
 }
 
 impl State {
+    fn closed() -> Self {
+        Self::Closed {
+            recent: VecDeque::new(),
+        }
+    }
+
     fn half_open(now: Instant) -> Self {
         Self::HalfOpen {
             in_flight: 0,
@@ -78,21 +131,27 @@ impl State {
     }
 }
 
+/// 개수를 `u32`로 바꾼다. 창 크기(`window`)가 `u32`라서 넘칠 일은 없다.
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug)]
 pub struct CircuitBreaker {
     policy: CircuitBreakerPolicy,
     state: State,
     generation: u64,
+    /// 관리자가 강제로 정한 상태. `Some`이면 호출 결과로 상태가 바뀌지 않는다.
+    forced: Option<ForcedState>,
 }
 
 impl CircuitBreaker {
     pub fn new(policy: CircuitBreakerPolicy) -> Self {
         Self {
             policy,
-            state: State::Closed {
-                recent: VecDeque::new(),
-            },
+            state: State::closed(),
             generation: 0,
+            forced: None,
         }
     }
 
@@ -104,10 +163,67 @@ impl CircuitBreaker {
         }
     }
 
+    /// 지금 상태를 자세히 본다. 상태를 바꾸지 않는다 (열린 지 `open_ms`가 지났어도 다음 호출이 올 때까지는 Open이다).
+    pub fn snapshot(&self) -> CircuitSnapshot {
+        let mut snapshot = CircuitSnapshot {
+            state: self.state(),
+            forced: self.forced,
+            recent_calls: 0,
+            recent_failures: 0,
+            open_until: None,
+            probes_succeeded: 0,
+            probes_in_flight: 0,
+        };
+        match &self.state {
+            State::Closed { recent } => {
+                snapshot.recent_calls = count(recent.len());
+                snapshot.recent_failures = count(recent.iter().filter(|failed| **failed).count());
+            }
+            State::Open { until } => {
+                snapshot.open_until = self.forced.is_none().then_some(*until);
+            }
+            State::HalfOpen {
+                in_flight,
+                succeeded,
+                ..
+            } => {
+                snapshot.probes_succeeded = *succeeded;
+                snapshot.probes_in_flight = *in_flight;
+            }
+        }
+        snapshot
+    }
+
+    /// 관리자 조작. 상태가 바뀌므로 그 전에 받은 허락의 늦은 결과는 세지 않는다 (세대가 바뀐다).
+    pub fn control(&mut self, action: CircuitAction, now: Instant) {
+        let (forced, state) = match action {
+            CircuitAction::ForceOpen => (
+                Some(ForcedState::Open),
+                State::Open {
+                    until: now + self.policy.open_duration(),
+                },
+            ),
+            CircuitAction::ForceClose => (Some(ForcedState::Closed), State::closed()),
+            CircuitAction::Reset => (None, State::closed()),
+        };
+        self.forced = forced;
+        self.change(state);
+    }
+
     /// 호출해도 되는지 묻는다. 안 되면 다시 시도해 볼 시각을 담은 `Err`.
     ///
     /// 열린 지 `open_ms`가 지났으면 여기서 HalfOpen으로 바뀌고 첫 시험 호출을 허락한다.
     pub fn try_acquire(&mut self, now: Instant) -> Result<Permit, Instant> {
+        match self.forced {
+            // 강제로 열려 있으면 풀 때까지 막는다. 기다리는 쪽(워커)이 너무 자주 묻지 않도록 open_ms 뒤에 다시 오라고 한다.
+            Some(ForcedState::Open) => return Err(now + self.policy.open_duration()),
+            Some(ForcedState::Closed) => {
+                return Ok(Permit {
+                    generation: self.generation,
+                });
+            }
+            None => {}
+        }
         let probes = self.policy.half_open_probes;
         let open = self.policy.open_duration();
         match self.state {
@@ -156,8 +272,9 @@ impl CircuitBreaker {
 
     /// 허락받은 호출의 결과를 알린다.
     pub fn record(&mut self, permit: Permit, verdict: CircuitVerdict, now: Instant) {
-        if permit.generation != self.generation {
-            // 지금과 다른 상태일 때 시작한 호출의 늦은 결과. 현재 판단에 섞지 않는다.
+        if permit.generation != self.generation || self.forced.is_some() {
+            // 지금과 다른 상태일 때 시작한 호출의 늦은 결과이거나, 관리자가 상태를 강제해 둔 동안의 결과.
+            // 현재 판단에 섞지 않는다.
             return;
         }
         let open_until = now + self.policy.open_duration();
@@ -193,9 +310,7 @@ impl CircuitBreaker {
                     CircuitVerdict::Failure => Some(State::Open { until: open_until }),
                     CircuitVerdict::Success => {
                         *succeeded += 1;
-                        (*succeeded >= self.policy.half_open_probes).then_some(State::Closed {
-                            recent: VecDeque::new(),
-                        })
+                        (*succeeded >= self.policy.half_open_probes).then(State::closed)
                     }
                     // 시험 자리를 돌려주기만 한다
                     CircuitVerdict::Ignored => None,
@@ -426,6 +541,99 @@ mod tests {
         let probe = breaker.revalidate(waiting, later).unwrap();
         assert_ne!(probe, waiting);
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn 강제로_열면_open_ms가_지나도_풀_때까지_막는다() {
+        let mut breaker = CircuitBreaker::new(policy());
+        let t0 = Instant::now();
+        breaker.control(CircuitAction::ForceOpen, t0);
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        let much_later = t0 + Duration::from_secs(60);
+        assert_eq!(
+            breaker.try_acquire(much_later),
+            Err(much_later + Duration::from_secs(1)),
+            "시험 호출로 넘어가지 않고 open_ms 뒤에 다시 물으라고 한다"
+        );
+        assert_eq!(breaker.state(), CircuitState::Open);
+        let snapshot = breaker.snapshot();
+        assert_eq!(snapshot.forced, Some(ForcedState::Open));
+        assert_eq!(snapshot.open_until, None, "강제로 열면 끝나는 시각이 없다");
+
+        breaker.control(CircuitAction::Reset, much_later);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert!(breaker.try_acquire(much_later).is_ok());
+        assert_eq!(breaker.snapshot().forced, None);
+    }
+
+    #[test]
+    fn 강제로_닫으면_실패가_쌓여도_열리지_않는다() {
+        let mut breaker = CircuitBreaker::new(policy());
+        let t0 = Instant::now();
+        open(&mut breaker, t0);
+
+        breaker.control(CircuitAction::ForceClose, t0);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        for _ in 0..10 {
+            call(&mut breaker, Failure, t0);
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        let snapshot = breaker.snapshot();
+        assert_eq!(snapshot.forced, Some(ForcedState::Closed));
+        assert_eq!(snapshot.recent_calls, 0, "강제된 동안의 결과는 세지 않는다");
+
+        // 풀면 처음부터 다시 센다
+        breaker.control(CircuitAction::Reset, t0);
+        open(&mut breaker, t0);
+    }
+
+    #[test]
+    fn 조작_전에_시작한_호출의_결과는_세지_않는다() {
+        let mut breaker = CircuitBreaker::new(policy());
+        let t0 = Instant::now();
+        let before = breaker.try_acquire(t0).unwrap();
+        breaker.control(CircuitAction::Reset, t0);
+        breaker.record(before, Failure, t0);
+        assert_eq!(breaker.snapshot().recent_calls, 0);
+
+        // 강제로 열기 전에 허락받고 기다리던 호출은 다시 확인할 때 막힌다
+        let waiting = breaker.try_acquire(t0).unwrap();
+        breaker.control(CircuitAction::ForceOpen, t0);
+        assert!(breaker.revalidate(waiting, t0).is_err());
+    }
+
+    #[test]
+    fn 스냅샷은_상태별_진행_상황을_보여준다() {
+        let mut breaker = CircuitBreaker::new(policy());
+        let t0 = Instant::now();
+        for verdict in [Success, Failure, Ignored] {
+            call(&mut breaker, verdict, t0);
+        }
+        let closed = breaker.snapshot();
+        assert_eq!(
+            (closed.recent_calls, closed.recent_failures),
+            (2, 1),
+            "집계에서 빼는 결과는 세지 않는다"
+        );
+
+        let mut breaker = CircuitBreaker::new(policy());
+        open(&mut breaker, t0);
+        assert_eq!(
+            breaker.snapshot().open_until,
+            Some(t0 + Duration::from_secs(1))
+        );
+
+        let later = t0 + Duration::from_secs(1);
+        let probe = breaker.try_acquire(later).unwrap();
+        let _second = breaker.try_acquire(later).unwrap();
+        breaker.record(probe, Success, later);
+        let half_open = breaker.snapshot();
+        assert_eq!(half_open.state, CircuitState::HalfOpen);
+        assert_eq!(
+            (half_open.probes_succeeded, half_open.probes_in_flight),
+            (1, 1)
+        );
     }
 
     #[test]

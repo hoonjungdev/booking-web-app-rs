@@ -129,11 +129,40 @@ jobs:
           tool: cargo-shear@1.14.0
       - run: scripts/check.sh shear
 
+  # 관리자 웹이 쓰는 API 문서(web/admin/openapi.json)가 서버 코드와 같은지 (DB 불필요: .sqlx로 컴파일)
+  api:
+    name: api (OpenAPI 문서)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check.sh api
+
+  # 관리자 웹: API 타입이 openapi.json과 같은지, 타입 검사, ESLint, 빌드
+  web:
+    name: web (관리자 웹)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # pnpm 버전은 web/admin/package.json의 packageManager를 따른다
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: web/admin/package.json
+          cache: true
+          cache_dependency_path: web/admin/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+      - run: scripts/check.sh web
+
   # 브랜치 보호 규칙에는 이 job 하나만 "필수"로 걸면 된다.
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [fmt, clippy, test, sqlx, deny, shear]
+    needs: [fmt, clippy, test, sqlx, deny, shear, api, web]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

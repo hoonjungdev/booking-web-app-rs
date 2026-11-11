@@ -34,7 +34,7 @@ use tracing::{Span, field::Empty};
 
 pub use backoff::JobBackoff;
 pub use resolve::{REQUIRED_NOT_FOUND_CHECKS, decide_resolution};
-pub use submit::decide;
+pub use submit::{SubmitPayload, decide, decide_lookup};
 
 use crate::{metrics, registry::ProviderRegistry, trace};
 

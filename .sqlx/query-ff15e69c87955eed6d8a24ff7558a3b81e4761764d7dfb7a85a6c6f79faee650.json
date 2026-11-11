@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT kind,\n               count(*) FILTER (WHERE status = 'queued' AND run_at <= now()) AS \"ready!\",\n               count(*) FILTER (WHERE status = 'queued' AND run_at > now())  AS \"scheduled!\",\n               count(*) FILTER (WHERE status = 'running')                    AS \"running!\",\n               count(*) FILTER (WHERE status = 'dead')                       AS \"dead!\"\n        FROM jobs\n        WHERE status IN ('queued', 'running', 'dead')\n        GROUP BY kind\n        ORDER BY kind\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ready!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "scheduled!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "running!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "dead!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ff15e69c87955eed6d8a24ff7558a3b81e4761764d7dfb7a85a6c6f79faee650"
+}

@@ -9,10 +9,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# API 문서(OpenAPI)에 쓸 스키마를 derive한다 (`utoipa::ToSchema`). 문서를 만드는 booking-server만 켠다.
+# 켜지 않으면 utoipa를 아예 컴파일하지 않는다. → docs/decisions.md D-25
+openapi = ["dep:utoipa"]
+
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+utoipa = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]

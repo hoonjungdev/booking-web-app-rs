@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 /// Rust의 `enum`은 C#의 enum처럼 이름 붙은 값 목록이다. 아래 [`BookingEvent`]처럼 값마다 데이터를 담을 수도 있다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema),
+    schema(description = "예약 상태 (docs/02-domain-and-data.md §2)")
+)]
 pub enum BookingStatus {
     /// 접수됨. 업체 제출을 기다리거나 진행 중
     Pending,

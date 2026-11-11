@@ -17,3 +17,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# 잠금 테스트에서 다른 연결의 쿼리를 동시에 돌린다 (tokio::spawn)
+tokio.workspace = true

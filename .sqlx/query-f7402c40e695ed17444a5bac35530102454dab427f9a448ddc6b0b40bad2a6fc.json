@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n          provider_id,\n          count(*)                                                           AS \"attempts!\",\n          count(*) FILTER (WHERE outcome NOT IN ('circuit_open', 'throttled')) AS \"called!\",\n          count(*) FILTER (WHERE outcome IN ('success', 'rejected'))         AS \"answered!\",\n          count(*) FILTER (WHERE outcome = 'rate_limited')                   AS \"rate_limited!\",\n          count(*) FILTER (WHERE outcome IN ('circuit_open', 'throttled'))   AS \"blocked!\",\n          count(*) FILTER (WHERE attempt > 1)                                AS \"retries!\",\n          percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms)\n              FILTER (WHERE outcome NOT IN ('circuit_open', 'throttled'))     AS p50_ms,\n          percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)\n              FILTER (WHERE outcome NOT IN ('circuit_open', 'throttled'))     AS p95_ms,\n          percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms)\n              FILTER (WHERE outcome NOT IN ('circuit_open', 'throttled'))     AS p99_ms\n        FROM provider_calls\n        WHERE provider_id = ANY($1) AND started_at >= $2\n        GROUP BY provider_id\n        ORDER BY provider_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "provider_calls",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "attempts!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "called!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "answered!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "rate_limited!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "blocked!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "retries!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "p50_ms",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "p95_ms",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "p99_ms",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "f7402c40e695ed17444a5bac35530102454dab427f9a448ddc6b0b40bad2a6fc"
+}

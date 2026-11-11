@@ -14,3 +14,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  # 관리자 웹 (web/admin, pnpm)
+  - package-ecosystem: npm
+    directory: /web/admin
+    schedule:
+      interval: weekly
+    # 새 버전이 나오고 1주일이 지난 뒤에 올린다. 공개 직후 문제가 드러나 철회되는 버전을 피한다 (공급망 안전).
+    cooldown:
+      default-days: 7
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]

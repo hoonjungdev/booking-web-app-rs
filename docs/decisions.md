@@ -137,3 +137,51 @@
 - 상태: 채택 ([04 §1](04-api.md#1-공통-규약)의 "모든 응답 헤더에 `X-Trace-Id`"에 예외를 둠)
 - 이유: `/healthz` · `/readyz`는 배포 환경에서 몇 초마다 불린다. 계측하면 trace 목록이 헬스 체크로 채워지고, API 요청 수 · 지연 지표가 실제 요청이 아닌 값에 묻힌다.
 - 결과: 헬스 체크 응답에는 `X-Trace-Id`가 없고 `http.server.request.duration`에도 잡히지 않는다. 라우터에서 계측 layer를 건 **뒤에** 헬스 체크 라우트를 등록하는 것으로 구현했다 (`api::router`).
+
+### D-25. API 문서는 utoipa로 코드에서 만들고, 라우트와 문서 경로를 한곳에서 정한다
+- 상태: 채택 ([D-08](#d-08-관리자-웹-react--typescript--vite--mantine--tanstack-query-타입은-openapi에서-생성)의 "타입은 OpenAPI에서 생성"을 구현)
+- 이유: 관리자 웹의 TypeScript 타입을 서버 코드에서 만들려면 OpenAPI 문서가 코드와 항상 같아야 한다. utoipa-axum의 `routes!(핸들러)`는 핸들러의 `#[utoipa::path(path = ..)]`를 읽어 axum 라우트와 문서 경로를 함께 등록하므로, 경로 문자열이 한곳에만 있어 둘이 어긋날 수 없다 (≈ Swashbuckle이 컨트롤러 라우트로 문서를 만드는 것).
+- 구성
+  - `booking-server openapi`가 문서를 표준 출력으로 낸다 (DB 없이). 결과를 `web/admin/openapi.json`으로 커밋하고, `scripts/check.sh api`가 코드와 같은지 검사한다.
+  - `domain`의 예약 상태 · ID · 고객 타입은 `openapi` feature를 켤 때만 `ToSchema`를 derive한다 (`#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]`). 문서를 만드는 booking-server만 켜고, 다른 크레이트에는 utoipa가 컴파일되지 않는다. derive는 컴파일 시점의 메타데이터라 "domain에 I/O를 넣지 않는다"는 규칙과 부딪히지 않는다. 학습용 주석이 문서 설명으로 새지 않게 `schema(description = ..)`을 따로 적는다.
+  - 업체 정책은 API 전용 타입(`PolicyView`)으로 내보낸다. 정책 타입은 `#[serde(default)]`라서 그대로 쓰면 모든 필드가 "생략 가능"으로 문서화되기 때문이다. 정책 → 응답 변환은 필드를 `..` 없이 모두 풀어 써서, 정책에 필드가 늘면 컴파일 에러로 드러난다.
+  - mock 업체의 장애 설정도 booking-server에 같은 모양의 타입을 따로 둔다 (mock-provider는 우리 크레이트에 의존하지 않는다).
+- 결과: 서버 API를 바꾸면 `cd web/admin && pnpm gen`으로 문서와 타입을 다시 만들어 함께 커밋해야 한다 (잊으면 CI의 `api` · `web` 단계가 실패한다).
+- 대안: OpenAPI 문서를 손으로 관리 (코드와 어긋난다), utoipa만 쓰고 라우트는 axum에 따로 등록 (경로 문자열이 두 곳), domain이 utoipa에 늘 의존 (문서가 필요 없는 크레이트까지 컴파일)
+
+### D-26. 관리자 재시도는 예약을 잠그고, dead 작업을 같은 행으로 되살리고, 기한을 다시 잡고, 보내기 전에 업체에서 먼저 찾는다
+- 상태: 채택 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)의 "관리자 재시도는 다시 제출하기 전에 업체 조회를 먼저"를 구현)
+- 규칙 (`POST /admin/api/bookings/{id}/retry`, `POST /admin/api/jobs/{id}/requeue` 공통, 한 트랜잭션)
+  1. 예약 행을 잠그고(`SELECT … FOR UPDATE`) `failed`인지, 대기 · 실행 중인 작업이 없는지 확인한다. 한 예약에 처리 중인 작업이 둘이면 두 워커가 같은 예약을 동시에 업체에 보낼 수 있다 (멱등키 없는 업체에서는 이중 예약).
+  2. `failed → pending` (`AdminRetry`, actor `admin`), 확정 기한을 지금부터 다시 계산한다 (접수와 같은 규칙: 30분 뒤 또는 슬롯 시작 중 이른 쪽). 슬롯이 이미 시작했으면 409.
+  3. 그 예약의 dead 작업을 **같은 행으로** 되살린다 (`submit_booking`, payload `{"lookup_first": true}`). 시도 횟수(`attempts`)는 되돌리지 않고 한도(`max_attempts`)를 지금부터 8회 늘린다. dead 작업이 없으면 새로 등록한다.
+  4. 워커는 `lookup_first`가 있으면 업체에서 참조값으로 먼저 찾는다: 있으면 보내지 않고 `confirmed`, 없으면 제출, 조회 실패면 작업 재예약(표시는 남아 다음에도 조회부터).
+- 이유
+  - 기한 재설정: 장애로 실패한 예약은 대개 업체를 부르지 못한 채 기한이 지나 포기한 것이다. 처음 구현은 기한을 그대로 둬서, 재시도하자마자 워커가 `deadline_exceeded`로 다시 포기했다 (관리자 화면으로 끝에서 끝까지 돌려 보다 발견).
+  - 같은 행 되살리기: dead 작업 수(`jobs.dead` 지표 · "dead 작업이 있음" 알림 · 대시보드)가 재처리하는 즉시 줄어든다. 새 작업을 만들면 dead 행이 남아 따로 치울 방법(새 작업 상태, 마이그레이션)이 필요하다. 결과 불명 확인(`resolve_unknown`)이 포기한 예약도 같은 행을 `submit_booking` + `lookup_first`로 바꿔 되살린다: "조회 → 없으면 제출"이 그 예약에 지금 필요한 일이다.
+  - "없음"을 한 번만 확인: 결과 불명 확인은 업체 처리가 늦을 수 있어 두 번 확인하지만, 관리자 재시도는 실패하고 한참 뒤(사람이 보고 누른 뒤)라 한 번으로 판단한다.
+  - 시도 횟수를 되돌리지 않는 이유: `attempts`는 작업을 쥐었다는 증표(fencing token)다 ([02 §5](02-domain-and-data.md#5-작업-큐-동작)). 0으로 되돌리면 예전 번호가 다시 나와서, lease를 잃고 멈춰 있던 옛 워커가 깨어나 같은 번호로 쓰는 결과가 새 워커의 작업과 예약에 반영된다 (독립 리뷰에서 지적). 번호는 늘어나기만 해야 하므로 한도를 늘린다. 화면에는 "시도 3 / 11"처럼 보인다.
+- 결과
+  - 작업 재큐잉은 예약이 `failed`일 때 위 규칙과 같고, 그 밖에는 예약 상태는 그대로 두고 작업만 되살린다 (예약이 없어 묻힌 작업 등. 같은 예약에 처리 중인 작업이 따로 있으면 409). 이때도 `submit_booking`이면 `lookup_first`를 붙이고, 예약이 아직 `pending`이면 기한을 다시 잡는다.
+  - 참조값 조회를 지원하지 않는 업체는 확인 없이 다시 보낸다 (관리자가 업체에 직접 확인했다고 본다). 지금은 그런 업체가 없다.
+  - 재시도한 예약의 `booking.time_to_final`은 처음 접수한 시각부터 잰다 (재시도 전 시간이 포함된다).
+  - `cancel_failed` 재시도는 취소 흐름과 함께 Phase 6에서 만든다 (지금은 409).
+- 대안: 새 작업 등록 + dead 작업 그대로 (dead 수가 줄지 않음), 작업 상태에 `retried` 추가 (마이그레이션 · 지표 · 화면을 모두 고쳐야 함), `failed → unknown` 전이를 만들어 결과 불명 확인 재사용 (상태 머신 변경)
+
+### D-27. 장애 주입 중계는 `BOOKING_CHAOS_URL`을 설정할 때만 켠다
+- 상태: 채택
+- 이유: mock 업체의 `/_chaos`는 개발 도구이고 실제 업체에는 없다. 기본으로 켜 두면 다른 환경에서도 쓸모없는 관리자 API가 열려 있고, 누르면 엉뚱한 주소로 요청이 나간다.
+- 결과: 로컬에서는 `.env`에 `BOOKING_CHAOS_URL=http://127.0.0.1:9090`이 있어야 장애 주입 화면을 쓴다 (`.env.example`에 넣어 두었다). 꺼져 있으면 관리자 API가 503(`chaos-disabled`)을 돌려주고, 화면은 켜는 방법을 안내한다.
+- 대안: 업체의 `base_url`에서 mock 주소를 추론 (업체 API와 관리 API가 같은 서버라는 가정에 기댄다), 관리자 웹이 mock을 직접 호출 (주소가 둘, CORS 필요)
+
+### D-28. 업체 정책 편집은 정책 실시간 반영(Phase 6)과 함께 만든다
+- 상태: 채택 ([04 §3](04-api.md#3-관리자-api-adminapi)의 정책 변경 `PUT /admin/api/providers/{id}/policy`를 Phase 6으로 미룸)
+- 이유: 설계는 "정책 변경 (즉시 반영)"이다. 지금 `ResilientProvider`는 서버가 시작할 때 정책을 읽어 서킷 · rate limiter · bulkhead를 만들고 바꾸지 않는다. 즉시 반영하려면 정책과 그 부품을 실행 중에 교체해야 하는데(arc-swap), 로드맵상 Phase 6 항목이다. 저장만 하고 재시작해야 반영되는 편집 화면은 "바꿨는데 그대로인" 혼란을 준다.
+- 결과: Phase 5의 업체 상세 화면은 정책을 읽기 전용으로 보여 준다.
+
+### D-29. 관리자 웹 의존성은 정확한 버전으로 고정하고, 공개된 지 1주 이상 지난 버전을 쓴다. TypeScript는 5.x
+- 상태: 채택
+- 이유
+  - 공급망 공격: 공개 직후의 버전에 악성 코드가 섞였다가 며칠 안에 철회되는 일이 있다. 패키지를 처음 고를 때 1~2주 지난 버전을 골랐고, Dependabot의 npm 업데이트도 공개 7일 뒤에 올린다(`cooldown`). pnpm 11도 기본으로 갓 나온 버전을 막는다(`minimumReleaseAge`). `package.json`에 `^` 없이 정확한 버전을 적고 `pnpm-lock.yaml`을 커밋한다.
+  - TypeScript 7(Go로 다시 만든 컴파일러)은 openapi-typescript(`typescript ^5`)와 typescript-eslint(`<6.1`)가 아직 지원하지 않는다.
+- 결과: 일부 패키지가 최신보다 한두 버전 낮다. 올릴 때는 Dependabot PR이 CI(`web` 단계)를 통과하는지 본다.

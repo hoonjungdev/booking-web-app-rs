@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, display_name, adapter_kind, base_url, enabled, policy\n         FROM providers WHERE enabled ORDER BY id",
+  "query": "SELECT id, display_name, adapter_kind, base_url, enabled, policy, updated_at\n         FROM providers WHERE enabled ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -68,6 +68,17 @@
             "name": "policy"
           }
         }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "providers",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {
@@ -79,8 +90,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "58499877192e73ce4c6abdc987877a65d565bb606402bfb8bfa697c3b34c5c93"
+  "hash": "34677291d140bf65fb82608be326b4afaf4d4c61819b7527e94e1bf19568f394"
 }

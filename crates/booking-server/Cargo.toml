@@ -19,13 +19,16 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 db.workspace = true
-domain.workspace = true
+# openapi: 예약 상태 · ID 타입의 API 문서 스키마 (docs/decisions.md D-25)
+domain = { workspace = true, features = ["openapi"] }
 dotenvy.workspace = true
 figment.workspace = true
 # 메트릭 계측기 (Counter · Histogram · Gauge). SDK 설정은 telemetry 크레이트가 맡는다.
 opentelemetry.workspace = true
 providers.workspace = true
 rand.workspace = true
+# 관리자 API가 mock 업체의 장애 주입 API(`/_chaos`)를 중계할 때 쓴다 (개발 환경 전용)
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -35,7 +38,12 @@ thiserror.workspace = true
 # sync: 호출 기록 채널(mpsc)
 tokio = { workspace = true, features = ["sync"] }
 tokio-util.workspace = true
+# 관리자 웹(web/admin/dist) 정적 파일 제공
+tower-http.workspace = true
 tracing.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-swagger-ui.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -37,13 +37,16 @@ use domain::{BookingId, ProviderId};
 use governor::{
     Quota, RateLimiter,
     clock::MonotonicClock,
+    middleware::StateInformationMiddleware,
     state::{InMemoryState, NotKeyed},
 };
 use rand::RngExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{Span, field::Empty};
 
-pub use circuit::{CircuitBreaker, CircuitState, Permit};
+pub use circuit::{
+    CircuitAction, CircuitBreaker, CircuitSnapshot, CircuitState, ForcedState, Permit,
+};
 pub use retry::{MAX_IN_CALL_RETRY_AFTER, backoff_delay, may_retry};
 
 use crate::{
@@ -57,7 +60,24 @@ use crate::{
 const DEFAULT_PAUSE: Duration = Duration::from_secs(1);
 
 /// 업체 하나의 rate limiter. 키 없이(direct) 하나의 버킷을 쓰고, 시계는 표준 라이브러리의 단조 시계다.
-type Limiter = RateLimiter<NotKeyed, InMemoryState, MonotonicClock>;
+/// `StateInformationMiddleware`: 토큰을 받을 때마다 "버킷에 몇 개 남았는지"도 함께 알려 준다 (관리자 화면의 limiter 여유).
+type Limiter = RateLimiter<NotKeyed, InMemoryState, MonotonicClock, StateInformationMiddleware>;
+
+/// 업체 파이프라인의 지금 상태 (관리자 화면의 업체 런타임 상태). 모두 이 프로세스 메모리의 값이다 (docs/decisions.md D-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub circuit: CircuitSnapshot,
+    /// 업체가 쉬라고 해서(`Retry-After`) 호출을 멈춘 상태면 그 끝 시각
+    pub paused_until: Option<Instant>,
+    /// 지금 업체를 부르고 있는 호출 수와 bulkhead의 전체 자리 수
+    pub in_flight: usize,
+    pub max_concurrency: usize,
+    /// 우리 rate limiter 버킷에 남은 토큰 수 (추정값)와 버킷 크기
+    pub limiter_available: u32,
+    pub limiter_burst: u32,
+    /// 업체가 마지막 응답에서 알려 준 남은 호출 수 (`X-RateLimit-Remaining`)
+    pub rate_limit_remaining: Option<u32>,
+}
 
 /// 업체 호출 종류. 호출 기록의 `operation` 값이 된다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +125,9 @@ pub struct ResilientProvider {
     /// `await` 중에는 쥐지 않는다 (std `Mutex`를 쥔 채 기다리면 다른 태스크가 멈춘다).
     breaker: Mutex<CircuitBreaker>,
     limiter: Limiter,
+    /// limiter에 마지막으로 물었을 때 남아 있던 토큰 수와 그 시각. governor는 토큰을 쓰지 않고 남은 수만
+    /// 엿보는 기능이 없어서, 이 값에 그 뒤로 다시 채워졌을 토큰을 더해 지금 남은 수를 추정한다.
+    limiter_seen: Mutex<Option<(Instant, u32)>>,
     /// 동시 호출 수 제한 (≈ C#의 `SemaphoreSlim`)
     bulkhead: Semaphore,
     /// bulkhead의 전체 자리 수
@@ -132,7 +155,9 @@ impl ResilientProvider {
         metrics::register_provider(&id);
         Self {
             breaker: Mutex::new(CircuitBreaker::new(policy.circuit_breaker)),
-            limiter: RateLimiter::direct_with_clock(quota, MonotonicClock),
+            limiter: RateLimiter::direct_with_clock(quota, MonotonicClock)
+                .with_middleware::<StateInformationMiddleware>(),
+            limiter_seen: Mutex::new(None),
             bulkhead: Semaphore::new(max_concurrency),
             max_concurrency,
             paused_until: Mutex::new(None),
@@ -179,6 +204,49 @@ impl ResilientProvider {
     /// 업체가 마지막 응답에서 알려 준 남은 호출 수. 아직 받은 적이 없으면 `None`.
     pub fn rate_limit_remaining(&self) -> Option<u32> {
         *lock(&self.rate_limit_remaining)
+    }
+
+    /// 이 업체에 적용 중인 정책 (서버가 시작할 때 DB에서 읽은 값)
+    pub fn policy(&self) -> &ProviderPolicy {
+        &self.policy
+    }
+
+    /// 서킷 상태를 자세히 본다
+    pub fn circuit(&self) -> CircuitSnapshot {
+        lock(&self.breaker).snapshot()
+    }
+
+    /// 관리자가 서킷을 강제로 열거나 닫거나, 강제 상태를 푼다
+    pub fn control_circuit(&self, action: CircuitAction) {
+        self.with_breaker(|breaker| breaker.control(action, Instant::now()));
+        tracing::info!(provider = %self.id, ?action, "관리자가 서킷을 조작했다");
+    }
+
+    /// 우리 rate limiter 버킷에 지금 남은 토큰 수 (추정값). 아직 한 번도 묻지 않았으면 버킷이 가득 차 있다.
+    ///
+    /// 마지막으로 물었을 때 남은 수 + 그 뒤로 다시 채워졌을 수 (초당 `per_second`개), 단 버킷 크기를 넘지 않는다.
+    pub fn limiter_available(&self) -> u32 {
+        let burst = self.policy.rate_limit.burst.max(1);
+        let Some((seen_at, remaining)) = *lock(&self.limiter_seen) else {
+            return burst;
+        };
+        let refilled =
+            seen_at.elapsed().as_secs_f64() * f64::from(self.policy.rate_limit.per_second);
+        // `as u32`: 실수를 정수로 바꿀 때 소수점 아래는 버리고, 범위를 넘으면 u32의 최댓값으로 맞춘다
+        remaining.saturating_add(refilled as u32).min(burst)
+    }
+
+    /// 관리자 화면에 보여 줄 지금 상태를 한 번에 모은다
+    pub fn runtime_status(&self) -> RuntimeStatus {
+        RuntimeStatus {
+            circuit: self.circuit(),
+            paused_until: self.paused_until(),
+            in_flight: self.in_flight(),
+            max_concurrency: self.max_concurrency,
+            limiter_available: self.limiter_available(),
+            limiter_burst: self.policy.rate_limit.burst.max(1),
+            rate_limit_remaining: self.rate_limit_remaining(),
+        }
     }
 
     /// 업체에 예약을 만든다
@@ -438,10 +506,16 @@ impl ResilientProvider {
     async fn wait_for_token(&self) -> Result<(), ProviderError> {
         let give_up_at = Instant::now() + self.policy.rate_limit.max_wait();
         loop {
-            // check(): 토큰이 있으면 하나 쓰고 Ok, 없으면 언제 생기는지 알려 주는 Err
+            // check(): 토큰이 있으면 하나 쓰고 Ok(남은 상태), 없으면 언제 생기는지 알려 주는 Err
             let not_until = match self.limiter.check() {
-                Ok(()) => return Ok(()),
-                Err(not_until) => not_until,
+                Ok(snapshot) => {
+                    self.saw_limiter(snapshot.remaining_burst_capacity());
+                    return Ok(());
+                }
+                Err(not_until) => {
+                    self.saw_limiter(0);
+                    not_until
+                }
             };
             let now = Instant::now();
             let ready_at = now + not_until.wait_time_from(now);
@@ -450,6 +524,11 @@ impl ResilientProvider {
             }
             tokio::time::sleep(ready_at - now).await;
         }
+    }
+
+    /// limiter 버킷에 남은 토큰 수를 기억해 둔다 ([`Self::limiter_available`])
+    fn saw_limiter(&self, remaining: u32) {
+        *lock(&self.limiter_seen) = Some((Instant::now(), remaining));
     }
 
     /// bulkhead 자리를 기다린다. `max_wait_ms` 안에 자리가 나지 않으면 `Throttled`.

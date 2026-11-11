@@ -17,27 +17,38 @@ use domain::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{Span, field::Empty};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{ApiError, ApiState};
+use super::{ApiError, ApiState, Problem, docs::tags};
 use crate::{auth::AuthenticatedClient, metrics, trace};
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 
 /// 예약 생성 요청 본문. 모르는 필드가 있으면 400 (오타를 조용히 무시하지 않기 위해)
-#[derive(Debug, Deserialize)]
+///
+/// `#[derive(ToSchema)]`: 이 구조체의 모양을 API 문서(OpenAPI 스키마)로 만든다. 필드의 문서 주석(`///`)이 설명이 된다.
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateBookingBody {
+    /// 업체 ID
+    #[schema(example = "alpha")]
     pub provider: String,
+    /// 업체 안의 예약 대상 (매장 등)
+    #[schema(example = "store-001")]
     pub resource_id: String,
+    /// 슬롯 시작 시각 (RFC 3339). 오프셋을 붙여도 된다 (`+09:00`)
     pub slot_start: DateTime<Utc>,
+    /// 인원 (1~50)
+    #[schema(minimum = 1, maximum = 50)]
     pub party_size: u32,
+    /// 고객 정보. 저장하지만 응답 · 로그에는 내보내지 않는다
     pub customer: Customer,
 }
 
 /// 예약 응답. 고객 정보는 돌려주지 않는다 (개인정보 최소화).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BookingResponse {
     pub id: BookingId,
     pub status: BookingStatus,
@@ -75,6 +86,29 @@ impl From<&Booking> for BookingResponse {
 ///
 /// `skip_all`이 중요하다: 인자(`body`)에는 고객 이름 · 전화번호가 들어 있어서 span에 기록하면 안 된다.
 /// 예약 ID는 접수한 뒤에야 알 수 있으므로 `Empty`로 자리만 잡아 두고 나중에 채운다.
+///
+/// `#[utoipa::path]`: 이 핸들러의 경로 · 매개변수 · 응답을 API 문서에 적는다. `api::documented_routes`의
+/// `routes!(bookings::create)`가 이 정보로 axum 라우트와 문서 경로를 함께 등록한다.
+#[utoipa::path(
+    post,
+    path = "/v1/bookings",
+    operation_id = "create_booking",
+    tag = tags::BOOKINGS,
+    security(("api_key" = [])),
+    params(
+        ("Idempotency-Key" = String, Header, description = "멱등키 (출력 가능한 ASCII 1~255자). 같은 키로 다시 보내면 같은 예약을 돌려준다"),
+    ),
+    request_body = CreateBookingBody,
+    responses(
+        (status = 202, description = "접수함 (업체 제출은 워커가 한다). 같은 키 + 같은 본문이면 기존 예약", body = BookingResponse,
+            headers(("Location" = String, description = "예약 조회 경로"))),
+        (status = 400, description = "입력 오류 · 지난 슬롯 · 멱등키 없음", body = Problem, content_type = "application/problem+json"),
+        (status = 401, description = "API 키가 없거나 틀림", body = Problem, content_type = "application/problem+json"),
+        (status = 404, description = "없는 업체", body = Problem, content_type = "application/problem+json"),
+        (status = 409, description = "예약을 받지 않는 업체", body = Problem, content_type = "application/problem+json"),
+        (status = 422, description = "같은 멱등키 + 다른 본문", body = Problem, content_type = "application/problem+json"),
+    ),
+)]
 #[tracing::instrument(
     name = "booking.accept",
     skip_all,
@@ -156,6 +190,19 @@ pub async fn create(
 }
 
 /// 자기 클라이언트의 예약을 조회한다. 다른 클라이언트의 예약이나 잘못된 ID는 모두 404.
+#[utoipa::path(
+    get,
+    path = "/v1/bookings/{id}",
+    operation_id = "get_booking",
+    tag = tags::BOOKINGS,
+    security(("api_key" = [])),
+    params(("id" = Uuid, Path, description = "예약 ID")),
+    responses(
+        (status = 200, description = "예약", body = BookingResponse),
+        (status = 401, description = "API 키가 없거나 틀림", body = Problem, content_type = "application/problem+json"),
+        (status = 404, description = "없거나 다른 클라이언트의 예약", body = Problem, content_type = "application/problem+json"),
+    ),
+)]
 #[tracing::instrument(name = "booking.get", skip_all, fields(booking_id = Empty))]
 pub async fn get(
     State(state): State<ApiState>,

@@ -48,7 +48,7 @@ pub async fn create_client(pool: &PgPool, name: &str) -> TestClient {
 }
 
 pub fn app(pool: &PgPool) -> Router {
-    api::router(ApiState { pool: pool.clone() })
+    api::router(ApiState::new(pool.clone()))
 }
 
 pub struct Reply {
