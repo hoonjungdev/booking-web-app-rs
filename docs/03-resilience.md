@@ -54,6 +54,7 @@ pub enum ProviderError {
 → Phase 6: 취소는 멱등키가 없어도 멱등 안전으로 본다. 이미 취소된 예약을 다시 취소해도 결과가 같고, 어댑터가 "이미 취소됨"을 성공으로 분류하기 때문이다 ([D-32](decisions.md#d-32-취소는-결과를-모르는-실패-뒤에도-다시-보내고-cancel_failed는-관리자가-다시-시도한다)). 그래서 멱등 안전하지 않은 호출은 "멱등키 없는 업체의 생성" 하나뿐이다 (`Operation::safe_to_resend`).
 
 오류 메시지에는 업체가 보낸 글자를 넣지 않는다 (Phase 4). `client_error`의 본문과 `decode_error`의 내용에는 업체가 되돌려 준 고객 정보가 들어 있을 수 있는데, 오류 메시지는 로그 · 추적 · 예약의 실패 사유(`status_reason`)로 퍼져 나간다. 그 내용은 `ProviderError::detail()`로 꺼내 호출 기록(`provider_calls.error_detail`)에만 남긴다.
+→ Phase 6: `connect_error` · `transport_error`도 같다. HTTP 클라이언트의 오류 문구에는 업체 주소가 들어 있어서, 메시지에 넣으면 예약의 실패 사유로 클라이언트에게까지 보인다 (독립 리뷰에서 지적). 메시지는 "연결 실패" · "전송 중 연결 오류"뿐이고 문구는 호출 기록에만 남는다.
 
 **구현 (Phase 3)**: 분류와 분류별 판단(처리 안 됐다고 확신할 수 있는지, 서킷 집계)은 `crates/providers/src/error.rs`, 호출 내 재시도 판단은 `crates/providers/src/resilience/retry.rs`의 `may_retry`에 있다. 워커는 호출 내 재시도까지 끝난 **최종 결과**를 보고 작업 수준에서 판단한다 (`crates/booking-server/src/worker/submit.rs`의 `decide`, 조회는 `resolve.rs`의 `decide_resolution`).
 
@@ -90,7 +91,7 @@ ResilientProvider::call(operation)
 Polly가 권장하는 순서(Retry → CircuitBreaker → Timeout)와 같은 이유로 이 순서를 쓴다. 재시도가 가장 바깥에 있어야 시도마다 서킷과 타임아웃을 따로 거친다.
 
 **구현 메모** (`crates/providers/src/resilience/`)
-- 업체 pause는 호출을 시작할 때뿐 아니라 **시도마다** 확인한다. 한 호출이 재시도를 기다리는 동안 다른 호출이 429를 받아 pause가 걸릴 수 있기 때문이다.
+- 업체 pause는 호출을 시작할 때뿐 아니라 **시도마다** 확인한다. 한 호출이 재시도를 기다리는 동안 다른 호출이 429를 받아 pause가 걸릴 수 있기 때문이다. Phase 6부터는 시도 안에서도 토큰 · bulkhead 자리를 **기다린 뒤에** 한 번 더 확인한다 (기다리던 호출이 Retry-After 중에 나가지 않게). 업체가 보낸 `Retry-After`는 1시간으로 자른다 (아주 큰 값은 시각 계산을 넘쳐 panic을 냈다).
 - 관문(pause · 서킷 · rate limiter · bulkhead)에서 막힌 시도도 `provider_calls`에 `circuit_open` / `throttled`로 남긴다. 실제로 부르지 않았으므로 지연 통계에서는 뺀다 ([05 §7](05-observability-and-analytics.md#7-분석-쿼리-관리자-통계-api의-기반)).
 - 재시도 대기 시간은 `max(백오프, Retry-After)`다. 대기 뒤 **시도 타임아웃만큼 온전히 쓸 예산이 남지 않으면** 재시도하지 않고 마지막 실패를 돌려준다 (남은 몇 ms로 보낸 요청은 거의 타임아웃이 나고, 멱등키 없는 업체에서는 괜히 결과 불명이 된다). 관문에서 기다리다 예산을 다 쓰면 업체를 부르지 않고 `Throttled`로 돌려준다.
 - 재시도가 관문에서 막혔는데 앞선 시도가 업체까지 갔다면, `CircuitOpen` · `Throttled` 대신 **앞선 시도의 실패**를 돌려준다. 워커는 관문에서 막힌 실패를 "부르지 않았다"로 보고 시도 횟수를 되돌리는데, 실제로 부른 호출까지 되돌리면 업체가 계속 죽어 있을 때 작업이 끝없이 미뤄진다.

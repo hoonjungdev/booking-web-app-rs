@@ -73,6 +73,10 @@ pub(super) fn routes() -> OpenApiRouter<ApiState> {
         .routes(routes!(chaos::apply_chaos_preset))
         .routes(routes!(audit::audit_log))
         .routes(routes!(info::admin_info))
+        // 위의 모든 관리자 API에 건다: 상태를 바꾸는 요청은 관리자 화면과 같은 출처에서 온 것만 받는다 (CSRF 방어)
+        .layer(axum::middleware::from_fn(
+            crate::admin_auth::reject_cross_origin,
+        ))
 }
 
 /// 관리자 조작을 감사 로그에 남긴다. 조작과 같은 트랜잭션(`conn`)에서 부르면 "조작은 됐는데 기록은 없는" 경우가 생기지 않는다.

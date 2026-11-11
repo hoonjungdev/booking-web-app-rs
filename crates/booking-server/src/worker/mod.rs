@@ -432,10 +432,6 @@ async fn give_up(
     booking: &Booking,
     reason: String,
 ) -> Result<(), WorkerError> {
-    tracing::warn!(%reason, "예약 처리를 포기한다");
-    record_decision("give_up");
-    // 포기한 작업은 trace에서 오류로 표시한다 (Grafana에서 오류 span만 골라 볼 수 있다)
-    Span::current().record("otel.status_code", "error");
     let trace_id = telemetry::current_trace_id();
 
     let mut tx = ctx.pool.begin().await?;
@@ -443,7 +439,7 @@ async fn give_up(
         warn_lease_lost();
         return Ok(());
     }
-    let event = give_up_event(booking.status, reason);
+    let event = give_up_event(booking.status, reason.clone());
     let transitioned = bookings::transition(
         &mut tx,
         booking.id,
@@ -453,11 +449,21 @@ async fn give_up(
         trace_id.as_deref(),
     )
     .await?;
+    let Transitioned::Applied(to) = transitioned else {
+        // 그사이 다른 경로(대사가 업체에서 확정된 예약을 찾음 등)가 예약을 처리했다. 포기할 것이 없으므로 작업을 dead로
+        // 남기지 않고 끝내기만 한다 (dead로 남기면 예약은 멀쩡한데 "dead 작업이 있음" 알림이 계속 울린다).
+        // `tx`는 커밋하지 않고 버리므로 dead 표시는 롤백된다.
+        drop(tx);
+        tracing::info!(status = %booking.status, "그사이 예약 상태가 바뀌어 포기하지 않고 작업만 끝낸다");
+        return complete_only(ctx, lease).await;
+    };
     tx.commit().await?;
 
-    if let Transitioned::Applied(to) = transitioned {
-        metrics::booking_transitioned(booking, to);
-    }
+    tracing::warn!(%reason, "예약 처리를 포기했다");
+    record_decision("give_up");
+    // 포기한 작업은 trace에서 오류로 표시한다 (Grafana에서 오류 span만 골라 볼 수 있다)
+    Span::current().record("otel.status_code", "error");
+    metrics::booking_transitioned(booking, to);
     Ok(())
 }
 

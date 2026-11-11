@@ -570,7 +570,7 @@ async fn 보낸_뒤_결과를_남기지_못하고_멈춘_작업은_다시_보내
         .unwrap();
     let mut conn = pool.acquire().await.unwrap();
     assert!(
-        db::jobs::mark_sent(&mut conn, claimed.lease())
+        db::jobs::mark_sent(&mut conn, claimed.lease(), Duration::from_secs(60))
             .await
             .unwrap()
     );
@@ -922,4 +922,116 @@ async fn 업체_호출_한도에_여유가_없으면_대사를_미루고_업체�
     let job = db::jobs::get(&mut conn, job_id).await.unwrap().unwrap();
     assert_eq!(job.status, "queued", "미뤘다가 다시 돈다");
     assert_eq!(job.attempts, 0, "미룬 것은 시도 횟수로 세지 않는다");
+}
+
+/// 결과 불명 예약을 조회받는 순간, 다른 경로(대사)가 그 예약을 확정으로 바꾼 것처럼 DB를 고친 뒤 조회에 실패하는 업체
+struct RacingAdapter {
+    pool: PgPool,
+}
+
+#[async_trait::async_trait]
+impl ProviderAdapter for RacingAdapter {
+    fn capabilities(&self) -> Capabilities {
+        NOT_IDEMPOTENT
+    }
+
+    async fn create_booking(&self, _request: &CreateBooking) -> AdapterReply<ProviderBooking> {
+        Err(ProviderError::Server { status: 599 }).into()
+    }
+
+    async fn find_booking(&self, reference: BookingId) -> AdapterReply<Option<ProviderBooking>> {
+        // 테스트 준비 코드라 상태를 직접 바꾼다 (대사가 `unknown → confirmed`를 먼저 커밋한 상황)
+        sqlx::query(
+            "UPDATE bookings SET status = 'confirmed', provider_booking_id = 'rsv_found', updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(reference.as_uuid())
+        .execute(&self.pool)
+        .await
+        .expect("예약을 바꿀 수 있어야 한다");
+        Err(ProviderError::Client {
+            status: 400,
+            body: "bad".into(),
+        })
+        .into()
+    }
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 포기하려는_사이에_다른_경로가_예약을_확정했으면_작업을_dead로_남기지_않는다(
+    pool: PgPool,
+) {
+    let id = accept_booking(&pool).await;
+    // 멱등키 없는 업체에서 타임아웃 → unknown + resolve_unknown
+    let adapter = Arc::new(FakeAdapter::new(
+        NOT_IDEMPOTENT,
+        vec![Err(ProviderError::Timeout)],
+    ));
+    worker::process_next(&worker_with(&pool, &adapter))
+        .await
+        .unwrap();
+    assert_eq!(booking(&pool, id).await.status, BookingStatus::Unknown);
+
+    // 조회가 client_error로 실패해 포기하려는 순간, 예약은 이미 확정되어 있다
+    let mut registry = ProviderRegistry::default();
+    registry.insert(resilient(
+        Arc::new(RacingAdapter { pool: pool.clone() }),
+        single_attempt_policy(),
+    ));
+    let ctx = WorkerContext {
+        pool: pool.clone(),
+        providers: Arc::new(registry),
+        config: test_config(),
+    };
+    assert!(worker::process_next(&ctx).await.unwrap());
+
+    assert_eq!(booking(&pool, id).await.status, BookingStatus::Confirmed);
+    assert_eq!(
+        job_summary(&pool, id).await,
+        vec![
+            pair("submit_booking", "done"),
+            pair("resolve_unknown", "done")
+        ],
+        "예약은 멀쩡한데 dead 작업이 남아 알림이 울리지 않게"
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 업체_목록을_받는_동안_바뀐_예약은_이슈로_남기지_않고_다음_대사에서_다시_본다(
+    pool: PgPool,
+) {
+    let id = accept_booking(&pool).await;
+    // 업체 목록에는 아무것도 없다 (방금 확정된 예약이 목록에 아직 반영되지 않은 상황)
+    let adapter = Arc::new(
+        FakeAdapter::new(IDEMPOTENT, vec![confirmed("rsv_1")])
+            .with_lists(vec![Ok(vec![]), Ok(vec![])]),
+    );
+    let ctx = worker_with(&pool, &adapter);
+    worker::process_next(&ctx).await.unwrap();
+    assert_eq!(booking(&pool, id).await.status, BookingStatus::Confirmed);
+
+    schedule_reconcile_now(&pool).await;
+    assert!(worker::process_next(&ctx).await.unwrap());
+    let issues: i64 = sqlx::query_scalar("SELECT count(*) FROM reconciliation_issues")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(issues, 0, "방금 바뀐 예약은 목록보다 새것일 수 있다");
+
+    // 한동안 그대로인 확정 예약이 여전히 목록에 없으면 이슈로 남긴다
+    sqlx::query("UPDATE bookings SET updated_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    db::jobs::run_reconcile_now(&mut conn, &ProviderId::parse("alpha").unwrap(), None)
+        .await
+        .unwrap();
+    assert!(worker::process_next(&ctx).await.unwrap());
+    let kind: String = sqlx::query_scalar("SELECT kind FROM reconciliation_issues")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kind, "missing_at_provider");
 }

@@ -212,6 +212,7 @@ Grafana(Explore → Tempo)에서 찾는 법:
   INFO job: booking_server::worker: 예약 상태를 바꿨다 status=confirmed otel.name=job.submit_booking job_id=38 … trace_id="036d4968…" booking_id=01a1c619-… decision="transition"
   ```
 - 로그를 내보내는 과정에서 생긴 로그는 다시 내보내지 않는다. 그렇지 않으면 내보낼 때마다 로그가 또 생겨 끝없이 되먹임된다. SDK는 자기 스레드에서 생긴 로그를 스스로 거르지만, exporter의 HTTP 클라이언트는 별도 스레드에서 일해서 걸러지지 않는다. 그래서 `reqwest` · `hyper` · `h2` · `opentelemetry`로 시작하는 대상의 로그는 우리가 거른다 (`telemetry::filter::WithoutExporterLogs`). 콘솔에는 그대로 나오므로 수집기가 꺼져 있으면 콘솔 경고로 알 수 있다.
+- HTTP 클라이언트의 연결 오류 문구(업체 주소가 들어 있음)도 오류 메시지에 넣지 않고 호출 기록에만 남긴다 (Phase 6). 오류 메시지는 예약의 실패 사유로 클라이언트에게까지 보이기 때문이다.
 - **업체가 보낸 글자는 로그에 넣지 않는다.** 예상하지 못한 4xx의 본문이나 응답 형식 오류의 내용에는 업체가 되돌려 준 요청 값(고객 이름 · 전화번호)이 들어 있을 수 있다. `ProviderError`의 메시지(`Display`)에는 그 글자를 넣지 않고(로그 · span · 예약의 실패 사유가 이 메시지를 쓴다), 원인을 찾는 데 필요한 내용은 `ProviderError::detail()`로 꺼내 DB의 호출 기록(`provider_calls.error_detail`)에만 남긴다. 통합 테스트가 업체가 고객 정보를 되돌려 주는 상황에서 span과 로그에 그 글자가 없는지 검사한다.
 
 ## 6. 호출 기록기 (Call Recorder)

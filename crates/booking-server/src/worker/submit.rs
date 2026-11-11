@@ -172,9 +172,10 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
     }
     if !provider.capabilities().idempotency_key {
         // 멱등키가 없어 두 번 보내면 예약이 둘 생긴다. 보내기 직전에 "보냄" 표시를 커밋해 둔다 (모듈 설명).
+        // 이때 lease도 새로 잡는다: 앞의 조회(lookup_first)에 lease를 거의 다 썼어도 제출 한 번이 끝날 시간이 남는다.
         // lease를 잃었으면 이미 다른 워커가 이 작업을 가져간 것이라 보내지 않는다.
         let mut conn = ctx.pool.acquire().await?;
-        if !jobs::mark_sent(&mut conn, lease).await? {
+        if !jobs::mark_sent(&mut conn, lease, ctx.config.lease).await? {
             warn_lease_lost();
             return Ok(());
         }

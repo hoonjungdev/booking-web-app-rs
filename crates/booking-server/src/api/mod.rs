@@ -49,8 +49,9 @@ pub struct ApiState {
     pub availability: AvailabilityCache,
     /// 관리자 로그인 세션 설정 (유지 시간, 쿠키의 `Secure`)
     pub admin_auth: AdminAuthConfig,
-    /// 같은 프로세스에서 도는 워커의 lease. 정책을 바꿀 때 업체 호출 한 번이 lease보다 길어지지 않는지 검사한다
-    /// (길면 호출 도중 다른 워커가 같은 작업을 가져간다). 워커가 없는 프로세스(`--role api`)면 `None`.
+    /// 설정된 워커 lease (`BOOKING_WORKER_LEASE_SECS`). 정책을 바꿀 때 업체 호출 한 번이 lease보다 길어지지 않는지 검사한다
+    /// (길면 호출 도중 다른 워커가 같은 작업을 가져간다). 워커가 없는 프로세스(`--role api`)에서도 같은 값으로 검사한다.
+    /// `None`이면 검사하지 않는다 (테스트용).
     pub worker_lease: Option<Duration>,
 }
 

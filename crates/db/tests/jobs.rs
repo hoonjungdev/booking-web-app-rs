@@ -573,10 +573,24 @@ async fn 보냄_표시는_lease가_있어야_남고_결과를_기록하면_지�
         job_id: job.id,
         attempt: job.attempts + 1,
     };
-    assert!(!jobs::mark_sent(&mut conn, stale).await.unwrap());
-    assert!(jobs::mark_sent(&mut conn, job.lease()).await.unwrap());
+    let renew = Duration::from_secs(600);
+    assert!(!jobs::mark_sent(&mut conn, stale, renew).await.unwrap());
+    assert!(
+        jobs::mark_sent(&mut conn, job.lease(), renew)
+            .await
+            .unwrap()
+    );
     let record = &jobs::for_booking(&pool, booking_id).await.unwrap()[0];
     assert!(record.sent_at.is_some());
+    // 보내기 직전에 lease를 새로 잡는다 (60초로 가져갔지만 지금부터 10분)
+    let (renewed,): (bool,) = sqlx::query_as(
+        "SELECT locked_until > now() + interval '9 minutes' FROM jobs WHERE id = $1",
+    )
+    .bind(job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(renewed, "제출 한 번이 끝날 시간이 늘 남는다");
 
     // 결과를 기록하면(여기서는 재예약) 표시가 지워진다
     assert!(
@@ -591,7 +605,11 @@ async fn 보냄_표시는_lease가_있어야_남고_결과를_기록하면_지�
     assert_eq!(again.sent_at, None);
 
     // 표시한 뒤 결과를 남기지 못하고 lease가 끝나면, 다시 가져간 쪽이 표시를 본다
-    assert!(jobs::mark_sent(&mut conn, again.lease()).await.unwrap());
+    assert!(
+        jobs::mark_sent(&mut conn, again.lease(), renew)
+            .await
+            .unwrap()
+    );
     sqlx::query("UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1")
         .bind(again.id)
         .execute(&pool)

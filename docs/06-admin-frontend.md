@@ -120,6 +120,8 @@ POST /admin/api/logout ── DB의 세션을 지우고 쿠키를 지운다 (Max
 | `admin` | + 업체 정책 변경 | `RequireAdmin` |
 
 - 관리자 API는 로그인이 필요하다 (없으면 401, 역할이 모자라면 403). 예외: `POST /login`, `GET /info`(로그인 화면도 쓰는 화면 설정. 비밀이 아닌 값만).
+- 상태를 바꾸는 요청은 관리자 화면과 같은 출처에서 온 것만 받는다 (`Sec-Fetch-Site` · `Origin` 확인). `SameSite=Strict`만으로는 같은 사이트의 다른 포트 · 서브도메인 페이지가 보낸 폼 요청을 막지 못한다.
+- 비밀번호 확인(argon2)은 동시에 4개까지만 돌린다. 로그인 요청이 몰려도 메모리 · CPU를 다 쓰지 않는다.
 - 관리자 조작은 `admin_audit_log`에 조작과 같은 트랜잭션으로 남는다 (`/audit` 화면). 예약 상태를 바꾼 조작은 상태 이력에 `admin:<이름>`으로도 남는다.
 - 화면은 `GET /admin/api/session`으로 로그인 여부와 역할을 안다. 401이면 로그인 화면을 그린다. 어떤 요청이든 401을 받으면(세션 만료) `main.tsx`가 세션 정보를 비워 로그인 화면으로 돌아간다. 역할이 모자란 버튼은 꺼 두고, 그 위에 필요한 역할을 툴팁으로 보여 준다 (`NeedsRole`). 화면에서 끄는 것은 편의이고, 막는 것은 서버다.
 - 개발 서버(Vite :5173)는 `/admin/api`를 서버로 프록시하므로 쿠키가 같은 주소(localhost)에 붙는다. `Secure` 쿠키는 https에서만 보내지만 브라우저가 localhost를 예외로 둔다. localhost가 아닌 http 주소로 쓰거나 localhost 예외가 없는 브라우저라면 `.env`에 `BOOKING_ADMIN_COOKIE_SECURE=false`.

@@ -399,6 +399,10 @@ mod availability {
             FakeAdapter::new(IDEMPOTENT, vec![]).with_availabilities(vec![
                 Ok(vec![slot()]),
                 Err(ProviderError::Server { status: 503 }),
+                // HTTP 클라이언트의 오류 문구에는 업체 주소가 들어 있다
+                Err(ProviderError::Connect {
+                    detail: "error sending request for url (http://10.1.2.3/internal)".into(),
+                }),
             ]),
         );
         // TTL 100ms: 첫 조회 뒤 바로 다시 물으면 캐시, 조금 지나면 업체에 다시 묻는다
@@ -432,6 +436,11 @@ mod availability {
         assert_eq!(
             unavailable.body["type"],
             "https://booking.local/problems/provider-unavailable"
+        );
+        let detail = unavailable.body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("connect_error") && !detail.contains("10.1.2.3"),
+            "클라이언트에게는 결과 분류만 알리고 내부 주소는 내보내지 않는다: {detail}"
         );
     }
 

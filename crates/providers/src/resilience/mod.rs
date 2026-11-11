@@ -69,6 +69,8 @@ use crate::{
 
 /// 업체가 `Retry-After` 없이 호출 한도 초과를 알렸을 때 쉬는 시간
 const DEFAULT_PAUSE: Duration = Duration::from_secs(1);
+/// 업체가 쉬라고 한 시간의 상한 (어댑터도 `Retry-After`를 자르지만, 어떤 어댑터든 시각 계산이 넘치지 않게 여기서도 자른다)
+const MAX_PAUSE: Duration = Duration::from_secs(60 * 60);
 
 /// 업체 하나의 rate limiter. 키 없이(direct) 하나의 버킷을 쓰고, 시계는 표준 라이브러리의 단조 시계다.
 /// `StateInformationMiddleware`: 토큰을 받을 때마다 "버킷에 몇 개 남았는지"도 함께 알려 준다 (관리자 화면의 limiter 여유).
@@ -154,6 +156,8 @@ pub struct ResilientProvider {
     adapter: Arc<dyn ProviderAdapter>,
     /// 지금 적용 중인 정책. 바꿀 때는 새 값으로 통째로 교체한다 (`ArcSwap`: 잠금 없이 읽고, 드물게 바꾸는 값).
     policy: ArcSwap<ProviderPolicy>,
+    /// 정책 교체를 한 번에 하나씩 하게 하는 잠금. 두 교체가 섞이면 정책 · limiter · semaphore가 서로 다른 정책의 것으로 남는다.
+    policy_update: Mutex<()>,
     /// 여러 워커 태스크가 함께 쓰므로 잠금으로 감싼다. 잠금은 상태를 읽고 바꾸는 짧은 순간에만 쥐고,
     /// `await` 중에는 쥐지 않는다 (std `Mutex`를 쥔 채 기다리면 다른 태스크가 멈춘다).
     breaker: Mutex<CircuitBreaker>,
@@ -202,6 +206,14 @@ impl RateState {
     }
 }
 
+/// limiter 버킷의 토큰을 모두 써서 비운다 (새로 만든 limiter는 버킷이 가득 차 있다)
+fn drain(limiter: &Limiter, burst: u32) {
+    if let Some(burst) = NonZeroU32::new(burst) {
+        // 버킷 크기만큼 한 번에 쓴다. 새 limiter라 항상 성공하고, 실패해도(이미 비어 있음) 할 일이 없다.
+        let _ = limiter.check_n(burst);
+    }
+}
+
 /// `per_second`개씩 다시 채워지고 `burst`개까지 쌓이는 limiter
 fn build_limiter(per_second: u32, burst: u32) -> Limiter {
     // NonZeroU32: 0이 될 수 없는 정수 타입. governor는 "초당 0회" 같은 말이 안 되는 설정을 타입으로 막는다.
@@ -243,6 +255,7 @@ impl ResilientProvider {
             paused_until: Mutex::new(None),
             rate_limit_remaining: Mutex::new(None),
             policy: ArcSwap::from_pointee(policy),
+            policy_update: Mutex::new(()),
             id,
             adapter,
             recorder,
@@ -301,6 +314,8 @@ impl ResilientProvider {
     ///
     /// `policy`는 [`ProviderPolicy::validate`]를 통과한 값이어야 한다.
     pub fn update_policy(&self, policy: ProviderPolicy) {
+        // 교체가 끝날 때까지 다른 교체를 기다리게 한다 (`_guard`가 사라질 때 잠금이 풀린다)
+        let _guard = lock(&self.policy_update);
         let previous = self.policy.load_full();
         if previous.rate_limit != policy.rate_limit {
             let mut rate = lock(&self.rate);
@@ -348,7 +363,7 @@ impl ResilientProvider {
     /// 대사는 여유가 있을 때만 부른다 (docs/03-resilience.md §6).
     pub fn has_spare_capacity(&self) -> bool {
         let burst = lock(&self.rate).burst;
-        self.limiter_available() * 2 > burst
+        u64::from(self.limiter_available()) * 2 > u64::from(burst)
     }
 
     /// 관리자 화면에 보여 줄 지금 상태를 한 번에 모은다
@@ -640,6 +655,11 @@ impl ResilientProvider {
         let slot = async {
             self.wait_for_token(policy).await?;
             let slot = self.acquire_bulkhead(policy).await?;
+            // 기다리는 동안 다른 호출이 한도 초과를 받아 업체가 pause됐을 수 있다. 그동안은 부르지 않는다
+            // (pause 확인을 맨 앞에서만 하면, 토큰 · 자리를 기다리던 호출이 Retry-After 중에 나간다).
+            if let Some(until) = self.paused_until() {
+                return Err(ProviderError::Throttled { retry_at: until });
+            }
             if Instant::now() >= deadline {
                 // 기다리는 동안 호출 예산을 다 썼다. 부르지 않고 돌려보낸다.
                 return Err(ProviderError::Throttled {
@@ -704,7 +724,9 @@ impl ResilientProvider {
     fn adapt_rate(&self, rate_limited: bool) {
         let now = Instant::now();
         let burst = self.policy.load().rate_limit.burst.max(1);
-        let (changed, limiter) = {
+        let changed = {
+            // limiter 교체까지 이 잠금 안에서 한다. 잠금을 놓은 뒤에 교체하면, 그사이 정책 교체(`update_policy`)가
+            // 넣은 새 limiter를 옛 상태로 만든 limiter가 덮어써 실제 속도와 상태가 어긋난다.
             let mut rate = lock(&self.rate);
             let changed = if rate_limited {
                 rate.adaptive.on_rate_limited(now)
@@ -715,10 +737,18 @@ impl ResilientProvider {
                 return;
             }
             rate.burst = rate.adaptive.scaled_burst(burst);
-            rate.seen = None;
-            (changed, rate.limiter())
+            let limiter = rate.limiter();
+            if rate_limited {
+                // 줄일 때는 빈 버킷으로 시작한다. 가득 찬 채로 시작하면 줄이자마자 버킷만큼 한꺼번에 나간다
+                // (토큰을 기다리던 호출들이 바로 풀려난다).
+                drain(&limiter, rate.burst);
+                rate.seen = Some((now, 0));
+            } else {
+                rate.seen = None;
+            }
+            self.limiter.store(Arc::new(limiter));
+            changed
         };
-        self.limiter.store(Arc::new(limiter));
         if let Some(per_second) = changed {
             if rate_limited {
                 tracing::warn!(provider = %self.id, per_second, "업체가 한도 초과를 알려 허용 속도를 낮췄다 (AIMD)");
@@ -750,7 +780,7 @@ impl ResilientProvider {
 
     /// 업체가 쉬라고 한 만큼 이 업체 호출을 모두 멈춘다 (이미 더 길게 멈춰 있으면 그대로 둔다)
     fn pause(&self, duration: Duration) {
-        let until = Instant::now() + duration;
+        let until = Instant::now() + duration.min(MAX_PAUSE);
         let extended = {
             let mut paused = lock(&self.paused_until);
             let extend = paused.is_none_or(|current| current < until);

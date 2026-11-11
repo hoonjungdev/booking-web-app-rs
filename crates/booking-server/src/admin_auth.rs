@@ -26,8 +26,10 @@ use argon2::{
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use axum::{
-    extract::FromRequestParts,
-    http::{HeaderMap, HeaderValue, header, request::Parts},
+    extract::{FromRequestParts, Request},
+    http::{HeaderMap, HeaderValue, Method, header, request::Parts},
+    middleware::Next,
+    response::Response,
 };
 use chrono::{DateTime, Utc};
 use rand::RngExt;
@@ -192,6 +194,46 @@ pub fn session_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
+/// 상태를 바꾸는 관리자 요청은 관리자 화면과 같은 출처(origin)에서 온 것만 받는다 (CSRF 방어, 관리자 API 전체에 거는 미들웨어).
+///
+/// 쿠키의 `SameSite=Strict`는 "다른 사이트"에서 시작한 요청만 막는다. 같은 사이트의 다른 출처 — localhost의 다른 포트,
+/// 같은 도메인의 다른 서브도메인 — 에 있는 페이지가 폼으로 POST하면 쿠키가 실려 조작이 실행된다. 그래서 브라우저가
+/// 붙이는 헤더로 출처를 한 번 더 확인한다.
+/// - `Sec-Fetch-Site`가 있으면 `same-origin`만 받는다 (브라우저가 계산해 붙이는 헤더라 페이지가 바꿀 수 없다)
+/// - 없으면(오래된 브라우저) `Origin`이 이 서버의 주소(`Host`)와 같은지 본다
+/// - 둘 다 없으면 브라우저가 아닌 클라이언트(curl, 테스트)다. 쿠키가 저절로 실리는 일은 브라우저에서만 일어나므로 받는다.
+///
+/// 조회(GET · HEAD · OPTIONS)는 상태를 바꾸지 않으므로 확인하지 않는다.
+pub async fn reject_cross_origin(request: Request, next: Next) -> Result<Response, ApiError> {
+    let safe = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    if !safe && !same_origin(request.headers()) {
+        tracing::warn!(method = %request.method(), "다른 출처에서 보낸 관리자 조작 요청을 거절했다");
+        return Err(ApiError::CrossOrigin);
+    }
+    Ok(next.run(request).await)
+}
+
+fn same_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site == "same-origin";
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok());
+    let origin_host = origin.to_str().ok().and_then(|origin| {
+        origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+    });
+    matches!((origin_host, host), (Some(origin), Some(host)) if origin.eq_ignore_ascii_case(host))
+}
+
 /// 새 세션 토큰: 무작위 32바이트(256비트)를 16진수로 적은 것 (API 키와 같은 강도)
 pub fn generate_session_token() -> String {
     let bytes: [u8; 32] = rand::rng().random();
@@ -230,19 +272,40 @@ pub fn generate_password() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// 비밀번호를 argon2로 해시한다 (솔트는 무작위로 만든다).
+/// 동시에 돌릴 수 있는 argon2 계산 수.
+///
+/// argon2는 계산 한 번에 메모리를 약 19MB 쓴다 (기본 설정 m=19456 KiB). 로그인은 로그인 전에 부를 수 있는 API라,
+/// 상한이 없으면 동시 요청 수백 개로 메모리 수 GB와 CPU를 다 쓰게 만들 수 있다. 자리를 기다리는 요청은 메모리를
+/// 거의 쓰지 않는다 (≈ C#의 `SemaphoreSlim`으로 동시 실행 수를 묶는 것).
+const ARGON2_CONCURRENCY: usize = 4;
+static ARGON2_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(ARGON2_CONCURRENCY);
+
+/// argon2 계산을 블로킹 작업용 스레드에서 돌린다. 동시에 [`ARGON2_CONCURRENCY`]개까지만.
 ///
 /// argon2는 일부러 느리게(수십 ms) 만든 계산이다. async 태스크에서 그대로 돌리면 그동안 그 스레드의 다른 태스크가 멈추므로,
 /// CPU 작업용 스레드 풀(`spawn_blocking`)에 맡기고 결과를 기다린다 (≈ C#의 `Task.Run(() => …)`).
+async fn run_argon2<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    // 자리를 받을 때까지 기다린다. `_slot`이 사라질 때(계산이 끝난 뒤) 자리를 돌려준다.
+    let _slot = ARGON2_SLOTS
+        .acquire()
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+/// 비밀번호를 argon2로 해시한다 (솔트는 무작위로 만든다).
 pub async fn hash_password(password: String) -> Result<String, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    run_argon2(move || {
         Argon2::default()
             .hash_password(password.as_bytes())
             .map(|hash| hash.to_string())
             .map_err(|error| ApiError::Internal(format!("비밀번호를 해시할 수 없습니다: {error}")))
     })
-    .await
-    .map_err(|error| ApiError::Internal(error.to_string()))?
+    .await?
 }
 
 /// 비밀번호가 해시와 맞는가. 계정이 없으면(`hash`가 `None`) 가짜 해시로 같은 계산을 하고 `false`.
@@ -251,7 +314,7 @@ pub async fn hash_password(password: String) -> Result<String, ApiError> {
 pub async fn verify_password(password: String, hash: Option<String>) -> bool {
     let exists = hash.is_some();
     let hash = hash.unwrap_or_else(|| DUMMY_HASH.to_owned());
-    let verified = tokio::task::spawn_blocking(move || {
+    let verified = run_argon2(move || {
         PasswordHash::new(&hash).is_ok_and(|parsed| {
             Argon2::default()
                 .verify_password(password.as_bytes(), &parsed)

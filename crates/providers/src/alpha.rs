@@ -405,14 +405,42 @@ pub(crate) fn classify_transport(error: &reqwest::Error) -> ProviderError {
     }
 }
 
-/// `Retry-After: <초>` 헤더를 읽는다 (HTTP 날짜 형식은 우리 mock 업체가 쓰지 않으므로 무시)
+/// 업체가 알려 준 대기 시간은 이 값으로 자른다. 터무니없이 큰 값(업체의 버그 등)을 그대로 쓰면
+/// "지금 + 대기 시간" 계산이 넘쳐 panic이 나고, 그 업체를 사실상 영원히 멈추게 된다.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// `Retry-After: <초>` 헤더를 읽는다 (HTTP 날짜 형식은 우리 mock 업체가 쓰지 않으므로 무시). 최대 [`MAX_RETRY_AFTER`].
 pub(crate) fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
-    headers
+    let seconds = headers
         .get(header::RETRY_AFTER)?
         .to_str()
         .ok()?
         .trim()
         .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(value: &str) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn retry_after는_초를_읽고_터무니없이_큰_값은_자른다() {
+        assert_eq!(retry_after(&headers("3")), Some(Duration::from_secs(3)));
+        assert_eq!(retry_after(&headers(" 0 ")), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after(&headers("9223372036854775807")),
+            Some(MAX_RETRY_AFTER),
+            "그대로 쓰면 Instant 계산이 넘쳐 panic이 난다"
+        );
+        assert_eq!(retry_after(&headers("Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(retry_after(&header::HeaderMap::new()), None);
+    }
 }

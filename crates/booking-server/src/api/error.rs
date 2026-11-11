@@ -23,6 +23,9 @@ pub enum ApiError {
     /// 관리자 역할이 모자람
     #[error("{} 이상의 권한이 필요합니다", .0.as_str())]
     Forbidden(AdminRole),
+    /// 관리자 화면과 다른 출처(origin)의 페이지가 보낸 조작 요청 (CSRF 방어)
+    #[error("관리자 화면이 아닌 곳에서 보낸 조작 요청은 받지 않습니다")]
+    CrossOrigin,
     #[error("{0}")]
     InvalidRequest(String),
     #[error("Idempotency-Key 헤더가 필요합니다 (출력 가능한 ASCII 1~255자)")]
@@ -78,6 +81,11 @@ impl ApiError {
             ),
             Self::LoginFailed => (StatusCode::UNAUTHORIZED, "login-failed", "로그인 실패"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "권한이 없습니다"),
+            Self::CrossOrigin => (
+                StatusCode::FORBIDDEN,
+                "cross-origin",
+                "다른 출처의 요청입니다",
+            ),
             Self::InvalidRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid-request",

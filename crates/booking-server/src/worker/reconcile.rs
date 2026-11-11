@@ -19,11 +19,11 @@
 //! 처리 중인 예약(`pending`, `cancel_requested`)은 다른 작업이 다루고 있으므로 건너뛴다 (이중 예약 검사만 한다).
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::{Duration, Instant},
 };
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use db::{
     TraceRef,
     bookings::{self, Transitioned},
@@ -49,6 +49,8 @@ pub const LOOKAHEAD: TimeDelta = TimeDelta::days(7);
 const RECONCILER: &str = "reconciler";
 /// 우리 limiter에 여유가 없을 때 대사를 미루는 시간
 const SPARE_CAPACITY_WAIT: Duration = Duration::from_secs(5);
+/// 업체 목록을 받는 동안 바뀐 예약을 가려낼 때 두는 여유 (서버와 DB의 시계 차이)
+const CLOCK_MARGIN: TimeDelta = TimeDelta::seconds(5);
 
 /// 대사에서 찾은 것 (DB 없이 [`compare`]가 만든다)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +133,10 @@ pub fn compare(ours: &[Booking], theirs: &[ListedBooking]) -> Vec<Finding> {
         }
     }
 
+    // 우리 예약 ID 집합 (아래에서 참조값마다 찾는다. 목록을 매번 훑으면 예약 수 × 업체 예약 수만큼 걸린다)
+    let our_ids: HashSet<BookingId> = ours.iter().map(|b| b.id).collect();
     for (reference, entries) in &by_reference {
-        if ours.iter().any(|b| b.id == *reference) {
+        if our_ids.contains(reference) {
             continue;
         }
         let confirmed: Vec<_> = entries
@@ -267,10 +271,22 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
         booking_id: None,
         job_id: Some(job.id),
     };
+    // 이 시각 뒤에 바뀐 우리 예약은 업체 목록보다 새것일 수 있다 (아래 `apply_finding`)
+    let listed_since = now - CLOCK_MARGIN;
     let theirs = match provider.list_bookings(from, to, call).await {
         Ok(listed) => listed,
         Err(error) => return failed_call(ctx, job, &provider_id, &error).await,
     };
+    // 업체 목록에 lease를 많이 썼을 수 있다. 남은 일(찾은 것마다 트랜잭션)을 하는 동안 lease가 끝나지 않게 늘린다.
+    {
+        let mut conn = ctx.pool.acquire().await?;
+        if !jobs::extend_lease(&mut conn, lease, ctx.config.lease).await? {
+            warn_lease_lost();
+            return Ok(());
+        }
+    }
+    // 우리 예약은 업체 목록을 받은 **뒤에** 읽는다. 그래야 목록에 있는 업체 예약의 우리 쪽 예약이 반드시 보인다
+    // (먼저 읽으면 그사이 접수 · 확정된 예약이 "우리에게 없음"으로 잘못 잡힌다).
     let ours = bookings::for_reconciliation(&ctx.pool, &provider_id, from, to).await?;
     let findings = compare(&ours, &theirs);
     tracing::info!(
@@ -285,7 +301,7 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
     let trace = trace::current();
     let by_id: HashMap<BookingId, &Booking> = ours.iter().map(|b| (b.id, b)).collect();
     for finding in findings {
-        apply_finding(ctx, &provider_id, finding, &by_id, &trace).await?;
+        apply_finding(ctx, &provider_id, finding, &by_id, listed_since, &trace).await?;
     }
     end_run(ctx, lease, &provider_id, None, &trace).await
 }
@@ -296,8 +312,17 @@ async fn apply_finding(
     provider: &ProviderId,
     finding: Finding,
     bookings: &HashMap<BookingId, &Booking>,
+    listed_since: DateTime<Utc>,
     trace: &TraceRef,
 ) -> Result<(), WorkerError> {
+    // 업체 목록을 받는 동안 바뀐 우리 예약: 우리 쪽 상태가 목록보다 새것이라 비교가 틀릴 수 있다
+    // (목록을 받는 사이에 확정된 예약이 "업체에 없음"으로, 취소가 끝난 예약이 "상태 불일치"로 보인다).
+    // 이슈만 남기는 결과는 다음 대사에서 다시 본다. 자동 수정은 업체 쪽 사실에 근거하고 낙관적 전이로 막히므로 그대로 둔다.
+    let changed_while_listing = |id: &BookingId| {
+        bookings
+            .get(id)
+            .is_some_and(|b| b.updated_at >= listed_since)
+    };
     let issue =
         |kind, booking_id: BookingId, provider_booking_id: Option<String>, detail| NewIssue {
             provider_id: provider.clone(),
@@ -357,6 +382,12 @@ async fn apply_finding(
                 provider_booking_id,
             };
             fix(ctx, booking, &event, &fixed, trace).await
+        }
+        Finding::MissingAtProvider { booking_id, .. } | Finding::Mismatch { booking_id, .. }
+            if changed_while_listing(&booking_id) =>
+        {
+            tracing::debug!(%booking_id, "업체 목록을 받는 동안 바뀐 예약이라 다음 대사에서 다시 본다");
+            Ok(())
         }
         Finding::MissingAtProvider {
             booking_id,

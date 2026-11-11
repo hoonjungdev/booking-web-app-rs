@@ -350,18 +350,50 @@ pub async fn claim_next(
     Ok(row.map(Job::from))
 }
 
-/// 멱등키 없는 업체에 생성 요청을 보내기 **직전에** "보냄" 표시를 커밋한다. lease를 잃었으면 `false` (보내면 안 된다).
+/// 멱등키 없는 업체에 생성 요청을 보내기 **직전에** "보냄" 표시를 커밋하고, lease를 지금부터 `lease_for`로 새로 잡는다.
+/// lease를 잃었으면 `false` (보내면 안 된다).
 ///
 /// 보낸 뒤 결과를 기록하기 전에 워커가 죽거나 그 기록이 DB 오류로 실패하면, lease가 끝난 뒤 다른 워커가 이 작업을 다시
 /// 가져간다. 그 워커는 이 표시를 보고 다시 보내지 않고 결과 불명(`unknown`)으로 넘겨 업체에서 조회부터 한다.
 /// 결과를 기록하는 함수들(완료 · 재예약 · 미루기 · 포기)은 모두 이 표시를 지운다.
+///
+/// lease를 새로 잡는 이유: 한 작업이 업체를 두 번 부를 수 있다 (관리자 재시도의 "조회 → 제출"). lease 검사는 업체 호출
+/// 한 번만 계산하므로, 조회에 lease를 거의 다 쓰면 제출하는 도중에 lease가 끝나 다른 워커가 이 작업을 가져갈 수 있다.
+/// 보내기 직전에 lease를 새로 잡으면 제출 한 번이 끝날 시간이 늘 남는다.
 #[tracing::instrument(name = "db.jobs.mark_sent", skip_all)]
-pub async fn mark_sent(conn: &mut PgConnection, lease: Lease) -> Result<bool, DbError> {
+pub async fn mark_sent(
+    conn: &mut PgConnection,
+    lease: Lease,
+    lease_for: Duration,
+) -> Result<bool, DbError> {
     let result = sqlx::query!(
-        "UPDATE jobs SET sent_at = now(), updated_at = now()
+        "UPDATE jobs SET sent_at = now(), locked_until = now() + make_interval(secs => $3),
+                         updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
+        lease_for.as_secs_f64(),
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 쥐고 있는 작업의 lease를 지금부터 `lease_for`로 늘린다. lease를 잃었으면 `false`.
+///
+/// 업체 호출 뒤에도 할 일이 많이 남은 작업(대사: 찾은 것마다 트랜잭션)이 남은 일을 하는 동안 lease가 끝나지 않게 한다.
+#[tracing::instrument(name = "db.jobs.extend_lease", skip_all)]
+pub async fn extend_lease(
+    conn: &mut PgConnection,
+    lease: Lease,
+    lease_for: Duration,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs SET locked_until = now() + make_interval(secs => $3), updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2",
+        lease.job_id,
+        lease.attempt,
+        lease_for.as_secs_f64(),
     )
     .execute(conn)
     .await?;
@@ -782,13 +814,23 @@ pub async fn run_reconcile_now(
     let id = match id {
         Some(id) => id,
         // 대기 중인 것도 없고 새로 넣지도 못했다 = 지금 실행 중이다
-        None => sqlx::query_scalar!(
-            "SELECT id FROM jobs
-             WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status IN ('queued', 'running')",
-            provider.as_str(),
-        )
-        .fetch_one(&mut *conn)
-        .await?,
+        None => {
+            let active = sqlx::query_scalar!(
+                "SELECT id FROM jobs
+                 WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status IN ('queued', 'running')",
+                provider.as_str(),
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
+            match active {
+                Some(id) => id,
+                // 그 짧은 사이에 실행 중이던 대사가 다음 실행을 등록하지 않고 끝났다 (파이프라인이 없는 업체 등).
+                // 자리가 비었으니 다시 등록한다.
+                None => schedule_reconcile(conn, provider, Duration::ZERO, trace_context)
+                    .await?
+                    .ok_or_else(|| DbError::corrupt("대사 작업을 등록할 수 없습니다"))?,
+            }
+        }
     };
     get(conn, id)
         .await?

@@ -58,7 +58,7 @@
 - 시각은 UTC(`DateTime<Utc>`, DB는 `timestamptz`), ID는 UUID v7.
 - DB 쿼리는 `db` 크레이트에 두고 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`로 `.sqlx/`를 갱신해서 함께 커밋한다 (`scripts/check.sh`는 `.sqlx/`로 오프라인 검사하므로, 갱신하지 않으면 컴파일 에러가 난다). 테스트에서 준비용으로만 쓰는 SQL은 검사 없는 `sqlx::query(...)`를 써도 된다.
 - 예약 상태는 `db::bookings::transition`(내부에서 `BookingStatus::apply` 호출)으로만 바꾼다. `bookings.status`를 직접 UPDATE하지 않는다 (테스트 준비 코드 제외).
-- 관리자 API 핸들러는 필요한 권한을 매개변수 타입으로 밝힌다: 조회는 `AdminSession`, 조작은 `RequireOperator`, 정책 변경은 `RequireAdmin` (`docs/decisions.md` D-36). 상태를 바꾸는 관리자 조작은 같은 트랜잭션에서 `record_audit`로 감사 로그를 남기고, 상태 이력의 actor는 `session.actor()`(`admin:<이름>`)를 쓴다.
+- 관리자 API 핸들러는 필요한 권한을 매개변수 타입으로 밝힌다: 조회는 `AdminSession`, 조작은 `RequireOperator`, 정책 변경은 `RequireAdmin` (`docs/decisions.md` D-36). 상태를 바꾸는 관리자 조작은 같은 트랜잭션에서 `record_audit`로 감사 로그를 남기고, 상태 이력의 actor는 `session.actor()`(`admin:<이름>`)를 쓴다. 관리자 API 라우트는 `api::admin::routes()`에 등록한다 (상태를 바꾸는 요청의 출처 확인(CSRF) 미들웨어가 거기에 걸려 있다).
 - HTTP 핸들러에는 `#[utoipa::path(...)]`(경로 · 매개변수 · 응답 · `operation_id`)를 붙이고 `routes!(핸들러)`로 등록한다. 경로 문자열은 이 속성 한 곳에만 둔다 (`docs/decisions.md` D-25). 쿼리 매개변수 구조체는 `#[derive(utoipa::IntoParams)]`처럼 전체 경로로 derive한다 (`use utoipa::IntoParams`로 가져오면 매크로가 만든 코드가 `unused_qualifications`에 걸린다).
 - API의 요청 · 응답 모양을 바꾸면 `cd web/admin && pnpm gen`으로 `web/admin/openapi.json`과 `src/api/schema.d.ts`를 다시 만들어 함께 커밋한다 (`scripts/check.sh api` · `web`이 검사한다).
 - 이미 적용된 마이그레이션 파일은 수정하지 않는다. 바꿀 것이 있으면 새 마이그레이션을 추가한다.

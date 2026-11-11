@@ -1146,6 +1146,72 @@ async fn 포기한_대사_작업을_다시_넣으면_그_업체의_대사를_지
     );
 }
 
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 다른_출처의_페이지가_보낸_조작_요청은_거절한다(pool: PgPool) {
+    // SameSite=Strict 쿠키는 같은 사이트의 다른 출처(localhost의 다른 포트, 형제 서브도메인)에서 보낸 요청에도 실린다
+    let app = admin_app(ApiState::new(pool.clone())).await;
+    let uri = "/admin/api/providers/beta/reconcile";
+
+    let same_site = post_with(&app, uri, &[("sec-fetch-site", "same-site")]).await;
+    assert_eq!(
+        same_site.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        same_site.body
+    );
+    assert_eq!(
+        same_site.body["type"],
+        "https://booking.local/problems/cross-origin"
+    );
+    let other_port = post_with(
+        &app,
+        uri,
+        &[
+            ("origin", "http://localhost:3000"),
+            ("host", "localhost:8080"),
+        ],
+    )
+    .await;
+    assert_eq!(other_port.status, StatusCode::FORBIDDEN);
+
+    // 관리자 화면(같은 출처)에서 보낸 요청, 브라우저가 아닌 클라이언트(헤더 없음)는 받는다
+    let same_origin = post_with(&app, uri, &[("sec-fetch-site", "same-origin")]).await;
+    assert_eq!(
+        same_origin.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        same_origin.body
+    );
+    let matching = post_with(
+        &app,
+        uri,
+        &[
+            ("origin", "http://localhost:8080"),
+            ("host", "localhost:8080"),
+        ],
+    )
+    .await;
+    assert_eq!(matching.status, StatusCode::ACCEPTED);
+    assert_eq!(post_with(&app, uri, &[]).await.status, StatusCode::ACCEPTED);
+    // 조회는 상태를 바꾸지 않으므로 확인하지 않는다
+    let read = send(
+        &app.app,
+        Method::GET,
+        "/admin/api/providers",
+        &[("cookie", &app.cookie), ("sec-fetch-site", "cross-site")],
+        None,
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK);
+}
+
+/// 쿠키에 헤더를 더해 POST한다
+async fn post_with(admin: &Admin, uri: &str, headers: &[(&str, &str)]) -> common::Reply {
+    let mut all = vec![("cookie", admin.cookie.as_str())];
+    all.extend_from_slice(headers);
+    send(&admin.app, Method::POST, uri, &all, None).await
+}
+
 // ───────────────────────── 준비 코드 ─────────────────────────
 
 /// 예약 API로 예약 하나를 접수하고 ID를 돌려준다 (`key`: 멱등키)

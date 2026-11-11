@@ -783,6 +783,44 @@ async fn 업체가_한도_초과를_알리면_허용_속도를_절반으로_줄�
         (5, 10)
     );
     assert_eq!(status.limiter_burst, 2, "버킷도 같은 비율로 줄인다");
+    assert_eq!(
+        status.limiter_available, 0,
+        "줄일 때는 빈 버킷으로 시작한다 (가득 찬 채면 줄이자마자 버킷만큼 한꺼번에 나간다)"
+    );
+}
+
+#[tokio::test]
+async fn 토큰을_기다리는_동안_업체가_pause되면_부르지_않는다() {
+    // A가 토큰을 쓰고 업체에서 한도 초과(Retry-After 5초)를 받는 동안, B는 다음 토큰을 기다린다 (초당 5회 = 200ms).
+    // B가 토큰을 받았을 때는 업체가 쉬는 중이므로 부르지 않고 Throttled여야 한다.
+    let adapter = Scripted::new(IDEMPOTENT)
+        .create(
+            MS,
+            Err(ProviderError::RateLimited {
+                retry_after: Some(Duration::from_secs(5)),
+            }),
+        )
+        .create(MS, booked("rsv_2"));
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 5,
+            burst: 1,
+            max_wait_ms: 1_000,
+            adaptive: false,
+        },
+        ..fast_policy()
+    };
+    let (provider, adapter, _records) = provider(adapter, policy);
+
+    let request = request();
+    let (a, b) = tokio::join!(
+        provider.create_booking(&request, CallContext::default()),
+        provider.create_booking(&request, CallContext::default()),
+    );
+
+    assert!(matches!(a, Err(ProviderError::RateLimited { .. })), "{a:?}");
+    assert!(matches!(b, Err(ProviderError::Throttled { .. })), "{b:?}");
+    assert_eq!(adapter.calls(), 1, "pause 중에는 업체를 부르지 않는다");
 }
 
 #[tokio::test]

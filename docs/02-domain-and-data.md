@@ -278,12 +278,13 @@ CREATE TABLE reconciliation_issues (
 | `20261113000004_add_beta_provider.sql` | 로컬 개발용 업체 `beta` (`http://127.0.0.1:9090/beta/api`, 멱등키 없음) |
 
 - **작업의 업체** ([D-30](decisions.md#d-30-워커는-업체마다-루프를-따로-두고-작업에-업체를-적는다-jobsprovider_id)): 예약 작업은 등록하는 SQL 안에서 예약의 업체를 읽어 넣는다 (`(SELECT provider_id FROM bookings WHERE id = $2)`). 예약의 업체는 바뀌지 않으므로 함께 바꿀 일이 없다. 워커 루프는 `provider_id = $1` 조건으로 자기 업체의 작업만 가져간다 (§5).
-- **"보냄" 표시** ([D-31](decisions.md#d-31-멱등키-없는-업체에는-보내기-직전에-보냄-표시를-커밋한다-jobssent_at)): `jobs::mark_sent`가 lease 증표 조건으로 `sent_at = now()`를 남기고, 결과를 남기는 SQL(`complete` · `retry_later` · `defer` · `mark_dead` · `requeue` 등)이 모두 `sent_at = NULL`로 지운다.
+- **"보냄" 표시** ([D-31](decisions.md#d-31-멱등키-없는-업체에는-보내기-직전에-보냄-표시를-커밋한다-jobssent_at)): `jobs::mark_sent`가 lease 증표 조건으로 `sent_at = now()`를 남기면서 `locked_until`도 지금부터 lease만큼으로 새로 잡는다. 결과를 남기는 SQL(`complete` · `retry_later` · `defer` · `mark_dead` · `requeue` 등)이 모두 `sent_at = NULL`로 지운다. 업체 호출 뒤에 할 일이 많은 대사 작업은 `jobs::extend_lease`로 lease를 늘린다.
+- **포기하려는데 예약이 그사이 바뀌었으면** (다른 경로가 먼저 처리함, 낙관적 전이 충돌) 작업을 dead로 남기지 않고 끝내기만 한다. dead 표시와 상태 전이가 한 트랜잭션이라 전이가 막히면 그 트랜잭션을 버리고 완료로 기록한다. 예약은 멀쩡한데 dead 작업이 남아 "dead 작업이 있음" 알림이 울리는 일을 막는다 (독립 리뷰에서 지적: 결과 불명 확인의 포기와 대사의 확정이 겹친 경우).
 - **대사 작업은 업체마다 하나** ([D-33](decisions.md#d-33-대사는-업체별-작업-체인으로-돌고-자동으로-바로잡을-것과-사람에게-넘길-것을-나눈다)): `jobs::schedule_reconcile`은 `INSERT … ON CONFLICT (provider_id) WHERE kind = 'reconcile_provider' AND status IN ('queued', 'running') DO NOTHING`이다. 부분 유니크 인덱스를 `ON CONFLICT`의 대상으로 쓰려면 인덱스와 **같은 `WHERE` 조건**을 적어야 PostgreSQL이 그 인덱스를 찾는다. `jobs::run_reconcile_now`는 대기 중인 대사 작업의 `run_at`을 지금으로 당긴다 (없으면 새로 등록, 실행 중이면 그 작업).
 - **이슈 기록** (`db::reconciliation::record`): `ON CONFLICT … DO NOTHING`이라 같은 미해결 이슈가 있으면 새로 넣지 않는다. 자동으로 바로잡은 이슈는 처음부터 `resolved_at` · `resolved_by = 'reconciler'`를 채워 넣는다 (부분 인덱스 밖이라 겹쳐도 남는다).
 - **대사가 실패 예약을 바로잡을 때** 그 예약의 dead 작업을 `status = 'done'`으로 정리한다 (`jobs::close_dead_for_booking`). 포기한 대사 작업을 관리자가 다시 넣을 때도 그 행을 `done`으로 정리하고(`jobs::close_dead`) 대기 중인 대사를 당긴다. 되살리면 하나뿐인 대사 자리와 겹쳐 유니크 인덱스에 걸린다 (처음 구현은 500이 났다. 문서를 쓰다 발견).
 - **대사의 우리 쪽 예약** (`bookings::for_reconciliation`): 업체와 슬롯 기간으로 고른다 (`bookings_provider_idx (provider_id, slot_start)`).
-- **관리자 세션**: 쿠키의 토큰을 SHA-256으로 해시해 `admin_sessions`의 기본 키로 바로 찾는다 (만료 시각 조건 포함). 끝난 세션 행은 아직 지우지 않는다 (§6).
+- **관리자 세션**: 쿠키의 토큰을 SHA-256으로 해시해 `admin_sessions`의 기본 키로 바로 찾는다 (만료 시각 조건 포함). 로그인할 때 그 관리자의 만료된 세션을 같은 트랜잭션에서 지우고, 로그아웃하면 그 세션을 지운다 (§6).
 - 관리자 조작과 감사 로그는 한 트랜잭션이다. `admin_audit_log.actor`와 `booking_events.actor`는 `admin:<이름>`이다.
 
 ## 5. 작업 큐 동작
@@ -344,5 +345,5 @@ WHERE provider_id = $1 AND ((status = 'queued' AND run_at <= now()) OR (status =
 |---|---|---|
 | `provider_calls` | 30일 | 매일 정리 작업이 삭제. 장기 추세가 필요하면 시간 단위 집계 테이블을 추가 (Phase 7 이후) |
 | `jobs` (`done`) | 7일 | 매일 정리 |
-| `admin_sessions` (만료된 것) | 만료 즉시 | 정리 작업과 함께 (Phase 7). 그 전까지는 찾을 때 만료 시각을 확인하고 행은 남는다 |
+| `admin_sessions` (만료된 것) | 만료 뒤 정리 | 그 관리자가 다시 로그인할 때 지운다. 다시 로그인하지 않는 관리자의 것은 정리 작업과 함께 (Phase 7) |
 | 나머지 (`reconciliation_issues`, `admin_audit_log` 포함) | 영구 | |

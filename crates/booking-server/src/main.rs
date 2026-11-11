@@ -206,8 +206,9 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
         if let Some(url) = config.chaos_url() {
             tracing::info!(%url, "관리자 API가 mock 업체의 장애 주입 API를 중계한다 (개발 환경 전용)");
         }
-        // 같은 프로세스에서 워커가 돌 때만 그 lease로 정책 변경을 검사한다
-        let worker_lease = runtime.is_some().then_some(worker_config.lease);
+        // 정책 변경은 설정된 워커 lease로 늘 검사한다. API만 띄운 프로세스(`--role api`)에서도 검사해야,
+        // lease를 넘는 정책이 DB에 저장된 뒤 따로 띄운 워커가 시작 검사에 걸려 뜨지 못하는 일이 없다.
+        let worker_lease = Some(worker_config.lease);
         let state = ApiState {
             pool: pool.clone(),
             // 이 값이 API 쪽에서 업체 파이프라인을 쥐고 있게 된다. API 서버가 멈추면서 놓으므로 종료 순서는 그대로다.

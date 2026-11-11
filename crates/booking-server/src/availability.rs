@@ -136,7 +136,9 @@ impl AvailabilityCache {
             }
             // 업무적 거절은 업체가 정상으로 답한 것이다. 예전 값으로 덮지 않는다.
             Err(error @ ProviderError::Rejected { .. }) => Err(error),
-            Err(error) => match cached {
+            // 예전 값의 나이는 업체 호출이 끝난 지금 다시 잰다. 호출 전에 꺼낸 값이라, 호출이 오래 걸렸으면
+            // 그사이 stale 한도(5분)를 넘었을 수 있다.
+            Err(error) => match cached.filter(|entry| entry.fetched.elapsed() <= STALE_IF_ERROR) {
                 Some(entry) => {
                     tracing::warn!(
                         provider = %provider.id(),

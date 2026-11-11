@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{JobView, find_provider, record_audit, to_utc};
+
+/// 정책 변경을 이 프로세스 안에서 한 번에 하나씩 하게 하는 잠금 (`update_policy` 참고).
+/// `tokio::sync::Mutex`: 잠근 채로 `await`(DB 저장)할 수 있는 async용 잠금이다 (std `Mutex`는 그러면 안 된다).
+static POLICY_UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use crate::{
     admin_auth::{AdminSession, RequireAdmin, RequireOperator},
     api::{ApiError, ApiState, Problem, docs::tags},
@@ -279,10 +283,16 @@ pub async fn update_policy(
             )));
         }
     }
-    let stored = ProviderPolicy::from_json(record.policy.clone()).ok();
     let json =
         serde_json::to_value(&policy).map_err(|error| ApiError::Internal(error.to_string()))?;
 
+    // 정책 변경은 이 프로세스 안에서 한 번에 하나씩 한다 (저장부터 파이프라인 적용까지). 두 변경이 겹치면
+    // DB에 커밋된 순서와 파이프라인에 적용되는 순서가 달라져, 화면 · DB의 정책과 실제로 쓰는 정책이 어긋날 수 있다.
+    let _serialized = POLICY_UPDATE.lock().await;
+    // 바꾸기 전 정책은 잠근 뒤에 읽는다 (감사 로그의 before가 바로 앞 변경의 결과와 맞게)
+    let stored = db::providers::find(&state.pool, &record.id)
+        .await?
+        .and_then(|current| ProviderPolicy::from_json(current.policy).ok());
     let actor = session.actor();
     let mut tx = state.pool.begin().await?;
     db::providers::update_policy(&mut tx, &record.id, &json)
@@ -341,11 +351,8 @@ pub async fn control_circuit(
 ) -> Result<Json<RuntimeView>, ApiError> {
     let Json(command) = body?;
     let provider = pipeline(&state, &id).await?;
-    provider.control_circuit(match command.action {
-        CircuitActionView::ForceOpen => CircuitAction::ForceOpen,
-        CircuitActionView::ForceClose => CircuitAction::ForceClose,
-        CircuitActionView::Reset => CircuitAction::Reset,
-    });
+    // 서킷은 DB 밖(프로세스 메모리)의 상태라 조작과 감사 로그를 한 트랜잭션에 묶을 수 없다. 기록을 먼저 남기고
+    // 조작한다: 기록에 실패하면 조작하지 않으므로 "조작은 됐는데 기록이 없는" 일이 없다 (조작 자체는 실패하지 않는다).
     let mut conn = state.pool.acquire().await?;
     record_audit(
         &mut conn,
@@ -355,6 +362,11 @@ pub async fn control_circuit(
         serde_json::json!({ "action": command.action }),
     )
     .await?;
+    provider.control_circuit(match command.action {
+        CircuitActionView::ForceOpen => CircuitAction::ForceOpen,
+        CircuitActionView::ForceClose => CircuitAction::ForceClose,
+        CircuitActionView::Reset => CircuitAction::Reset,
+    });
     Ok(Json(RuntimeView::from(provider.runtime_status())))
 }
 

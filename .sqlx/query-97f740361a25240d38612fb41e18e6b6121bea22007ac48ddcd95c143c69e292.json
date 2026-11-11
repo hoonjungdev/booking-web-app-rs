@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id FROM jobs\n             WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status IN ('queued', 'running')",
+  "query": "SELECT id FROM jobs\n                 WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status IN ('queued', 'running')",
   "describe": {
     "columns": [
       {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "a2bae34db9288ea0292f5815fec954a723c3acb10bb53b239a71d5a9b069d1f8"
+  "hash": "97f740361a25240d38612fb41e18e6b6121bea22007ac48ddcd95c143c69e292"
 }

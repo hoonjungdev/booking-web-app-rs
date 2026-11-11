@@ -149,8 +149,12 @@ pub async fn availability(
                 "업체가 조회 조건을 받지 않았습니다 ({})",
                 reason.code()
             )),
-            // 오류 메시지(`Display`)에는 업체가 보낸 글자가 없다 (ProviderError 규칙)
-            error => ApiError::ProviderUnavailable(error.to_string()),
+            // 클라이언트에게는 결과 분류(`timeout` 등)만 알린다. 오류 메시지(`Display`)에는 HTTP 클라이언트가 붙인
+            // 업체 주소 같은 내부 정보가 들어 있을 수 있어서, 그 내용은 서버 로그에만 남긴다.
+            error => {
+                tracing::warn!(outcome = error.outcome(), %error, "업체에서 빈 시간을 가져오지 못했다");
+                ApiError::ProviderUnavailable(error.outcome().to_owned())
+            }
         })?;
     let span = Span::current();
     span.record("cache", result.source.as_str());

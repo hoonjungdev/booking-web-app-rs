@@ -15,6 +15,14 @@ use crate::BuildError;
 /// 시도 타임아웃의 상한 (밀리초). 어댑터의 HTTP 클라이언트가 안전장치로 거는 타임아웃(`ADAPTER_TIMEOUT`)과 같다.
 /// 이보다 길게 정하면 안전장치가 먼저 끊어 정책 값이 지켜지지 않으므로 거절한다.
 pub const MAX_ATTEMPT_TIMEOUT_MS: u64 = 60_000;
+/// 시간 값(밀리초)의 상한: 1시간. 이보다 긴 값은 뜻이 없고, "지금 + 값" 같은 시각 계산이 넘쳐 panic이 날 수 있다.
+pub const MAX_DURATION_MS: u64 = 60 * 60 * 1000;
+/// 빈 시간 캐시를 새것으로 보는 시간의 상한 (밀리초). 캐시는 항목을 최대 5분(stale-if-error 한도)까지만 둔다.
+pub const MAX_AVAILABILITY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+/// 개수 값(초당 호출 수, 버킷 크기, 동시 실행 수, 서킷 창 크기, 시험 호출 수)의 상한
+pub const MAX_COUNT: u32 = 100_000;
+/// 호출 한 번 안의 최대 시도 횟수 상한
+pub const MAX_RETRY_ATTEMPTS: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -177,6 +185,40 @@ impl ProviderPolicy {
         if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("{name}는 1 이상이어야 합니다"));
         }
+        let durations = [
+            ("call_budget_ms", self.call_budget_ms),
+            ("retry.base_delay_ms", self.retry.base_delay_ms),
+            ("retry.max_delay_ms", self.retry.max_delay_ms),
+            ("rate_limit.max_wait_ms", self.rate_limit.max_wait_ms),
+            ("bulkhead.max_wait_ms", self.bulkhead.max_wait_ms),
+            ("circuit_breaker.open_ms", self.circuit_breaker.open_ms),
+        ];
+        if let Some((name, _)) = durations.iter().find(|(_, value)| *value > MAX_DURATION_MS) {
+            return Err(format!("{name}는 {MAX_DURATION_MS}(1시간) 이하여야 합니다"));
+        }
+        let counts = [
+            ("rate_limit.per_second", self.rate_limit.per_second),
+            ("rate_limit.burst", self.rate_limit.burst),
+            ("bulkhead.max_concurrency", self.bulkhead.max_concurrency),
+            ("circuit_breaker.window", self.circuit_breaker.window),
+            (
+                "circuit_breaker.half_open_probes",
+                self.circuit_breaker.half_open_probes,
+            ),
+        ];
+        if let Some((name, _)) = counts.iter().find(|(_, value)| *value > MAX_COUNT) {
+            return Err(format!("{name}는 {MAX_COUNT} 이하여야 합니다"));
+        }
+        if self.retry.max_attempts > MAX_RETRY_ATTEMPTS {
+            return Err(format!(
+                "retry.max_attempts는 {MAX_RETRY_ATTEMPTS} 이하여야 합니다"
+            ));
+        }
+        if self.availability_cache_ttl_ms > MAX_AVAILABILITY_CACHE_TTL_MS {
+            return Err(format!(
+                "availability_cache_ttl_ms는 {MAX_AVAILABILITY_CACHE_TTL_MS}(5분) 이하여야 합니다 (캐시는 항목을 5분까지만 둔다)"
+            ));
+        }
         if self.attempt_timeout_ms > MAX_ATTEMPT_TIMEOUT_MS {
             return Err(format!(
                 "attempt_timeout_ms는 {MAX_ATTEMPT_TIMEOUT_MS} 이하여야 합니다 (어댑터의 HTTP 안전장치 타임아웃)"
@@ -307,6 +349,13 @@ mod tests {
             json!({ "circuit_breaker": { "failure_rate": 1.5 } }),
             json!({ "circuit_breaker": { "failure_rate": 0.0 } }),
             json!({ "attempt_timeout_ms": 60_001 }),
+            // 너무 큰 값: 시각 계산이 넘치거나(panic) 뜻이 없는 값
+            json!({ "circuit_breaker": { "open_ms": 9_000_000_000_000_000_u64 } }),
+            json!({ "call_budget_ms": 3_600_001 }),
+            json!({ "rate_limit": { "burst": 3_000_000_000_u64 } }),
+            json!({ "bulkhead": { "max_concurrency": 100_001 } }),
+            json!({ "retry": { "max_attempts": 11 } }),
+            json!({ "availability_cache_ttl_ms": 300_001 }),
         ];
         for value in invalid {
             assert!(
