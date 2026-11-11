@@ -7,12 +7,16 @@
 //! | `policy` | 업체별 정책 (`providers.policy` jsonb) |
 //! | [`resilience`] | 어댑터를 감싸는 [`ResilientProvider`]: 재시도 · 타임아웃 · 서킷 브레이커 · rate limit · bulkhead |
 //! | `recorder` | 시도마다 남기는 호출 기록을 채널로 내보냄 (DB 저장은 booking-server) |
+//! | `metrics` | 업체 호출 지표 (시도 시간, 재시도, 호출 제한) |
+//! | `trace` | 업체 요청에 trace 정보(`traceparent`)를 실어 보냄 |
 
 mod alpha;
 mod error;
+mod metrics;
 mod policy;
 mod recorder;
 pub mod resilience;
+mod trace;
 
 use std::sync::Arc;
 

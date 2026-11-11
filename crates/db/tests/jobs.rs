@@ -190,3 +190,84 @@ async fn 진행_상황을_payload에_남기고_다시_가져갈_때_읽는다(po
     assert_eq!(again.payload, progress);
     assert_eq!(again.attempts, 2);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 가져갈_때_실행_시각보다_얼마나_밀렸는지_알려_준다(pool: PgPool) {
+    one_job(&pool).await;
+    // 준비: 7초 전에 실행했어야 하는 작업으로 만든다
+    sqlx::query("UPDATE jobs SET run_at = now() - interval '7 seconds'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        (Duration::from_secs(7)..Duration::from_secs(9)).contains(&job.lag),
+        "밀린 시간: {:?}",
+        job.lag
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 종류별로_대기_작업과_dead_작업을_센다(pool: PgPool) {
+    assert_eq!(jobs::queue_depths(&pool).await.unwrap(), vec![]);
+
+    // submit_booking 작업 3개: 하나는 바로 실행 가능, 하나는 나중에 실행, 하나는 dead
+    let client = common::create_client(&pool, "app").await;
+    for key in ["key-1", "key-2", "key-3"] {
+        let new = common::new_booking(client, key, key.as_bytes());
+        bookings::accept(&pool, &new).await.unwrap();
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    let later = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    jobs::retry_later(
+        &mut conn,
+        later.lease(),
+        Duration::from_secs(300),
+        "timeout",
+    )
+    .await
+    .unwrap();
+    let dead = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    jobs::mark_dead(&mut conn, dead.lease(), "attempts_exhausted")
+        .await
+        .unwrap();
+    // 다른 종류의 작업 하나
+    jobs::enqueue(
+        &mut conn,
+        jobs::JobKind::ResolveUnknown,
+        None,
+        jobs::DEFAULT_MAX_ATTEMPTS,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut depths = jobs::queue_depths(&pool).await.unwrap();
+    depths.sort_by(|a, b| a.kind.cmp(&b.kind));
+    assert_eq!(
+        depths,
+        vec![
+            jobs::QueueDepth {
+                kind: "resolve_unknown".into(),
+                ready: 1,
+                dead: 0
+            },
+            jobs::QueueDepth {
+                kind: "submit_booking".into(),
+                ready: 1,
+                dead: 1
+            },
+        ],
+        "나중에 실행할 작업(재예약)과 처리 중인 작업은 대기 수에 넣지 않는다"
+    );
+}

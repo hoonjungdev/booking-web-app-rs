@@ -10,6 +10,9 @@
 //! |---|---|
 //! | `submit_booking` | 접수한 예약을 업체에 제출한다 (`submit`) |
 //! | `resolve_unknown` | 결과 불명인 예약을 업체에서 조회해 확인한다 (`resolve`) |
+//!
+//! 작업 하나를 처리하는 동안 `job.<종류>` span을 연다. 이 span은 새 trace의 시작이고, 작업을 등록한 요청의 trace와는
+//! link로 이어진다 (`crate::trace`, docs/05-observability-and-analytics.md §3).
 
 mod backoff;
 mod resolve;
@@ -27,12 +30,13 @@ use providers::ProviderError;
 use rand::RngExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::{Span, field::Empty};
 
 pub use backoff::JobBackoff;
 pub use resolve::{REQUIRED_NOT_FOUND_CHECKS, decide_resolution};
 pub use submit::decide;
 
-use crate::registry::ProviderRegistry;
+use crate::{metrics, registry::ProviderRegistry, trace};
 
 /// 워커 이름. `booking_events.actor`에 남는다.
 const ACTOR: &str = "worker";
@@ -152,22 +156,44 @@ pub async fn process_next(ctx: &WorkerContext) -> Result<bool, WorkerError> {
     let Some(job) = jobs::claim_next(&ctx.pool, ctx.config.lease).await? else {
         return Ok(false);
     };
+    metrics::job_claimed(&job);
     process(ctx, job).await?;
     Ok(true)
 }
 
 /// `#[tracing::instrument]`: 이 함수 실행 동안 `job` span을 열어, 안에서 남기는 로그에 job_id 등이 함께 찍히게 한다.
+///
+/// - `otel.name`: Grafana에 보이는 span 이름. 작업 종류를 넣어 `job.submit_booking`처럼 만든다.
+/// - `Empty`로 둔 필드는 처리하면서 채운다: `booking_id`, `trace_id`, 이번 실행의 결론(`decision`),
+///   포기했을 때의 오류 표시(`otel.status_code`).
 #[tracing::instrument(
     name = "job",
     skip_all,
-    fields(job_id = job.id, kind = %job.kind, attempt = job.attempts, booking_id = tracing::field::Empty)
+    fields(
+        otel.name = %format!("job.{}", job.kind),
+        otel.status_code = Empty,
+        job_id = job.id,
+        kind = %job.kind,
+        attempt = job.attempts,
+        booking_id = Empty,
+        decision = Empty,
+        trace_id = Empty,
+    )
 )]
 async fn process(ctx: &WorkerContext, job: Job) -> Result<(), WorkerError> {
+    // 이 작업을 등록한 요청(또는 앞선 작업)의 trace로 가는 link를 걸고, 이 trace의 ID를 로그에 보이게 남긴다
+    let span = Span::current();
+    trace::link_to_origin(&span, &job);
+    if let Some(trace_id) = telemetry::current_trace_id() {
+        span.record("trace_id", trace_id.as_str());
+    }
+
     match job.kind.parse::<JobKind>() {
         Ok(JobKind::SubmitBooking) => submit::handle(ctx, &job).await,
         Ok(JobKind::ResolveUnknown) => resolve::handle(ctx, &job).await,
         Err(_) => {
             tracing::error!("알 수 없는 작업 종류라 처리하지 않는다");
+            record_decision("bury");
             let mut conn = ctx.pool.acquire().await?;
             jobs::mark_dead(&mut conn, job.lease(), "unsupported job kind").await?;
             Ok(())
@@ -181,7 +207,7 @@ async fn load_booking(ctx: &WorkerContext, job: &Job) -> Result<Option<Booking>,
         bury(ctx, job.lease(), "작업에 booking_id가 없습니다").await?;
         return Ok(None);
     };
-    tracing::Span::current().record("booking_id", tracing::field::display(booking_id));
+    Span::current().record("booking_id", tracing::field::display(booking_id));
 
     let booking = bookings::get(&ctx.pool, booking_id).await?;
     if booking.is_none() {
@@ -206,6 +232,7 @@ async fn apply(
             give_up(ctx, lease, booking, format!("attempts_exhausted: {reason}")).await
         }
         Decision::Retry(reason) => {
+            record_decision("retry");
             let delay = ctx.config.backoff.delay(job.attempts, rand::rng().random());
             tracing::info!(?delay, %reason, "나중에 다시 시도한다");
             let mut conn = ctx.pool.acquire().await?;
@@ -215,6 +242,7 @@ async fn apply(
             Ok(())
         }
         Decision::Defer { wait, reason } => {
+            record_decision("defer");
             let delay = wait.max(MIN_DEFER) + DEFER_JITTER.mul_f64(rand::rng().random());
             tracing::info!(?delay, %reason, "업체를 부르지 않고 미룬다 (시도 횟수로 세지 않음)");
             let mut conn = ctx.pool.acquire().await?;
@@ -228,6 +256,7 @@ async fn apply(
             give_up(ctx, lease, booking, reason).await
         }
         Decision::Recheck { not_found_checks } => {
+            record_decision("recheck");
             let delay = ctx.config.unknown_recheck_interval;
             tracing::info!(
                 ?delay,
@@ -260,21 +289,46 @@ async fn finish(
     booking: &Booking,
     event: &BookingEvent,
 ) -> Result<(), WorkerError> {
+    record_decision("transition");
+    // 이 작업의 trace. 상태 이력에 남기고, 이어서 할 작업에도 실어 보낸다 (그 작업이 이 trace로 link를 건다).
+    let trace = trace::current();
+
     let mut tx = ctx.pool.begin().await?;
     if !jobs::complete(&mut tx, lease).await? {
         warn_lease_lost();
         return Ok(()); // tx가 commit 없이 버려지면서 롤백된다
     }
-    match bookings::transition(&mut tx, booking.id, booking.status, event, ACTOR).await? {
+    let transitioned = bookings::transition(
+        &mut tx,
+        booking.id,
+        booking.status,
+        event,
+        ACTOR,
+        trace.trace_id.as_deref(),
+    )
+    .await?;
+    if let Transitioned::Applied(to) = transitioned
+        && let Some(kind) = follow_up(to)
+    {
+        jobs::enqueue(
+            &mut tx,
+            kind,
+            Some(booking.id),
+            jobs::DEFAULT_MAX_ATTEMPTS,
+            trace.context.as_ref(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+
+    // 지표는 커밋한 뒤에 센다. 커밋이 실패하면 전이는 일어나지 않은 것이다.
+    match transitioned {
         Transitioned::Applied(to) => {
-            if let Some(kind) = follow_up(to) {
-                jobs::enqueue(&mut tx, kind, Some(booking.id), jobs::DEFAULT_MAX_ATTEMPTS).await?;
-            }
+            metrics::booking_transitioned(booking, to);
             tracing::info!(status = %to, "예약 상태를 바꿨다");
         }
         Transitioned::Conflict => tracing::warn!("그사이 예약 상태가 바뀌어 전이를 건너뛴다"),
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -302,19 +356,37 @@ async fn give_up(
     reason: String,
 ) -> Result<(), WorkerError> {
     tracing::warn!(%reason, "예약 처리를 포기한다");
+    record_decision("give_up");
+    // 포기한 작업은 trace에서 오류로 표시한다 (Grafana에서 오류 span만 골라 볼 수 있다)
+    Span::current().record("otel.status_code", "error");
+    let trace_id = telemetry::current_trace_id();
+
     let mut tx = ctx.pool.begin().await?;
     if !jobs::mark_dead(&mut tx, lease, &reason).await? {
         warn_lease_lost();
         return Ok(());
     }
     let event = BookingEvent::GaveUp { reason };
-    bookings::transition(&mut tx, booking.id, booking.status, &event, ACTOR).await?;
+    let transitioned = bookings::transition(
+        &mut tx,
+        booking.id,
+        booking.status,
+        &event,
+        ACTOR,
+        trace_id.as_deref(),
+    )
+    .await?;
     tx.commit().await?;
+
+    if let Transitioned::Applied(to) = transitioned {
+        metrics::booking_transitioned(booking, to);
+    }
     Ok(())
 }
 
 /// 이미 다른 경로로 처리된 예약의 작업: 예약은 두고 작업만 끝낸다
 async fn complete_only(ctx: &WorkerContext, lease: Lease) -> Result<(), WorkerError> {
+    record_decision("skip");
     let mut conn = ctx.pool.acquire().await?;
     if !jobs::complete(&mut conn, lease).await? {
         warn_lease_lost();
@@ -325,9 +397,17 @@ async fn complete_only(ctx: &WorkerContext, lease: Lease) -> Result<(), WorkerEr
 /// 예약이 없는 등 작업 자체가 잘못된 경우: 작업만 `dead`로 남긴다
 async fn bury(ctx: &WorkerContext, lease: Lease, reason: &str) -> Result<(), WorkerError> {
     tracing::error!(%reason, "처리할 수 없는 작업");
+    record_decision("bury");
     let mut conn = ctx.pool.acquire().await?;
     jobs::mark_dead(&mut conn, lease, reason).await?;
     Ok(())
+}
+
+/// 작업 span에 이번 실행의 결론을 남긴다. trace를 열면 "이 작업은 어떻게 끝났나"가 바로 보인다.
+///
+/// 이 모듈의 함수들은 작업 span 안에서 바로 실행되므로(따로 span을 열지 않는다) 지금 span이 곧 작업 span이다.
+fn record_decision(decision: &'static str) {
+    Span::current().record("decision", decision);
 }
 
 fn warn_lease_lost() {

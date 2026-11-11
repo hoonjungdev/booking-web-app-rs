@@ -5,6 +5,9 @@
 //! 작업을 가져가면 `attempts`가 1 늘어나고, 그 값이 이 작업을 쥔 증표([`Lease`]) 역할을 한다.
 //! 처리 도중 lease가 만료되어 다른 워커가 같은 작업을 다시 가져가면 `attempts`가 또 늘어나므로,
 //! 늦게 끝난 원래 워커의 완료 처리(`WHERE attempts = $n`)는 아무 행도 바꾸지 못한다 (fencing token).
+//!
+//! 작업을 등록할 때 등록한 쪽의 trace 정보(`trace_context`)를 함께 저장한다. 작업은 나중에 다른 태스크가 처리하므로,
+//! 이 값이 "접수 요청의 trace"와 "작업 처리의 trace"를 잇는 유일한 끈이다 (docs/05-observability-and-analytics.md §3).
 
 use std::{str::FromStr, time::Duration};
 
@@ -27,6 +30,9 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// 모든 종류. 종류를 추가하면 여기에도 넣는다 (종류별 지표를 0으로 채울 때 쓴다).
+    pub const ALL: [Self; 2] = [Self::SubmitBooking, Self::ResolveUnknown];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitBooking => "submit_booking",
@@ -59,6 +65,20 @@ pub struct Job {
     pub max_attempts: i32,
     /// 작업 종류별 진행 상황 (예: `resolve_unknown`이 "없음"을 확인한 횟수)
     pub payload: serde_json::Value,
+    /// 이 작업을 등록한 요청 · 작업의 trace 문맥 (없을 수 있다)
+    pub trace_context: Option<serde_json::Value>,
+    /// 실행하기로 한 시각(`run_at`)부터 실제로 가져가기까지 밀린 시간. 워커가 바쁘거나 멈춰 있으면 길어진다.
+    pub lag: Duration,
+}
+
+/// 작업 종류별 큐 상태 (지표용)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDepth {
+    pub kind: String,
+    /// 지금 바로 실행할 수 있는데 아직 가져가지 않은 작업 수
+    pub ready: i64,
+    /// 더 시도하지 않고 묻어 둔 작업 수 (관리자 확인 대상)
+    pub dead: i64,
 }
 
 impl Job {
@@ -92,18 +112,24 @@ pub struct JobRecord {
 }
 
 /// 작업을 등록한다. 보통 예약 저장과 같은 트랜잭션 안에서 부른다.
+///
+/// `trace_context`는 등록하는 쪽의 trace 문맥이다 ([`crate::TraceRef::context`]). 없으면 `None`.
+#[tracing::instrument(name = "db.jobs.enqueue", skip_all, fields(kind = kind.as_str()))]
 pub async fn enqueue(
     conn: &mut PgConnection,
     kind: JobKind,
     booking_id: Option<BookingId>,
     max_attempts: i32,
+    trace_context: Option<&serde_json::Value>,
 ) -> Result<i64, DbError> {
     let booking_id = booking_id.map(|id| id.as_uuid());
     let id = sqlx::query_scalar!(
-        "INSERT INTO jobs (kind, booking_id, max_attempts) VALUES ($1, $2, $3) RETURNING id",
+        "INSERT INTO jobs (kind, booking_id, max_attempts, trace_context)
+         VALUES ($1, $2, $3, $4) RETURNING id",
         kind.as_str(),
         booking_id,
         max_attempts,
+        trace_context,
     )
     .fetch_one(conn)
     .await?;
@@ -114,6 +140,8 @@ pub async fn enqueue(
 ///
 /// `FOR UPDATE SKIP LOCKED`: 다른 워커가 잠근 행은 기다리지 않고 건너뛴다. 그래서 워커가 여러 개여도 같은 작업을 동시에 집지 않는다.
 /// `lease` 동안 끝내지 못하면(워커가 죽는 등) 다른 워커가 다시 가져갈 수 있다.
+///
+/// 이 함수에는 span을 열지 않는다. 워커가 할 일이 없을 때도 계속 부르는 함수라서, 열면 빈 trace가 끝없이 쌓인다.
 pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
     let row = sqlx::query!(
         r#"
@@ -130,7 +158,8 @@ pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, D
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, kind, booking_id, attempts, max_attempts, payload
+        RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,
+                  EXTRACT(EPOCH FROM (now() - run_at))::float8 AS "lag_secs!"
         "#,
         lease.as_secs_f64(),
     )
@@ -144,10 +173,13 @@ pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, D
         attempts: r.attempts,
         max_attempts: r.max_attempts,
         payload: r.payload,
+        trace_context: r.trace_context,
+        lag: crate::non_negative_secs(r.lag_secs),
     }))
 }
 
 /// 작업을 끝낸다. lease를 잃었으면(다른 워커가 다시 가져감) `false`.
+#[tracing::instrument(name = "db.jobs.complete", skip_all)]
 pub async fn complete(conn: &mut PgConnection, lease: Lease) -> Result<bool, DbError> {
     let result = sqlx::query!(
         "UPDATE jobs SET status = 'done', locked_until = NULL, last_error = NULL, updated_at = now()
@@ -161,6 +193,7 @@ pub async fn complete(conn: &mut PgConnection, lease: Lease) -> Result<bool, DbE
 }
 
 /// `delay` 뒤에 다시 실행하도록 되돌려 놓는다. lease를 잃었으면 `false`.
+#[tracing::instrument(name = "db.jobs.retry_later", skip_all)]
 pub async fn retry_later(
     conn: &mut PgConnection,
     lease: Lease,
@@ -183,6 +216,7 @@ pub async fn retry_later(
 }
 
 /// [`retry_later`]와 같지만 작업의 진행 상황(`payload`)도 함께 바꾼다. lease를 잃었으면 `false`.
+#[tracing::instrument(name = "db.jobs.retry_later", skip_all)]
 pub async fn retry_later_with_payload(
     conn: &mut PgConnection,
     lease: Lease,
@@ -210,6 +244,7 @@ pub async fn retry_later_with_payload(
 ///
 /// 서킷이 열려 있거나 업체가 쉬라고 해서 호출하지 않은 경우다. 실제로 시도하지 않았으므로
 /// 가져갈 때 늘린 `attempts`를 되돌린다 (docs/02-domain-and-data.md §5). 전체 기한은 예약의 `deadline_at`이 막는다.
+#[tracing::instrument(name = "db.jobs.defer", skip_all)]
 pub async fn defer(
     conn: &mut PgConnection,
     lease: Lease,
@@ -232,6 +267,7 @@ pub async fn defer(
 }
 
 /// 더 시도하지 않는 작업(dead)으로 표시한다. 관리자 화면에서 확인 · 재처리 대상. lease를 잃었으면 `false`.
+#[tracing::instrument(name = "db.jobs.mark_dead", skip_all)]
 pub async fn mark_dead(
     conn: &mut PgConnection,
     lease: Lease,
@@ -247,6 +283,35 @@ pub async fn mark_dead(
     .execute(conn)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// 작업 종류별로 "바로 실행할 수 있는 작업 수"와 "dead 작업 수"를 센다 (`jobs.ready`, `jobs.dead` 지표).
+///
+/// 해당하는 작업이 하나도 없는 종류는 결과에 없다 (부르는 쪽이 0으로 채운다).
+/// 두 조건은 각각 부분 인덱스(`jobs_ready_idx`, `jobs_dead_idx`)로 찾으므로 끝난 작업이 많이 쌓여도 가볍다.
+pub async fn queue_depths(pool: &PgPool) -> Result<Vec<QueueDepth>, DbError> {
+    // `count(*) FILTER (WHERE ..)`: 조건에 맞는 행만 센다. 한 번 훑으면서 두 가지를 따로 셀 수 있다.
+    let rows = sqlx::query!(
+        r#"
+        SELECT kind,
+               count(*) FILTER (WHERE status = 'queued') AS "ready!",
+               count(*) FILTER (WHERE status = 'dead')   AS "dead!"
+        FROM jobs
+        WHERE (status = 'queued' AND run_at <= now()) OR status = 'dead'
+        GROUP BY kind
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| QueueDepth {
+            kind: r.kind,
+            ready: r.ready,
+            dead: r.dead,
+        })
+        .collect())
 }
 
 /// 예약에 딸린 작업 목록 (등록 순서대로)

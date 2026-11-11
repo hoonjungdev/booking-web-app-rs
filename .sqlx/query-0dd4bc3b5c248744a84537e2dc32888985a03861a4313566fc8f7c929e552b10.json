@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT kind,\n               count(*) FILTER (WHERE status = 'queued') AS \"ready!\",\n               count(*) FILTER (WHERE status = 'dead')   AS \"dead!\"\n        FROM jobs\n        WHERE (status = 'queued' AND run_at <= now()) OR status = 'dead'\n        GROUP BY kind\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ready!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "dead!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "0dd4bc3b5c248744a84537e2dc32888985a03861a4313566fc8f7c929e552b10"
+}

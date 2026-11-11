@@ -131,6 +131,8 @@ flowchart BT
 
 mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업체처럼 우리 코드와 독립적이어야 하기 때문이다.
 
+`providers`는 `telemetry`에 의존하지 않는다. 지표와 trace 전파에는 외부 크레이트인 OpenTelemetry **API**만 쓰고, 어디로 내보낼지는 실행 파일이 `telemetry`로 정한다. → [D-20](decisions.md#d-20-라이브러리-크레이트는-opentelemetry-api만-쓰고-sdk-구성은-telemetry-크레이트에만-둔다)
+
 ## 7. 기술 스택
 
 | 영역 | 선택 | .NET에서 비슷한 것 |
@@ -177,3 +179,12 @@ mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업
 | GC | 소유권(ownership)과 빌림(borrowing) | 여러 곳에서 공유하려면 `Arc<T>` (참조 카운트 포인터) |
 | `.csproj` / `.sln` | crate / workspace | |
 | `[Attribute]` | `#[derive(...)]`, 속성 매크로 | `#[derive(Serialize)]`는 JSON 직렬화 코드를 자동 생성 |
+| 미들웨어 클래스 (`InvokeAsync(context, next)`) | tower `Layer` + `Service` | `Layer`는 안쪽 `Service`를 감싼 `Service`를 만드는 공장. `telemetry::HttpTelemetryLayer` |
+| `Activity` / `ActivitySource` | tracing span, `#[tracing::instrument]` | 함수 실행 동안 span을 연다. `skip_all`로 인자를 기록하지 않게 한다 (개인정보) |
+| `Activity.Current` | `tracing::Span::current()` | async에서는 `.instrument(span)`으로 Future에 span을 붙인다 (await 사이에도 유지) |
+| `Meter`, `Counter<T>`, `Histogram<T>` | `opentelemetry::metrics::{Meter, Counter, Histogram}` | 라이브러리는 API만 쓰고, SDK 구성은 실행 파일이 한다 |
+| `Meter.CreateObservableGauge` | `meter.u64_observable_gauge(..).with_callback(..)` | 내보낼 때마다 콜백으로 현재 값을 읽는다 |
+| `static readonly` 필드 + `Lazy<T>` | `static X: LazyLock<T>` | 처음 쓸 때 한 번 초기화되는 전역 값 (계측기 묶음) |
+| `WeakReference<T>` | `std::sync::Weak<T>` | 값을 살려 두지 않는 참조. `upgrade()`로 살아 있는지 확인하고 쓴다 |
+| `using var x = …` (끝날 때 `Dispose`) | 값을 변수에 담아 두기 + `Drop` | `let _telemetry = telemetry::init(..)?;` 사라질 때 남은 데이터를 내보낸다. `let _ =`로 받으면 바로 사라진다 |
+| `#if SYMBOL`, 조건부 패키지 참조 | Cargo feature, `#[cfg(feature = "…")]` | `--features tokio-console`로 켠 기능의 코드와 의존성만 컴파일한다 |

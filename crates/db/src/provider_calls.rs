@@ -22,6 +22,7 @@ pub struct NewProviderCall {
     pub rate_limit_remaining: Option<i32>,
     pub retry_after_ms: Option<i32>,
     pub error_detail: Option<String>,
+    pub trace_id: Option<String>,
 }
 
 /// 저장된 호출 기록
@@ -40,6 +41,8 @@ pub struct ProviderCallRecord {
     pub rate_limit_remaining: Option<i32>,
     pub retry_after_ms: Option<i32>,
     pub error_detail: Option<String>,
+    /// 이 호출이 속한 trace. Grafana에서 그 호출의 앞뒤(재시도, 업체 내부 처리)를 볼 수 있다.
+    pub trace_id: Option<String>,
 }
 
 /// 여러 건을 INSERT 한 번으로 넣는다. 넣은 행 수를 돌려준다.
@@ -69,15 +72,16 @@ pub async fn insert_batch(pool: &PgPool, calls: &[NewProviderCall]) -> Result<u6
     let remainings: Vec<Option<i32>> = calls.iter().map(|c| c.rate_limit_remaining).collect();
     let retry_afters: Vec<Option<i32>> = calls.iter().map(|c| c.retry_after_ms).collect();
     let details: Vec<Option<String>> = calls.iter().map(|c| c.error_detail.clone()).collect();
+    let trace_ids: Vec<Option<String>> = calls.iter().map(|c| c.trace_id.clone()).collect();
 
     let result = sqlx::query!(
         r#"
         INSERT INTO provider_calls (provider_id, operation, booking_id, job_id, attempt, started_at,
                                     duration_ms, outcome, http_status, rate_limit_remaining,
-                                    retry_after_ms, error_detail)
+                                    retry_after_ms, error_detail, trace_id)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::uuid[], $4::int8[], $5::int4[],
                              $6::timestamptz[], $7::int4[], $8::text[], $9::int4[], $10::int4[],
-                             $11::int4[], $12::text[])
+                             $11::int4[], $12::text[], $13::text[])
         "#,
         &provider_ids,
         &operations,
@@ -91,6 +95,7 @@ pub async fn insert_batch(pool: &PgPool, calls: &[NewProviderCall]) -> Result<u6
         &remainings as &[Option<i32>],
         &retry_afters as &[Option<i32>],
         &details as &[Option<String>],
+        &trace_ids as &[Option<String>],
     )
     .execute(pool)
     .await?;
@@ -104,7 +109,7 @@ pub async fn for_booking(
 ) -> Result<Vec<ProviderCallRecord>, DbError> {
     let rows = sqlx::query!(
         "SELECT id, provider_id, operation, booking_id, job_id, attempt, started_at, duration_ms,
-                outcome, http_status, rate_limit_remaining, retry_after_ms, error_detail
+                outcome, http_status, rate_limit_remaining, retry_after_ms, error_detail, trace_id
          FROM provider_calls WHERE booking_id = $1 ORDER BY id",
         booking_id.as_uuid(),
     )
@@ -127,6 +132,7 @@ pub async fn for_booking(
             rate_limit_remaining: r.rate_limit_remaining,
             retry_after_ms: r.retry_after_ms,
             error_detail: r.error_detail,
+            trace_id: r.trace_id,
         })
         .collect())
 }

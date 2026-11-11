@@ -5,22 +5,26 @@
 //! booking-server create-client --name <이름>      API 클라이언트를 만들고 키 발급
 //! ```
 //! 두 명령 모두 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
+//!
+//! `serve`는 추적 · 메트릭 · 로그를 OpenTelemetry(OTLP)로 내보낸다 (docs/05-observability-and-analytics.md).
+//! 받는 곳은 `OTEL_EXPORTER_OTLP_ENDPOINT`(기본 `http://localhost:4318`)이고, `OTEL_SDK_DISABLED=true`로 끌 수 있다.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use booking_server::{
+    DEFAULT_LOG_FILTER,
     api::{self, ApiState},
     auth,
     config::Config,
-    recorder,
+    metrics, recorder,
     registry::ProviderRegistry,
     worker::{self, WorkerContext},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use db::PgPool;
 use domain::ClientId;
-use telemetry::LogFormat;
+use telemetry::{Export, LogFormat, Settings};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -68,12 +72,22 @@ enum Role {
 async fn main() -> anyhow::Result<()> {
     // .env 파일이 있으면 환경 변수로 읽어 둔다. 없어도 괜찮다 (`.ok()`로 결과를 버림).
     dotenvy::dotenv().ok();
-    telemetry::init(
-        "info,booking_server=debug,tower_http=debug,sqlx=warn",
-        LogFormat::from_env(),
-    )?;
-
     let cli = Cli::parse();
+
+    // 반환값을 `_telemetry`에 담아 `main`이 끝날 때까지 들고 있는다. 이 값이 사라질 때(함수가 끝나거나 `?`로 빠져나갈 때)
+    // 아직 보내지 않은 추적 · 메트릭 · 로그를 마저 내보낸다. `let _ = ...`로 받으면 그 줄에서 바로 사라져 버린다.
+    let _telemetry = telemetry::init(Settings {
+        service_name: "booking-server",
+        service_version: env!("CARGO_PKG_VERSION"),
+        default_filter: DEFAULT_LOG_FILTER,
+        log_format: LogFormat::from_env(),
+        // 서버만 내보낸다. `create-client`처럼 금방 끝나는 명령은 콘솔 로그면 충분하다.
+        export: match cli.command {
+            Command::Serve { .. } => Export::Otlp,
+            Command::CreateClient { .. } => Export::Off,
+        },
+    })?;
+
     let config =
         Config::load().context("설정을 읽을 수 없습니다 (DATABASE_URL이 있는지 확인하세요)")?;
     let pool = db::connect(&config.database_url, config.db_max_connections)
@@ -94,6 +108,7 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
     // 종료 신호를 여러 태스크에 전달하는 토큰 (≈ C#의 CancellationTokenSource)
     let shutdown = CancellationToken::new();
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+    telemetry::register_runtime_metrics();
 
     if matches!(role, Role::All | Role::Worker) {
         // 업체 호출 기록 채널. 보내는 쪽은 업체 파이프라인마다 나눠 주고, 받는 쪽은 저장 태스크가 쓴다.
@@ -121,9 +136,20 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
             Ok(())
         });
 
+        let registry = Arc::new(registry);
+        // 서킷 상태 · pause · 동시 실행 수를 지표로 내보낸다 (지표를 내보낼 때마다 현재 값을 읽어 간다)
+        metrics::register_provider_gauges(&registry);
+
+        // 대기 · dead 작업 수처럼 DB에 물어야 아는 지표를 주기적으로 갱신한다
+        let (gauge_pool, token) = (pool.clone(), shutdown.clone());
+        tasks.spawn(async move {
+            metrics::run_queue_gauges(gauge_pool, token).await;
+            Ok(())
+        });
+
         let ctx = WorkerContext {
             pool: pool.clone(),
-            providers: Arc::new(registry),
+            providers: registry,
             config: worker_config,
         };
         let token = shutdown.clone();

@@ -23,10 +23,21 @@ services:
   # Grafana: http://localhost:3000 (로그인 없음)
   otel-lgtm:
     image: grafana/otel-lgtm:0.40.0
+    environment:
+      # 서버가 지표와 함께 보내는 "계측기가 시작한 시각"에 Prometheus가 0을 넣게 한다.
+      # Prometheus는 시계열이 처음 나타날 때의 값을 증가로 보지 않는데, 이 설정이 있으면 서버를 띄운 직후의
+      # 첫 요청들이 그래프에 잡힌다 (한참 뒤에 처음 나타난 시계열에는 효과가 없다: observability/README.md).
+      PROMETHEUS_EXTRA_ARGS: "--enable-feature=created-timestamp-zero-ingestion"
     ports:
       - "3000:3000"   # Grafana
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
+    volumes:
+      # 대시보드와 알림 규칙을 코드로 관리한다 (observability/README.md).
+      # Grafana가 시작할 때 이 파일들을 읽어 등록한다. 대시보드 JSON은 고치면 10초 안에 다시 읽는다.
+      - ./observability/grafana/provisioning/dashboards/booking.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/booking.yaml:ro
+      - ./observability/grafana/provisioning/alerting/booking.yaml:/otel-lgtm/grafana/conf/provisioning/alerting/booking.yaml:ro
+      - ./observability/grafana/dashboards:/otel-lgtm/booking-dashboards:ro
 
 volumes:
   pgdata:

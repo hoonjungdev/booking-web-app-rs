@@ -4,7 +4,7 @@
 #![allow(dead_code)] // 테스트 파일마다 쓰는 헬퍼가 달라서, 일부 파일에서는 안 쓰는 함수가 생긴다
 
 use chrono::{TimeDelta, Utc};
-use db::{PgPool, bookings::NewBooking, clients};
+use db::{PgPool, TraceRef, bookings::NewBooking, clients};
 use domain::{BookingId, BookingRequest, ClientId, Customer, ProviderId, confirmation_deadline};
 use uuid::Uuid;
 
@@ -39,5 +39,6 @@ pub fn new_booking(client_id: ClientId, idempotency_key: &str, request_hash: &[u
         request_hash: request_hash.to_vec(),
         deadline_at: confirmation_deadline(Utc::now(), request.slot_start),
         request,
+        trace: TraceRef::default(),
     }
 }

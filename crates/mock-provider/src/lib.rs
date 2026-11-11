@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::{Router, middleware};
 use serde::{Deserialize, Serialize};
-use tower_http::trace::TraceLayer;
+use telemetry::HttpTelemetryLayer;
 
 /// 흉내 내는 외부 업체 종류. beta는 Phase 6에서 추가한다.
 ///
@@ -66,7 +66,9 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .nest("/alpha/v1", alpha_routes)
         .merge(admin::routes())
-        .layer(TraceLayer::new_for_http())
+        // 요청마다 서버 span을 연다. 호출한 쪽이 `traceparent` 헤더를 보냈으면 그 trace에 이어 붙으므로,
+        // booking-server에서 시작한 trace 안에서 "업체 내부에서 무슨 일이 있었는지"까지 보인다.
+        .layer(HttpTelemetryLayer::new())
         .with_state(state)
 }
 

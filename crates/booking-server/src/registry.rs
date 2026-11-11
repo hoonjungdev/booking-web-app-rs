@@ -70,6 +70,13 @@ impl ProviderRegistry {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// 등록된 모든 업체 (순서는 정해져 있지 않다). 업체 상태 지표를 내보낼 때 쓴다.
+    ///
+    /// `impl Iterator<Item = ..>`: "이런 항목을 내놓는 반복자"라고만 밝히고 구체 타입은 감춘다 (≈ `IEnumerable<T>`를 돌려주는 것).
+    pub fn all(&self) -> impl Iterator<Item = &ResilientProvider> {
+        self.providers.values().map(|provider| provider.as_ref())
+    }
+
     pub fn ids(&self) -> Vec<&ProviderId> {
         let mut ids: Vec<_> = self.providers.keys().collect();
         ids.sort();

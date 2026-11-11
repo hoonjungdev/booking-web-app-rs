@@ -8,7 +8,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
-    DbError, PgPool,
+    DbError, PgPool, TraceRef,
     jobs::{self, JobKind},
 };
 
@@ -22,6 +22,8 @@ pub struct NewBooking {
     pub request_hash: Vec<u8>,
     pub request: BookingRequest,
     pub deadline_at: DateTime<Utc>,
+    /// 접수 요청의 trace. 상태 이력과 `submit_booking` 작업에 남는다.
+    pub trace: TraceRef,
 }
 
 /// 접수 결과
@@ -52,6 +54,8 @@ pub struct EventRecord {
     pub to_status: BookingStatus,
     pub reason: Option<String>,
     pub actor: String,
+    /// 이 변경이 일어난 trace (추적 없이 바꿨으면 `None`)
+    pub trace_id: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -103,6 +107,10 @@ impl TryFrom<BookingRow> for Booking {
 ///
 /// 같은 클라이언트가 같은 멱등키로 이미 접수했으면 새로 만들지 않고 기존 예약을 돌려준다.
 /// 두 요청이 동시에 와도 `UNIQUE (client_id, idempotency_key)` 제약 때문에 한쪽만 저장된다.
+///
+/// `#[tracing::instrument]`가 이 함수 실행 동안 `db.bookings.accept` span을 연다. trace에서 DB에 쓴 시간이 따로 보인다.
+/// `skip_all`: 인자(고객 정보가 들어 있다)를 span에 기록하지 않는다.
+#[tracing::instrument(name = "db.bookings.accept", skip_all)]
 pub async fn accept(pool: &PgPool, new: &NewBooking) -> Result<AcceptOutcome, DbError> {
     let customer = serde_json::to_value(&new.request.customer).map_err(DbError::corrupt)?;
     let party_size = i32::try_from(new.request.party_size).map_err(DbError::corrupt)?;
@@ -137,12 +145,22 @@ pub async fn accept(pool: &PgPool, new: &NewBooking) -> Result<AcceptOutcome, Db
 
     let outcome = match inserted {
         Some(row) => {
-            insert_event(&mut tx, new.id, None, BookingStatus::Pending, None, "api").await?;
+            insert_event(
+                &mut tx,
+                new.id,
+                None,
+                BookingStatus::Pending,
+                None,
+                "api",
+                new.trace.trace_id.as_deref(),
+            )
+            .await?;
             jobs::enqueue(
                 &mut tx,
                 JobKind::SubmitBooking,
                 Some(new.id),
                 jobs::DEFAULT_MAX_ATTEMPTS,
+                new.trace.context.as_ref(),
             )
             .await?;
             AcceptOutcome::Created(row.try_into()?)
@@ -173,6 +191,7 @@ pub async fn accept(pool: &PgPool, new: &NewBooking) -> Result<AcceptOutcome, Db
 }
 
 /// 예약 하나 (클라이언트 구분 없이). 워커용.
+#[tracing::instrument(name = "db.bookings.get", skip_all)]
 pub async fn get(pool: &PgPool, id: BookingId) -> Result<Option<Booking>, DbError> {
     let row = sqlx::query_as!(
         BookingRow,
@@ -189,6 +208,7 @@ pub async fn get(pool: &PgPool, id: BookingId) -> Result<Option<Booking>, DbErro
 }
 
 /// 클라이언트 자신의 예약 하나. 다른 클라이언트의 예약이면 `None`.
+#[tracing::instrument(name = "db.bookings.find_for_client", skip_all)]
 pub async fn find_for_client(
     pool: &PgPool,
     client_id: ClientId,
@@ -213,12 +233,16 @@ pub async fn find_for_client(
 ///
 /// 다음 상태는 도메인의 [`BookingStatus::apply`]로만 정한다. 그래서 규칙에 없는 전이는 저장 단계에서 막힌다.
 /// `WHERE status = $from`: 읽은 뒤 다른 곳에서 상태가 바뀌었으면 아무 행도 바꾸지 않는다 (낙관적 동시성).
+///
+/// `trace_id`는 이 전이를 일으킨 요청 · 작업의 trace다. 상태 이력에 함께 남는다.
+#[tracing::instrument(name = "db.bookings.transition", skip_all)]
 pub async fn transition(
     conn: &mut PgConnection,
     id: BookingId,
     from: BookingStatus,
     event: &BookingEvent,
     actor: &str,
+    trace_id: Option<&str>,
 ) -> Result<Transitioned, DbError> {
     let to = from.apply(event)?;
     let reason = event.reason();
@@ -241,14 +265,14 @@ pub async fn transition(
     if result.rows_affected() == 0 {
         return Ok(Transitioned::Conflict);
     }
-    insert_event(conn, id, Some(from), to, reason, actor).await?;
+    insert_event(conn, id, Some(from), to, reason, actor, trace_id).await?;
     Ok(Transitioned::Applied(to))
 }
 
 /// 예약의 상태 이력 (오래된 것부터)
 pub async fn events(pool: &PgPool, id: BookingId) -> Result<Vec<EventRecord>, DbError> {
     let rows = sqlx::query!(
-        "SELECT from_status, to_status, reason, actor, at
+        "SELECT from_status, to_status, reason, actor, trace_id, at
          FROM booking_events WHERE booking_id = $1 ORDER BY id",
         id.as_uuid(),
     )
@@ -266,10 +290,29 @@ pub async fn events(pool: &PgPool, id: BookingId) -> Result<Vec<EventRecord>, Db
                 to_status: r.to_status.parse().map_err(DbError::corrupt)?,
                 reason: r.reason,
                 actor: r.actor,
+                trace_id: r.trace_id,
                 at: r.at,
             })
         })
         .collect()
+}
+
+/// 결과 불명(`unknown`) 상태로 가장 오래 머문 예약이 그 상태가 된 뒤 흐른 시간. 그런 예약이 없으면 0.
+///
+/// "결과 불명이 10분 넘게 유지" 알림에 쓰는 지표의 원천이다 (docs/05-observability-and-analytics.md §8).
+/// `bookings_status_idx (status, updated_at)` 인덱스로 가장 오래된 한 건만 찾으므로 예약이 많아도 가볍다.
+pub async fn oldest_unknown_age(pool: &PgPool) -> Result<std::time::Duration, DbError> {
+    // `"age_secs!"`: sqlx는 계산식 컬럼을 NULL일 수 있다고 본다. 이름 끝의 `!`로 "NULL이 아니다"라고 알려 준다
+    // (COALESCE로 0을 채웠으므로 실제로 NULL이 아니다).
+    let age_secs = sqlx::query_scalar!(
+        r#"
+        SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0)::float8 AS "age_secs!"
+        FROM bookings WHERE status = 'unknown'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(crate::non_negative_secs(age_secs))
 }
 
 async fn insert_event(
@@ -279,16 +322,18 @@ async fn insert_event(
     to: BookingStatus,
     reason: Option<String>,
     actor: &str,
+    trace_id: Option<&str>,
 ) -> Result<(), DbError> {
     let from = from.map(BookingStatus::as_str);
     sqlx::query!(
-        "INSERT INTO booking_events (booking_id, from_status, to_status, reason, actor)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO booking_events (booking_id, from_status, to_status, reason, actor, trace_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
         booking_id.as_uuid(),
         from,
         to.as_str(),
         reason,
         actor,
+        trace_id,
     )
     .execute(conn)
     .await?;

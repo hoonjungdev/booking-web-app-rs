@@ -1,0 +1,910 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "예약 서버와 mock 업체의 HTTP 요청 수 · 오류 비율 · 응답 시간, tokio 런타임 (docs/05-observability-and-analytics.md §8).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "booking"
+      ],
+      "targetBlank": false,
+      "title": "예약 게이트웨이",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "API",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "예약 API 가용성 (선택한 기간)",
+      "description": "5xx가 아닌 응답의 비율. SLO: 99.9% 이상.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.99
+              },
+              {
+                "color": "green",
+                "value": 0.999
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "1 - (sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\", http_response_status_code=~\"5..\"}[$__range])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "초당 요청 수",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "응답 p95 (5분)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "{{job}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "호출 기록 버림 (선택한 기간)",
+      "description": "호출 기록 채널(10,000건)이 가득 차서 버린 건수. 0이 아니면 provider_calls 저장이 호출량을 따라가지 못한 것이다.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(provider_calls_recorder_dropped_total[$__range])) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "요청 수 (라우트별)",
+      "description": "라우트 틀(/v1/bookings/{id}) 기준이다. 실제 경로를 라벨로 쓰면 값이 끝없이 늘어난다. 헬스 체크는 넣지 않는다.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job, http_request_method, http_route) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}} {{http_request_method}} {{http_route}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 6,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "오류 비율 (4xx · 5xx · 응답 없음)",
+      "description": "mock-provider의 5xx는 주입한 장애(chaos)다.\n\n'응답 없음'은 응답을 보내기 전에 끝난 요청이다 (호출한 쪽이 기다리다 먼저 끊음). slow · lossy 프리셋에서 booking-server가 3초 타임아웃으로 끊으면 mock-provider 쪽에 나타난다.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\", http_response_status_code=~\"5..\"}[1m]) or rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]) * 0) / sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}} 5xx",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\", http_response_status_code=~\"4..\"}[1m]) or rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]) * 0) / sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}} 4xx",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\", error_type=\"no_response\"}[1m]) or rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]) * 0) / sum by (job) (rate(http_server_request_duration_seconds_count{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{job}} 응답 없음",
+          "refId": "C",
+          "range": true
+        }
+      ],
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "응답 시간 p50 / p95 / p99",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, job) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[1m])))",
+          "legendFormat": "{{job}} p50",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[1m])))",
+          "legendFormat": "{{job}} p95",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[1m])))",
+          "legendFormat": "{{job}} p99",
+          "refId": "C",
+          "range": true
+        }
+      ],
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "응답 시간 p95 (라우트별)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, job, http_request_method, http_route) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\"}[1m])))",
+          "legendFormat": "{{job}} {{http_request_method}} {{http_route}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "tokio 런타임",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "살아 있는 태스크 수",
+      "description": "끝나지 않은 태스크 수. 요청 · 작업을 처리하는 동안 늘었다가 돌아온다. 계속 늘기만 하면 끝나지 않는 태스크가 새고 있는 것이다.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "tokio_runtime_alive_tasks{job=~\"$job\"}",
+          "legendFormat": "{{job}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 11,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "전역 대기열 길이",
+      "description": "워커 스레드를 기다리는 태스크 수. 계속 쌓여 있으면 스레드를 오래 붙잡는 코드(블로킹 호출)가 있다는 신호다. 어느 태스크인지는 tokio-console로 찾는다 (docs/05 §9).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "tokio_runtime_global_queue_depth{job=~\"$job\"}",
+          "legendFormat": "{{job}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 12,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 22
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "워커 스레드 수",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "tokio_runtime_workers{job=~\"$job\"}",
+          "legendFormat": "{{job}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 13,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 22
+      }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "로그",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "panels": []
+    },
+    {
+      "type": "logs",
+      "title": "경고 · 오류 로그",
+      "description": "로그 줄을 펼치면 trace_id가 있다. 그 옆의 링크로 해당 trace(Tempo)로 넘어간다.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "editorMode": "code",
+          "expr": "{service_name=~\"$job\"} | detected_level=~\"warn|error\"",
+          "queryType": "range"
+        }
+      ],
+      "id": 15,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "booking"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "label": "서비스",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(http_server_request_duration_seconds_count, job)",
+        "query": {
+          "query": "label_values(http_server_request_duration_seconds_count, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Service",
+  "uid": "booking-service",
+  "version": 1
+}

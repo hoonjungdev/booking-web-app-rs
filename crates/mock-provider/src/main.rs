@@ -5,12 +5,14 @@
 //! - `MOCK_PROVIDER_ADDR`: 바인드 주소 (기본 `127.0.0.1:9090`)
 //! - `RUST_LOG`: 로그 수준 (예: `debug`)
 //! - `LOG_FORMAT`: `json`이면 JSON 로그
+//! - `OTEL_EXPORTER_OTLP_ENDPOINT`: 추적 · 메트릭 · 로그를 보낼 수집기 주소 (기본 `http://localhost:4318`)
+//! - `OTEL_SDK_DISABLED`: `true`면 내보내지 않는다
 
 use std::net::SocketAddr;
 
 use anyhow::Context;
 use mock_provider::{AppState, chaos::Preset};
-use telemetry::LogFormat;
+use telemetry::{Export, LogFormat, Settings};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9090";
 
@@ -18,10 +20,15 @@ const DEFAULT_ADDR: &str = "127.0.0.1:9090";
 /// `anyhow::Result`는 "어떤 에러든 담을 수 있는 Result"로, 실행 파일의 최상위에서 쓰기 편하다.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    telemetry::init(
-        "info,mock_provider=debug,tower_http=debug",
-        LogFormat::from_env(),
-    )?;
+    // 반환값을 변수에 담아 `main`이 끝날 때까지 들고 있는다. 사라질 때 남은 추적 · 메트릭 · 로그를 마저 내보낸다.
+    let _telemetry = telemetry::init(Settings {
+        service_name: "mock-provider",
+        service_version: env!("CARGO_PKG_VERSION"),
+        default_filter: "info,mock_provider=debug,telemetry=debug",
+        log_format: LogFormat::from_env(),
+        export: Export::Otlp,
+    })?;
+    telemetry::register_runtime_metrics();
 
     let addr: SocketAddr = std::env::var("MOCK_PROVIDER_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())

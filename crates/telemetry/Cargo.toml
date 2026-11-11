@@ -1,6 +1,6 @@
 [package]
 name = "telemetry"
-description = "tracing · OpenTelemetry 초기화 (booking-server와 mock-provider가 공유)"
+description = "tracing · OpenTelemetry 초기화와 공용 계측 도구 (booking-server와 mock-provider가 공유)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,5 +9,39 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# feature: 켜고 끌 수 있는 선택 기능 (≈ C#의 조건부 컴파일 기호 + 선택적 패키지 참조).
+# `cargo run --features tokio-console`처럼 켜면 그 기능의 코드와 의존성이 함께 컴파일된다.
+[features]
+# tokio-console 개발 모드 (docs/05-observability-and-analytics.md §9).
+# `dep:console-subscriber`: 이 feature를 켤 때만 아래 optional 의존성을 가져온다.
+tokio-console = ["dep:console-subscriber"]
+# span · 메트릭을 메모리에 모아 테스트에서 확인하는 도구 (`telemetry::testing`)
+testing = ["opentelemetry_sdk/testing"]
+
 [dependencies]
+axum.workspace = true
+console-subscriber = { workspace = true, optional = true }
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-http.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }
+
+# 이 테스트들은 `telemetry::testing`을 쓴다. `testing` feature 없이 테스트를 돌리면 건너뛴다.
+[[test]]
+name = "http_layer"
+required-features = ["testing"]
+
+[[test]]
+name = "log_filter"
+required-features = ["testing"]

@@ -16,6 +16,7 @@ pub struct ProviderRecord {
     pub policy: serde_json::Value,
 }
 
+#[tracing::instrument(name = "db.providers.find", skip_all)]
 pub async fn find(pool: &PgPool, id: &ProviderId) -> Result<Option<ProviderRecord>, DbError> {
     let row = sqlx::query!(
         "SELECT id, display_name, adapter_kind, base_url, enabled, policy FROM providers WHERE id = $1",

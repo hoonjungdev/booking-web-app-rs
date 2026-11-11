@@ -9,6 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# tokio-console 개발 모드 (docs/05-observability-and-analytics.md §9)
+tokio-console = ["telemetry/tokio-console"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -19,7 +23,6 @@ serde_json.workspace = true
 telemetry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 

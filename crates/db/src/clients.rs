@@ -32,6 +32,7 @@ pub async fn create(
 }
 
 /// API 키 해시로 클라이언트를 찾는다
+#[tracing::instrument(name = "db.clients.find_by_key_hash", skip_all)]
 pub async fn find_by_key_hash(
     pool: &PgPool,
     api_key_hash: &str,

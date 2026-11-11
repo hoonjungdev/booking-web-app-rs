@@ -1,0 +1,17 @@
+# Grafana가 시작할 때 observability/grafana/dashboards/ 의 JSON을 대시보드로 등록한다 (provisioning).
+# docker-compose.yml이 이 파일과 대시보드 폴더를 otel-lgtm 컨테이너에 마운트한다.
+apiVersion: 1
+
+providers:
+  - name: Booking
+    # Grafana 안에서 대시보드가 들어갈 폴더
+    folder: Booking
+    type: file
+    # 파일을 지워도 Grafana에 등록된 대시보드는 남긴다 (실수로 지워지는 것을 막는다)
+    disableDeletion: true
+    # 화면에서 고쳐 볼 수 있다. 다만 파일이 원본이라, 남기려면 JSON으로 내보내 파일을 덮어써야 한다.
+    allowUiUpdates: true
+    # JSON 파일을 고치면 10초 안에 반영된다 (컨테이너를 다시 띄울 필요가 없다)
+    updateIntervalSeconds: 10
+    options:
+      path: /otel-lgtm/booking-dashboards

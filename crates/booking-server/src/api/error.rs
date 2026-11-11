@@ -81,6 +81,10 @@ struct Problem {
     title: &'static str,
     status: u16,
     detail: String,
+    /// 이 요청의 trace ID. 문의를 받으면 이 값으로 Grafana에서 요청의 처리 과정을 찾는다.
+    /// trace가 없으면(OpenTelemetry를 설치하지 않은 테스트 등) 필드를 아예 넣지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
 }
 
 /// 핸들러가 `Err(ApiError)`를 돌려주면 axum이 이 구현으로 응답을 만든다.
@@ -99,6 +103,8 @@ impl IntoResponse for ApiError {
             title,
             status: status.as_u16(),
             detail,
+            // 핸들러(와 인증 추출기)는 요청 span 안에서 실행되므로, 지금 span의 trace가 곧 이 요청의 trace다
+            trace_id: telemetry::current_trace_id(),
         };
         (
             status,

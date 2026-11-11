@@ -50,14 +50,23 @@
 **배우는 것**: 제네릭, trait 객체(`dyn`), `Arc`와 공유 상태, 채널, `tokio::time`, 테스트 작성법
 
 ## Phase 4. 관측
-- [ ] OpenTelemetry 추적 · 메트릭 · 로그 → otel-lgtm
-- [ ] `traceparent` 전파 (HTTP, 작업 큐 span link), mock-provider 계측
-- [ ] 메트릭 구현 ([05 §4](05-observability-and-analytics.md#4-메트릭-목록))
-- [ ] Grafana 대시보드 3종 + 알림 규칙 (코드로 관리)
-- [ ] tokio-console 개발 모드
+- [x] OpenTelemetry 추적 · 메트릭 · 로그 → otel-lgtm (`telemetry` 크레이트, OTLP/HTTP)
+- [x] `traceparent` 전파 (HTTP, 작업 큐 span link), mock-provider 계측
+- [x] 메트릭 구현 ([05 §4](05-observability-and-analytics.md#4-메트릭-목록)): Phase 3에서 미룬 장애 대응 메트릭 포함
+- [x] 응답 헤더 `X-Trace-Id`, 에러 본문 `trace_id`, DB의 trace 컬럼(`booking_events` · `jobs` · `provider_calls`) 채우기
+- [x] Grafana 대시보드 3종 + 알림 규칙 6개 (`observability/`, 컨테이너가 시작할 때 자동 등록)
+- [x] tokio-console 개발 모드 (`tokio-console` feature)
+- [x] 관측 통합 테스트: 메모리에 모은 span · 메트릭으로 trace 연결과 지표의 이름 · 라벨 · 버킷을 검사 (`tests/telemetry.rs`)
 
 **완료 기준**: Grafana에서 업체별 p95를 보고, 느린 요청 하나를 골라 mock 내부까지 이어진 trace를 볼 수 있다.
+→ Provider Overview 대시보드의 "호출 지연" 패널과 "느린 업체 호출" 표. 표의 행을 누르면 `job → provider.call → provider.attempt → HTTP → mock-provider → chaos.delay`까지 한 trace로 열린다.
 **배우는 것**: tower Layer, tracing span과 `#[instrument]`, feature flag
+
+뒤로 미룬 것:
+- "대사에서 이중 예약 의심 발견" 알림 → 대사 작업을 만드는 Phase 6
+- 관리자 웹 예약 상세의 trace 링크 → Phase 5 (DB에 trace ID는 이미 남는다)
+- 알림을 받을 곳(메일 · 메신저) 연결 → 배포 환경을 만들 때 (Phase 7 이후)
+- 프로세스를 구분하는 리소스 속성(`service.instance.id`) → API와 워커를 따로 띄우거나 여러 대로 늘릴 때 ([05 §1](05-observability-and-analytics.md#1-전체-구성))
 
 ## Phase 5. 관리자 API + 관리자 웹
 - [ ] 관리자 API ([04 §3](04-api.md#3-관리자-api-adminapi)), utoipa로 OpenAPI 문서 생성

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(updated_at))), 0)::float8 AS \"age_secs!\"\n        FROM bookings WHERE status = 'unknown'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "age_secs!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ff33811697f5583edf79062f727b0ca2ad1ee3d2190005938c1efe100a86a0b2"
+}
