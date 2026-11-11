@@ -38,7 +38,7 @@
 
 ## 반드시 지킬 불변 조건
 
-- **이중 예약 0건**: 멱등키를 지원하지 않는 업체에는 타임아웃 · 5xx 뒤에 생성 요청을 그냥 재시도하지 않는다. `unknown` → 조회 절차를 거친다 (`docs/03-resilience.md` §5).
+- **이중 예약 0건**: 멱등키를 지원하지 않는 업체에는 타임아웃 · 5xx 뒤에 생성 요청을 그냥 재시도하지 않는다. `unknown` → 조회 절차를 거친다 (`docs/03-resilience.md` §5). 그런 업체에 생성 요청을 보내기 직전에는 `jobs::mark_sent`로 "보냄" 표시를 커밋하고, 표시가 남은 채 다시 가져온 작업은 보내지 않고 `unknown`으로 넘긴다 (`docs/decisions.md` D-31). 업체 호출 한 번의 최대 시간은 워커 lease보다 짧아야 한다 (정책 변경도 검사한다).
 - **유실 0건**: 예약 저장, 상태 이력, 작업 등록은 한 트랜잭션으로 묶는다.
 - **상태 전이**는 `domain`의 전이 함수를 거치고, SQL은 `WHERE id = $1 AND status = $expected`로 낙관적 동시성을 지킨다. 전이할 때마다 `booking_events`에 기록한다.
 - **관측이 서비스를 느리게 하면 안 된다**: 호출 기록은 채널로 비동기 배치 저장하고, 채널이 가득 차면 버린다 (막지 않는다). 추적 · 메트릭 · 로그도 SDK의 전용 스레드가 내보낸다. 요청 처리 경로와 지표 콜백에서 DB · 네트워크를 기다리지 않는다.
@@ -58,6 +58,7 @@
 - 시각은 UTC(`DateTime<Utc>`, DB는 `timestamptz`), ID는 UUID v7.
 - DB 쿼리는 `db` 크레이트에 두고 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`로 `.sqlx/`를 갱신해서 함께 커밋한다 (`scripts/check.sh`는 `.sqlx/`로 오프라인 검사하므로, 갱신하지 않으면 컴파일 에러가 난다). 테스트에서 준비용으로만 쓰는 SQL은 검사 없는 `sqlx::query(...)`를 써도 된다.
 - 예약 상태는 `db::bookings::transition`(내부에서 `BookingStatus::apply` 호출)으로만 바꾼다. `bookings.status`를 직접 UPDATE하지 않는다 (테스트 준비 코드 제외).
+- 관리자 API 핸들러는 필요한 권한을 매개변수 타입으로 밝힌다: 조회는 `AdminSession`, 조작은 `RequireOperator`, 정책 변경은 `RequireAdmin` (`docs/decisions.md` D-36). 상태를 바꾸는 관리자 조작은 같은 트랜잭션에서 `record_audit`로 감사 로그를 남기고, 상태 이력의 actor는 `session.actor()`(`admin:<이름>`)를 쓴다.
 - HTTP 핸들러에는 `#[utoipa::path(...)]`(경로 · 매개변수 · 응답 · `operation_id`)를 붙이고 `routes!(핸들러)`로 등록한다. 경로 문자열은 이 속성 한 곳에만 둔다 (`docs/decisions.md` D-25). 쿼리 매개변수 구조체는 `#[derive(utoipa::IntoParams)]`처럼 전체 경로로 derive한다 (`use utoipa::IntoParams`로 가져오면 매크로가 만든 코드가 `unused_qualifications`에 걸린다).
 - API의 요청 · 응답 모양을 바꾸면 `cd web/admin && pnpm gen`으로 `web/admin/openapi.json`과 `src/api/schema.d.ts`를 다시 만들어 함께 커밋한다 (`scripts/check.sh api` · `web`이 검사한다).
 - 이미 적용된 마이그레이션 파일은 수정하지 않는다. 바꿀 것이 있으면 새 마이그레이션을 추가한다.
@@ -114,6 +115,7 @@ cargo run -p mock-provider                 # mock 업체 서버 (:9090). 장애 
 cargo run -p booking-server -- serve       # 예약 서버 (:8080, API + 워커). 시작할 때 마이그레이션 적용
 OTEL_SDK_DISABLED=true cargo run -p booking-server -- serve   # 추적 · 메트릭 · 로그를 내보내지 않고 실행 (콘솔 로그만)
 cargo run -p booking-server -- create-client --name <이름>   # API 키 발급 (stdout에 한 번만 출력)
+cargo run -p booking-server -- create-admin --username <이름> --role <viewer|operator|admin>   # 관리자 웹 계정 (비밀번호를 한 번만 출력)
 cargo run -p booking-server -- openapi     # API 문서(OpenAPI JSON)를 표준 출력으로 (DB 불필요)
 (cd web/admin && pnpm install)             # 관리자 웹 의존성 (처음 한 번)
 (cd web/admin && pnpm dev)                 # 관리자 웹 개발 서버 http://localhost:5173/admin/ (API는 :8080으로 프록시)
@@ -131,7 +133,8 @@ docker compose up -d --force-recreate otel-lgtm   # 알림 규칙(observability/
 
 - 셸 환경에 따라 `cargo`가 PATH에 없을 수 있다. 그럴 때는 `. "$HOME/.cargo/env"`를 먼저 실행한다.
 - `cargo nextest`를 직접 돌릴 때는 `DATABASE_URL`이 환경 변수로 있어야 한다 (`set -a; . ./.env; set +a`). `scripts/check.sh`는 기본값을 알아서 넣는다.
-- mock 업체의 장애 설정은 관리자 웹의 "장애 주입" 화면이나 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다. 관리자 웹으로 하려면 `.env`에 `BOOKING_CHAOS_URL=http://127.0.0.1:9090`이 있어야 한다.
+- mock 업체는 alpha(멱등키 지원, 매장 `store-001~003`)와 beta(멱등키 없음 · 200으로 오는 에러 · 한국 시간 문자열, 매장 `GN01` · `HD02` · `PG03`) 두 곳이다. 장애 설정은 관리자 웹의 "장애 주입" 화면이나 `curl -X POST localhost:9090/_chaos/<alpha|beta>/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다. 관리자 웹으로 하려면 `.env`에 `BOOKING_CHAOS_URL=http://127.0.0.1:9090`이 있어야 한다.
+- 관리자 웹(`/admin`)과 관리자 API는 로그인이 필요하다. `create-admin`으로 계정을 만든다. 로컬 http에서 로그인이 유지되지 않으면 `.env`에 `BOOKING_ADMIN_COOKIE_SECURE=false`.
 - API 문서는 http://127.0.0.1:8080/docs/ (Swagger UI), 원본은 `/openapi.json`.
 - 두 서버는 추적 · 메트릭 · 로그를 OTLP로 `http://localhost:4318`(docker compose의 otel-lgtm)에 내보낸다. Grafana(http://localhost:3000)의 Dashboards → Booking 폴더에서 본다. 수집기가 꺼져 있어도 서버는 돌고, 콘솔에 내보내기 실패 경고만 남는다.
 - 대시보드 JSON(`observability/grafana/dashboards/`)은 고치면 10초 안에 Grafana가 다시 읽는다. 고치는 방법은 `observability/README.md`.

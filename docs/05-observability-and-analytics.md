@@ -132,7 +132,8 @@ job.submit_booking  job_id booking_id attempt decision    [새 trace, 위 trace�
 - 실패는 span 상태로 표시한다: 5xx 응답(서버 span), 4xx · 5xx · 전송 오류(클라이언트 span), 거절이 아닌 실패(`provider.attempt`, `provider.call`), 포기한 작업(`job.*`). Grafana에서 `status = error`로 골라 볼 수 있다.
 - **응답 전에 버려진 요청**도 남긴다. 시도 타임아웃은 기다리던 Future를 그 자리에서 버리므로 "응답을 받은 뒤 기록"하는 코드는 실행되지 않는다. 그래서 버려질 때 할 일을 `Drop`에 두었다: 우리 쪽 client span에는 `error.type=cancelled`, 업체 쪽 server span에는 `error.type=no_response`(호출한 쪽이 먼저 끊음)가 붙고 둘 다 오류로 표시된다.
 - 업체가 보낸 글자(예상하지 못한 4xx의 본문, 응답 형식 오류의 내용)는 span · 로그에 넣지 않는다 (§5).
-- 작업 span의 `decision` 속성에 그 실행의 결론이 남는다: `transition`, `retry`, `defer`, `recheck`, `give_up`, `skip`, `bury`.
+- 작업 span의 `decision` 속성에 그 실행의 결론이 남는다: `transition`, `retry`, `defer`, `recheck`, `give_up`, `skip`, `bury`, `reconcile`(대사를 마치고 다음 대사를 등록함, Phase 6).
+- 대사 작업(`job.reconcile_provider`, Phase 6)은 끝날 때 등록한 다음 대사 작업에 자기 trace를 넘긴다. 그래서 대사 trace들이 link로 줄줄이 이어진다. 대사가 바꾼 예약의 상태 이력(`actor = reconciler`)에는 그 대사의 trace ID가 남는다.
 
 Grafana(Explore → Tempo)에서 찾는 법:
 ```
@@ -156,12 +157,14 @@ Grafana(Explore → Tempo)에서 찾는 법:
 | `provider.paused` | gauge (0/1) | provider | Retry-After로 쉬는 중 | 〃 |
 | `provider.circuit.state` | gauge (0=closed, 1=half_open, 2=open) | provider | | 〃 |
 | `provider.bulkhead.in_flight` | gauge | provider | 동시에 실행 중인 호출 수 | 〃 |
+| `provider.rate_limit.allowed` | gauge | provider | 우리 rate limiter가 지금 허용하는 초당 호출 수 (AIMD로 줄었다가 되돌아간다, Phase 6) | 〃 |
 | `booking.transitions` | counter | provider, from, to | 상태 전이. 접수는 `from="none"` | `booking_server::metrics` |
 | `booking.time_to_final` | histogram (s) | provider, final_status | 접수부터 제출 흐름이 끝나는 상태(`confirmed` · `rejected` · `failed`)까지 걸린 시간 | 〃 |
 | `booking.unknown.oldest_age` | gauge (s) | | 결과 불명 상태로 가장 오래 머문 예약의 경과 시간 (없으면 0) | 〃 (5초마다 DB 조회) |
 | `jobs.ready` | gauge | kind | 실행 대기 작업 수 | 〃 (5초마다 DB 조회) |
 | `jobs.dead` | gauge | kind | dead 작업 수 | 〃 (5초마다 DB 조회) |
 | `jobs.lag` | histogram (s) | kind | `run_at`부터 실제 시작까지의 지연 | 〃 |
+| `reconciliation.issues.open` | gauge | kind | 대사에서 찾은 미해결 불일치 수. `kind="duplicate_suspected"`는 이중 예약 의심 (Phase 6) | 〃 (5초마다 DB 조회) |
 | `tokio.runtime.workers` · `alive_tasks` · `global_queue_depth` | gauge | | tokio 런타임 상태 | `telemetry::register_runtime_metrics` |
 
 모든 지표에는 서비스 이름이 함께 붙는다 (Prometheus의 `job` 라벨: `booking-server`, `mock-provider`).
@@ -190,6 +193,11 @@ Grafana(Explore → Tempo)에서 찾는 법:
   - `docker-compose.yml`이 otel-lgtm의 Prometheus에 `created-timestamp-zero-ingestion` 기능을 켠다. OpenTelemetry가 함께 보내는 "이 계측기가 시작한 시각"에 0을 넣어 주는 기능이다. 그 시각은 계측기(서버) 기준이지 시계열 기준이 아니어서, **서버를 띄운 직후**에 처음 나타난 시계열에만 효과가 있다 (0이 질의 창 안에 들어온다).
   - 그래서 히스토그램(`provider.call.duration` 등)과 `booking.transitions`에서 서버를 띄우고 한참 뒤에 처음 나타난 라벨 조합은 첫 10초치가 그래프에서 빠진다. 장애를 주입하고 요청을 한 번만 보냈는데 그래프에 안 보이면 한 번 더 보내 본다. 호출 기록(`provider_calls`)에는 빠짐없이 남는다 (§2의 두 갈래를 비교해 볼 좋은 예다).
 - 계측기는 처음 쓸 때 만들어지고 그 시점의 전역 meter provider에 묶인다. 그래서 실행 파일은 `telemetry::init`을 가장 먼저 부른다.
+
+**구현 메모 (Phase 6)**
+- `provider.rate_limit.allowed`는 다른 업체 상태 지표처럼 관측형 gauge다 (`ResilientProvider::rate_limit_allowed`). 상한(정책의 `per_second`)과 함께 보면 AIMD가 얼마나 줄였는지 보인다. 업체가 한도 초과를 알린 횟수는 기존 `provider.throttled{source="remote"}`다.
+- `reconciliation.issues.open`은 `jobs.ready`처럼 워커 역할의 서버가 5초마다 DB에서 세어 갱신한다. 이슈가 없는 종류도 0으로 내보낸다. 이슈를 처리 완료로 표시하면 값이 0으로 내려가야 알림이 풀린다 (값을 내보내지 않으면 마지막 값이 한동안 남는다).
+- 라벨은 종류(`kind`, 4가지)뿐이다. 업체별로 나누지 않았다 (업체는 대사 이슈 화면에서 본다).
 
 ## 5. 로그
 
@@ -262,8 +270,8 @@ ORDER BY bucket;
 
 | 대시보드 | 패널 |
 |---|---|
-| Provider Overview | 업체별 초당 호출 수, 성공률, p50/p95/p99, 결과별 비율, 429 · 503, 서킷 상태 타임라인, rate limit 여유 |
-| Booking Pipeline | 상태 전이 흐름, 접수 → 확정 시간 p95, 대기 · dead 작업 수, 작업 지연 |
+| Provider Overview | 업체별 초당 호출 수, 성공률, p50/p95/p99, 결과별 비율, 429 · 503, 서킷 상태 타임라인, rate limit 여유, AIMD 허용 속도 (Phase 6) |
+| Booking Pipeline | 상태 전이 흐름, 접수 → 확정 시간 p95, 대기 · dead 작업 수, 작업 지연, 미해결 대사 이슈 (Phase 6) |
 | Service | API 요청 수 · 에러율 · 지연, tokio 런타임 지표 |
 
 **구현 (Phase 4)**: 파일 구성과 고치는 방법은 [`observability/README.md`](../observability/README.md)에 있다.
@@ -288,12 +296,17 @@ ORDER BY bucket;
 | 서킷이 5분 넘게 Open | 경고 | `provider_circuit_state` = 2이고 서킷에 막힌 호출(`outcome="circuit_open"`)이 계속 있는 상태가 5분 지속 |
 | dead 작업이 1건 이상 | 경고 | `jobs_dead` > 0 |
 | `unknown` 상태가 10분 넘게 유지 | 경고 | `booking_unknown_oldest_age_seconds` > 600 |
-| 대사에서 이중 예약 의심 발견 | 긴급 | (대사 작업을 만드는 Phase 6에서 추가) |
+| 대사에서 이중 예약 의심 발견 | 긴급 | `max(reconciliation_issues_open{kind="duplicate_suspected"})` > 0 (Phase 6, 기다리지 않고 바로) |
 | 업체 호출 중 rate_limited 비율 5% 초과 (10분) | 경고 | 실제로 부른 시도 중 `outcome="rate_limited"` 비율 |
 | 작업 지연 p95가 30초 초과 | 경고 | `jobs_lag_seconds`의 p95 > 30이 2분 지속 |
 | `provider_calls.recorder.dropped` 증가 | 정보 | 5분 증가량 > 0 |
 
 **구현 (Phase 4)**: Grafana 알림 규칙으로 만들었다 (`observability/grafana/provisioning/alerting/booking.yaml`). 30초마다 평가하고, Grafana의 Alerting → Alert rules → **Booking** 폴더에서 상태를 본다. 로컬에는 알림을 받을 곳(메일 · 메신저)을 연결하지 않았다. 지표가 아예 없을 때(서버가 꺼져 있음)는 울리지 않게 했다.
+
+**Phase 6에서 더한 것**
+- Provider Overview: "적응형 rate limit (AIMD)" 줄에 "우리 limiter가 허용하는 초당 호출 수"(`provider_rate_limit_allowed`)와 "업체가 알린 한도 초과 (429 · 503)"(`provider_throttled_total{source="remote"}`)를 나란히 두었다. 한도 초과가 오면 허용 속도가 절반으로 꺾였다가 계단처럼 올라가는 모양이 보인다.
+- Booking Pipeline: "대사" 줄에 "이중 예약 의심 (미해결)" 숫자와 "미해결 대사 이슈 (종류별)" 그래프.
+- 알림 규칙은 7개가 되었다. 이중 예약 의심은 긴급(critical)이고, 한 번만 찾아도 바로 울린다 (`for: 0s`). 이슈를 처리 완료로 표시하면 그친다.
 
 서킷 알림이 상태 값만 보지 않는 이유: 서킷은 다음 호출이 올 때에야 Open에서 벗어난다 (§4). 업체가 복구됐어도 처리할 예약이 없으면 지표는 2로 남는데, 그것으로 울리면 거짓 경보다. "열려 있고, 그 때문에 막히는 호출이 계속 있다"를 조건으로 삼았다.
 

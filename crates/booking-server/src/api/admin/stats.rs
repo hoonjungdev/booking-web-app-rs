@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{Latency, find_provider};
-use crate::api::{ApiError, ApiState, Problem, docs::tags};
+use crate::{
+    admin_auth::AdminSession,
+    api::{ApiError, ApiState, Problem, docs::tags},
+};
 
 /// 시계열 한 번에 돌려줄 최대 구간 수 (화면에 그릴 점 수). 넘으면 간격을 넓혀 달라고 한다.
 const MAX_POINTS: i64 = 1_000;
@@ -156,9 +159,11 @@ pub struct ProviderStats {
     path = "/stats/providers/{id}/timeseries",
     operation_id = "admin_provider_timeseries",
     tag = tags::ADMIN_STATS,
+    security(("admin_session" = [])),
     params(("id" = String, Path, description = "업체 ID"), TimeseriesQuery),
     responses(
         (status = 200, description = "구간별 통계", body = Timeseries),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "기간 · 간격 오류 (구간이 너무 많음 등)", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "없는 업체", body = Problem, content_type = "application/problem+json"),
     ),
@@ -166,6 +171,7 @@ pub struct ProviderStats {
 #[tracing::instrument(name = "admin.stats.timeseries", skip_all, fields(provider = %id))]
 pub async fn provider_timeseries(
     State(state): State<ApiState>,
+    _session: AdminSession,
     Path(id): Path<String>,
     query: Result<Query<TimeseriesQuery>, QueryRejection>,
 ) -> Result<Json<Timeseries>, ApiError> {
@@ -238,15 +244,18 @@ pub async fn provider_timeseries(
     path = "/stats/providers/summary",
     operation_id = "admin_providers_summary",
     tag = tags::ADMIN_STATS,
+    security(("admin_session" = [])),
     params(SummaryQuery),
     responses(
         (status = 200, description = "업체별 호출 수 · 성공률 · 지연", body = StatsSummary),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "기간 값 오류", body = Problem, content_type = "application/problem+json"),
     ),
 )]
 #[tracing::instrument(name = "admin.stats.summary", skip_all)]
 pub async fn providers_summary(
     State(state): State<ApiState>,
+    _session: AdminSession,
     query: Result<Query<SummaryQuery>, QueryRejection>,
 ) -> Result<Json<StatsSummary>, ApiError> {
     let Query(query) = query?;

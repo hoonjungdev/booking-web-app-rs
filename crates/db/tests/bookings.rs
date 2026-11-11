@@ -184,7 +184,7 @@ async fn 접수와_전이를_일으킨_trace를_이력과_작업에_남긴다(po
     bookings::accept(&pool, &new).await.unwrap();
 
     // 작업을 가져가면 등록한 쪽의 trace 문맥이 함께 나온다 (워커가 link를 걸 때 쓴다)
-    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+    let job = jobs::claim_next(&pool, Duration::from_secs(60), &jobs::ClaimScope::Any)
         .await
         .unwrap()
         .unwrap();

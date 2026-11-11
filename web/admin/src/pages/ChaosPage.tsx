@@ -23,6 +23,8 @@ import type { Schemas } from '../api/client'
 import { useApplyPreset, useChaos, useSaveChaos } from '../api/queries/chaos'
 import { useAdminInfo } from '../api/queries/info'
 import { useProviders } from '../api/queries/providers'
+import { useCan } from '../api/queries/session'
+import { NeedsRole } from '../components/Permission'
 import { ErrorAlert, Loading } from '../components/QueryState'
 import { CHAOS_PRESET, CHAOS_PRESETS } from '../lib/labels'
 
@@ -62,6 +64,7 @@ export default function ChaosPage() {
 function ProviderChaos({ provider, name }: { provider: string; name: string }) {
   const chaos = useChaos(provider, true)
   const preset = useApplyPreset(provider)
+  const canOperate = useCan('operator')
 
   return (
     <Card withBorder>
@@ -72,21 +75,24 @@ function ProviderChaos({ provider, name }: { provider: string; name: string }) {
       {chaos.isError && <ErrorAlert error={chaos.error} title="장애 설정을 읽지 못했습니다" />}
       {chaos.data && (
         <Stack>
-          <Group gap="xs">
-            {CHAOS_PRESETS.map((name) => (
-              <Tooltip key={name} label={CHAOS_PRESET[name].description}>
-                <Button
-                  size="sm"
-                  variant={name === 'healthy' ? 'filled' : 'light'}
-                  color={name === 'healthy' ? 'green' : name === 'outage' ? 'red' : 'orange'}
-                  loading={preset.isPending && preset.variables === name}
-                  onClick={() => preset.mutate(name)}
-                >
-                  {CHAOS_PRESET[name].label}
-                </Button>
-              </Tooltip>
-            ))}
-          </Group>
+          <NeedsRole role="operator">
+            <Group gap="xs">
+              {CHAOS_PRESETS.map((name) => (
+                <Tooltip key={name} label={CHAOS_PRESET[name].description}>
+                  <Button
+                    size="sm"
+                    variant={name === 'healthy' ? 'filled' : 'light'}
+                    color={name === 'healthy' ? 'green' : name === 'outage' ? 'red' : 'orange'}
+                    disabled={!canOperate}
+                    loading={preset.isPending && preset.variables === name}
+                    onClick={() => preset.mutate(name)}
+                  >
+                    {CHAOS_PRESET[name].label}
+                  </Button>
+                </Tooltip>
+              ))}
+            </Group>
+          </NeedsRole>
           {/* key가 바뀌면 React가 폼을 새로 만든다: 서버 설정이 바뀌면(시나리오 적용) 입력값도 그 값으로 다시 시작한다 */}
           <ChaosForm key={JSON.stringify(chaos.data)} provider={provider} initial={chaos.data} />
         </Stack>
@@ -99,6 +105,7 @@ function ProviderChaos({ provider, name }: { provider: string; name: string }) {
 function ChaosForm({ provider, initial }: { provider: string; initial: Settings }) {
   const [draft, setDraft] = useState<Settings>(initial)
   const save = useSaveChaos(provider)
+  const canOperate = useCan('operator')
   const changed = JSON.stringify(draft) !== JSON.stringify(initial)
 
   /** 일부 값만 바꾼다 (객체를 통째로 새로 만들어야 React가 바뀐 것을 안다) */
@@ -177,9 +184,11 @@ function ChaosForm({ provider, initial }: { provider: string; initial: Settings 
         />
       </SimpleGrid>
       <Group>
-        <Button onClick={() => save.mutate(draft)} loading={save.isPending} disabled={!changed}>
-          저장
-        </Button>
+        <NeedsRole role="operator">
+          <Button onClick={() => save.mutate(draft)} loading={save.isPending} disabled={!changed || !canOperate}>
+            저장
+          </Button>
+        </NeedsRole>
         <Button variant="subtle" onClick={() => setDraft(initial)} disabled={!changed}>
           되돌리기
         </Button>

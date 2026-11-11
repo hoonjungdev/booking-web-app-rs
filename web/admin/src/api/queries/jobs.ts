@@ -33,7 +33,10 @@ export function useJobList(filters: JobFilters) {
   })
 }
 
-/** dead 작업을 다시 대기열에 넣는다 */
+/**
+ * dead 작업을 다시 대기열에 넣는다.
+ * 포기한 대사 작업은 되살리지 않고, 서버가 그 행을 정리한 뒤 그 업체의 대사 작업(다른 ID)을 지금으로 당긴다.
+ */
 export function useRequeueJob() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -43,9 +46,7 @@ export function useRequeueJob() {
       notifications.show({
         color: 'green',
         title: '재처리',
-        message: result.booking
-          ? '작업을 다시 넣었습니다. 실패했던 예약은 업체에서 먼저 찾아본 뒤 처리합니다.'
-          : '작업을 다시 넣었습니다.',
+        message: requeueMessage(result),
       })
       return queryClient.invalidateQueries()
     },
@@ -53,4 +54,13 @@ export function useRequeueJob() {
       notifications.show({ color: 'red', title: '재처리 실패', message: errorMessage(error) })
     },
   })
+}
+
+function requeueMessage(result: Schemas['RetryResult']): string {
+  if (result.job.kind === 'reconcile_provider') {
+    return `포기한 대사 작업을 정리하고 ${result.job.provider ?? ''} 대사를 지금 돌립니다 (작업 #${result.job.id}).`
+  }
+  return result.booking
+    ? '작업을 다시 넣었습니다. 실패했던 예약은 업체에서 먼저 찾아본 뒤 처리합니다.'
+    : '작업을 다시 넣었습니다.'
 }

@@ -8,10 +8,21 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::admin_auth::AdminRole;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("API 키가 없거나 올바르지 않습니다")]
     Unauthorized,
+    /// 관리자 API: 로그인하지 않았거나 세션이 만료됨
+    #[error("로그인이 필요합니다")]
+    LoginRequired,
+    /// 관리자 로그인 실패. 아이디가 없는지 비밀번호가 틀렸는지는 알려 주지 않는다 (계정 추측을 막는다)
+    #[error("아이디 또는 비밀번호가 올바르지 않습니다")]
+    LoginFailed,
+    /// 관리자 역할이 모자람
+    #[error("{} 이상의 권한이 필요합니다", .0.as_str())]
+    Forbidden(AdminRole),
     #[error("{0}")]
     InvalidRequest(String),
     #[error("Idempotency-Key 헤더가 필요합니다 (출력 가능한 ASCII 1~255자)")]
@@ -26,6 +37,14 @@ pub enum ApiError {
     BookingNotFound,
     #[error("작업을 찾을 수 없습니다")]
     JobNotFound,
+    #[error("대사 이슈를 찾을 수 없습니다")]
+    IssueNotFound,
+    /// 업체에 없는 자원 (빈 시간 조회)
+    #[error("업체에 없는 자원입니다: {0}")]
+    ResourceNotFound(String),
+    /// 업체를 부를 수 없고 대신 줄 캐시도 없음 (빈 시간 조회)
+    #[error("업체에서 빈 시간을 가져오지 못했습니다 ({0}). 잠시 뒤 다시 시도하세요")]
+    ProviderUnavailable(String),
     #[error("없는 경로입니다: {0}")]
     RouteNotFound(String),
     /// 지금 상태에서는 할 수 없는 조작 (예: `failed`가 아닌 예약 재시도, dead가 아닌 작업 재큐잉)
@@ -52,6 +71,13 @@ impl ApiError {
     fn describe(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", "인증 실패"),
+            Self::LoginRequired => (
+                StatusCode::UNAUTHORIZED,
+                "login-required",
+                "로그인이 필요합니다",
+            ),
+            Self::LoginFailed => (StatusCode::UNAUTHORIZED, "login-failed", "로그인 실패"),
+            Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "권한이 없습니다"),
             Self::InvalidRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid-request",
@@ -86,6 +112,21 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "job-not-found",
                 "작업을 찾을 수 없습니다",
+            ),
+            Self::IssueNotFound => (
+                StatusCode::NOT_FOUND,
+                "issue-not-found",
+                "대사 이슈를 찾을 수 없습니다",
+            ),
+            Self::ResourceNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "resource-not-found",
+                "업체에 없는 자원입니다",
+            ),
+            Self::ProviderUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider-unavailable",
+                "업체를 부를 수 없습니다",
             ),
             Self::RouteNotFound(_) => (StatusCode::NOT_FOUND, "not-found", "없는 경로입니다"),
             Self::Conflict(_) => (
@@ -171,7 +212,10 @@ impl ApiError {
     fn is_expected_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::ProviderRuntimeUnavailable | Self::ChaosDisabled | Self::Upstream(_)
+            Self::ProviderRuntimeUnavailable
+                | Self::ChaosDisabled
+                | Self::Upstream(_)
+                | Self::ProviderUnavailable(_)
         )
     }
 }

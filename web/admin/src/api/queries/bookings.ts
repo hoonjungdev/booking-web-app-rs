@@ -46,17 +46,20 @@ export function useBooking(id: string) {
   })
 }
 
-/** 실패한 예약 재시도 */
+/** 실패한 예약 · 취소에 실패한 예약 재시도 (operator 역할) */
 export function useRetryBooking() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) =>
       unwrap(api.POST('/admin/api/bookings/{id}/retry', { params: { path: { id } } })),
-    onSuccess: () => {
+    onSuccess: (result) => {
       notifications.show({
         color: 'green',
         title: '재시도',
-        message: '예약을 다시 처리합니다. 워커가 업체에서 먼저 찾아본 뒤 없으면 다시 보냅니다.',
+        message:
+          result.booking?.status === 'cancel_requested'
+            ? '취소를 다시 보냅니다. 이미 취소된 예약이어도 같은 결과입니다.'
+            : '예약을 다시 처리합니다. 워커가 업체에서 먼저 찾아본 뒤 없으면 다시 보냅니다.',
       })
       // 예약 · 작업 화면이 모두 바뀌므로 읽어 둔 데이터를 전부 다시 읽게 한다
       return queryClient.invalidateQueries()

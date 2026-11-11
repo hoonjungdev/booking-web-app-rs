@@ -306,6 +306,33 @@ pub async fn list(
     rows.into_iter().map(Booking::try_from).collect()
 }
 
+/// 업체 하나의, 슬롯 시작 시각이 `[from, to)`인 예약 (대사용, docs/03-resilience.md §9).
+/// `bookings_provider_idx (provider_id, slot_start)`로 찾는다.
+#[tracing::instrument(name = "db.bookings.for_reconciliation", skip_all)]
+pub async fn for_reconciliation(
+    pool: &PgPool,
+    provider: &ProviderId,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<Booking>, DbError> {
+    let rows = sqlx::query_as!(
+        BookingRow,
+        r#"
+        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        FROM bookings
+        WHERE provider_id = $1 AND slot_start >= $2 AND slot_start < $3
+        ORDER BY slot_start, id
+        "#,
+        provider.as_str(),
+        from,
+        to,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(Booking::try_from).collect()
+}
+
 /// 상태를 바꾸고 이력을 남긴다.
 ///
 /// 다음 상태는 도메인의 [`BookingStatus::apply`]로만 정한다. 그래서 규칙에 없는 전이는 저장 단계에서 막힌다.

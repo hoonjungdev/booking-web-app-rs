@@ -1,39 +1,47 @@
 //! alpha 업체 어댑터 (docs/04-api.md §4 alpha)
+//!
+//! 모범적인 REST API: 시각은 RFC 3339 UTC, 생성에 `Idempotency-Key`를 지원, 오류는 HTTP 상태 코드 + `{ "error": { "code" } }`,
+//! 호출 한도 초과는 429 + `Retry-After`, 응답마다 `X-RateLimit-Remaining`.
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use domain::{BookingId, RejectReason};
-use reqwest::{Response, StatusCode, header};
+use reqwest::{Response, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdapterReply, BuildError, Capabilities, CreateBooking, ProviderAdapter, ProviderBooking,
-    ProviderError, ProviderPolicy, ResponseMeta, trace,
+    AdapterReply, AvailableSlot, BuildError, Capabilities, CreateBooking, ListedBooking,
+    ListedStatus, ProviderAdapter, ProviderBooking, ProviderError, ResponseMeta, join_url,
+    parse_base_url, trace,
 };
 
 /// 에러 본문을 기록할 때 이 길이까지만 남긴다
 const MAX_ERROR_BODY: usize = 500;
 /// alpha가 확정된 예약에 쓰는 상태 값
 const CONFIRMED: &str = "confirmed";
+/// alpha가 취소된 예약에 쓰는 상태 값
+const CANCELLED: &str = "cancelled";
 
 pub struct AlphaAdapter {
-    base_url: String,
+    base: Url,
     http: reqwest::Client,
 }
 
 impl AlphaAdapter {
     /// `base_url` 예: `http://127.0.0.1:9090/alpha/v1`
-    pub fn new(base_url: &str, policy: &ProviderPolicy) -> Result<Self, BuildError> {
+    ///
+    /// `timeout`은 HTTP 클라이언트의 안전장치다. 실제 시도 타임아웃은 `ResilientProvider`가 정책 값으로 건다
+    /// (정책은 실행 중에 바뀔 수 있어서 여기에 박아 두지 않는다. `crate::ADAPTER_TIMEOUT`).
+    pub fn new(base_url: &str, timeout: Duration) -> Result<Self, BuildError> {
         // reqwest::Client는 연결을 재사용하므로 하나를 만들어 계속 쓴다 (≈ HttpClient를 싱글턴으로 쓰는 것).
-        // 시도 타임아웃은 ResilientProvider가 걸지만, 어댑터를 따로 쓸 때를 위해 같은 값을 안전장치로 둔다.
         let http = reqwest::Client::builder()
-            .timeout(policy.attempt_timeout())
+            .timeout(timeout)
             .connect_timeout(Duration::from_secs(1))
             .user_agent(concat!("booking-gateway/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base: parse_base_url(base_url)?,
             http,
         })
     }
@@ -57,7 +65,7 @@ impl AlphaAdapter {
 
         let request = self
             .http
-            .post(format!("{}/reservations", self.base_url))
+            .post(join_url(&self.base, &["reservations"]))
             // 우리 예약 ID를 멱등키로 보낸다. 같은 예약을 다시 보내도 업체가 하나만 만든다.
             .header("Idempotency-Key", &reference)
             .json(&body);
@@ -90,12 +98,11 @@ impl AlphaAdapter {
         reference: BookingId,
         meta: &mut ResponseMeta,
     ) -> Result<Option<ProviderBooking>, ProviderError> {
-        // 참조값은 UUID라 URL에 그대로 넣어도 되는 문자(16진수와 '-')만 있다
-        let request = self.http.get(format!(
-            "{}/reservations?client_reference={reference}",
-            self.base_url
-        ));
-        let response = trace::send(request, "/reservations")
+        let mut url = join_url(&self.base, &["reservations"]);
+        // `query_pairs_mut`: 쿼리 문자열을 인코딩해 붙인다 (≈ C#의 QueryHelpers.AddQueryString)
+        url.query_pairs_mut()
+            .append_pair("client_reference", &reference.to_string());
+        let response = trace::send(self.http.get(url), "/reservations")
             .await
             .map_err(|e| classify_transport(&e))?;
         *meta = read_meta(&response);
@@ -112,12 +119,114 @@ impl AlphaAdapter {
             .filter(|r| r.status == CONFIRMED);
         let found = confirmed.next();
         if found.is_some() && confirmed.next().is_some() {
-            // 이중 예약 의심. 대사 작업(Phase 6)이 이슈로 기록한다. 여기서는 첫 예약을 쓴다.
+            // 이중 예약 의심. 대사 작업이 이슈로 기록한다. 여기서는 첫 예약을 쓴다.
             tracing::warn!(%reference, "같은 참조값으로 확정된 예약이 업체에 여러 건 있다");
         }
         Ok(found.map(|r| ProviderBooking {
             provider_booking_id: r.id,
         }))
+    }
+
+    async fn cancel(
+        &self,
+        provider_booking_id: &str,
+        meta: &mut ResponseMeta,
+    ) -> Result<(), ProviderError> {
+        // `DELETE /reservations/{id}`는 멱등이다: 이미 취소된 예약도 200으로 같은 결과를 돌려준다
+        let url = join_url(&self.base, &["reservations", provider_booking_id]);
+        let response = trace::send(self.http.delete(url), "/reservations/{id}")
+            .await
+            .map_err(|e| classify_transport(&e))?;
+        *meta = read_meta(&response);
+
+        if !response.status().is_success() {
+            return Err(classify_failure(response).await);
+        }
+        let reservation: AlphaReservation =
+            response.json().await.map_err(|e| classify_transport(&e))?;
+        if reservation.status != CANCELLED {
+            return Err(ProviderError::Decode {
+                detail: format!(
+                    "취소 응답의 예약 상태가 cancelled가 아닙니다: {}",
+                    reservation.status
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        meta: &mut ResponseMeta,
+    ) -> Result<Vec<ListedBooking>, ProviderError> {
+        let mut url = join_url(&self.base, &["reservations"]);
+        url.query_pairs_mut()
+            .append_pair("from", &from.to_rfc3339())
+            .append_pair("to", &to.to_rfc3339());
+        let response = trace::send(self.http.get(url), "/reservations")
+            .await
+            .map_err(|e| classify_transport(&e))?;
+        *meta = read_meta(&response);
+
+        if !response.status().is_success() {
+            return Err(classify_failure(response).await);
+        }
+        let list: AlphaReservationList =
+            response.json().await.map_err(|e| classify_transport(&e))?;
+        list.reservations
+            .into_iter()
+            .map(|r| {
+                let status = match r.status.as_str() {
+                    CONFIRMED => ListedStatus::Confirmed,
+                    CANCELLED => ListedStatus::Cancelled,
+                    other => {
+                        return Err(ProviderError::Decode {
+                            detail: format!("알 수 없는 예약 상태입니다: {other}"),
+                        });
+                    }
+                };
+                Ok(ListedBooking {
+                    provider_booking_id: r.id,
+                    reference: r.client_reference,
+                    slot_start: r.slot_start,
+                    status,
+                })
+            })
+            // 하나라도 상태를 읽지 못하면 그 에러를 돌려준다 (≈ 하나라도 실패하면 전체 실패)
+            .collect()
+    }
+
+    async fn slots(
+        &self,
+        resource_id: &str,
+        date: NaiveDate,
+        meta: &mut ResponseMeta,
+    ) -> Result<Vec<AvailableSlot>, ProviderError> {
+        let mut url = join_url(&self.base, &["availability"]);
+        url.query_pairs_mut()
+            .append_pair("resource_id", resource_id)
+            .append_pair("date", &date.format("%Y-%m-%d").to_string());
+        let response = trace::send(self.http.get(url), "/availability")
+            .await
+            .map_err(|e| classify_transport(&e))?;
+        *meta = read_meta(&response);
+
+        if !response.status().is_success() {
+            return Err(classify_failure(response).await);
+        }
+        let availability: AlphaAvailability =
+            response.json().await.map_err(|e| classify_transport(&e))?;
+        Ok(availability
+            .slots
+            .into_iter()
+            .map(|slot| AvailableSlot {
+                start: slot.start,
+                end: slot.end,
+                remaining: slot.remaining,
+            })
+            .collect())
     }
 }
 
@@ -137,15 +246,31 @@ struct AlphaCustomer<'a> {
     phone: &'a str,
 }
 
+/// 예약 응답에서 쓰는 필드만 읽는다 (고객 정보는 읽지 않는다)
 #[derive(Deserialize)]
 struct AlphaReservation {
     id: String,
     status: String,
+    slot_start: DateTime<Utc>,
+    #[serde(default)]
+    client_reference: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AlphaReservationList {
     reservations: Vec<AlphaReservation>,
+}
+
+#[derive(Deserialize)]
+struct AlphaAvailability {
+    slots: Vec<AlphaSlot>,
+}
+
+#[derive(Deserialize)]
+struct AlphaSlot {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    remaining: u32,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +304,32 @@ impl ProviderAdapter for AlphaAdapter {
     async fn find_booking(&self, reference: BookingId) -> AdapterReply<Option<ProviderBooking>> {
         let mut meta = ResponseMeta::default();
         let result = self.find(reference, &mut meta).await;
+        AdapterReply { result, meta }
+    }
+
+    async fn cancel_booking(&self, provider_booking_id: &str) -> AdapterReply<()> {
+        let mut meta = ResponseMeta::default();
+        let result = self.cancel(provider_booking_id, &mut meta).await;
+        AdapterReply { result, meta }
+    }
+
+    async fn list_bookings(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> AdapterReply<Vec<ListedBooking>> {
+        let mut meta = ResponseMeta::default();
+        let result = self.list(from, to, &mut meta).await;
+        AdapterReply { result, meta }
+    }
+
+    async fn availability(
+        &self,
+        resource_id: &str,
+        date: NaiveDate,
+    ) -> AdapterReply<Vec<AvailableSlot>> {
+        let mut meta = ResponseMeta::default();
+        let result = self.slots(resource_id, date, &mut meta).await;
         AdapterReply { result, meta }
     }
 }
@@ -220,6 +371,9 @@ async fn classify_failure(response: Response) -> ProviderError {
         (StatusCode::NOT_FOUND, "resource_not_found") => ProviderError::Rejected {
             reason: RejectReason::ResourceNotFound,
         },
+        (StatusCode::NOT_FOUND, "reservation_not_found") => ProviderError::Rejected {
+            reason: RejectReason::BookingNotFound,
+        },
         (StatusCode::BAD_REQUEST, code) if !code.is_empty() => ProviderError::Rejected {
             reason: RejectReason::InvalidRequest {
                 code: code.to_owned(),
@@ -233,7 +387,7 @@ async fn classify_failure(response: Response) -> ProviderError {
 }
 
 /// reqwest 에러를 분류한다. 연결 단계 실패인지 먼저 본다 (연결 타임아웃도 "요청이 안 갔음"이므로 Connect).
-fn classify_transport(error: &reqwest::Error) -> ProviderError {
+pub(crate) fn classify_transport(error: &reqwest::Error) -> ProviderError {
     if error.is_connect() {
         ProviderError::Connect {
             detail: error.to_string(),
@@ -251,8 +405,8 @@ fn classify_transport(error: &reqwest::Error) -> ProviderError {
     }
 }
 
-/// `Retry-After: <초>` 헤더를 읽는다 (HTTP 날짜 형식은 alpha가 쓰지 않으므로 무시)
-fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+/// `Retry-After: <초>` 헤더를 읽는다 (HTTP 날짜 형식은 우리 mock 업체가 쓰지 않으므로 무시)
+pub(crate) fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
     headers
         .get(header::RETRY_AFTER)?
         .to_str()

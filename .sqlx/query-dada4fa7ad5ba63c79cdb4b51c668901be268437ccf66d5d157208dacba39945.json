@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, actor, action, target, detail, trace_id, at FROM admin_audit_log\n         WHERE ($1::int8 IS NULL OR id < $1)\n         ORDER BY id DESC\n         LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "actor",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "actor"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "action",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "action"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "target",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "target"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "detail",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "detail"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "trace_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "trace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "admin_audit_log",
+            "name": "at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "dada4fa7ad5ba63c79cdb4b51c668901be268437ccf66d5d157208dacba39945"
+}

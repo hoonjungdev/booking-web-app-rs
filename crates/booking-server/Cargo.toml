@@ -15,6 +15,8 @@ tokio-console = ["telemetry/tokio-console"]
 
 [dependencies]
 anyhow.workspace = true
+# 관리자 비밀번호 해시 (docs/06-admin-frontend.md §6)
+argon2.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -23,6 +25,8 @@ db.workspace = true
 domain = { workspace = true, features = ["openapi"] }
 dotenvy.workspace = true
 figment.workspace = true
+# 빈 시간 조회 캐시 (TTL + stale-if-error)
+moka.workspace = true
 # 메트릭 계측기 (Counter · Histogram · Gauge). SDK 설정은 telemetry 크레이트가 맡는다.
 opentelemetry.workspace = true
 providers.workspace = true

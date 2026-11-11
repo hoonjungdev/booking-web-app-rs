@@ -2,12 +2,19 @@
 //!
 //! JSON의 숫자 필드 이름(`_ms`)을 그대로 두고, 코드에서는 `Duration`을 돌려주는 메서드로 꺼내 쓴다.
 //! `#[serde(default)]`: JSON에 없는 필드는 `Default` 값(문서 §3의 기본값)으로 채운다. 모르는 필드는 무시한다.
+//!
+//! 정책은 실행 중에 바뀔 수 있다 (관리자 화면에서 편집, Phase 6). `ResilientProvider`가 새 정책을 받으면
+//! 정책 · rate limiter · bulkhead를 통째로 교체하고, 진행 중인 호출은 시작할 때의 정책을 끝까지 쓴다.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::BuildError;
+
+/// 시도 타임아웃의 상한 (밀리초). 어댑터의 HTTP 클라이언트가 안전장치로 거는 타임아웃(`ADAPTER_TIMEOUT`)과 같다.
+/// 이보다 길게 정하면 안전장치가 먼저 끊어 정책 값이 지켜지지 않으므로 거절한다.
+pub const MAX_ATTEMPT_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +27,8 @@ pub struct ProviderPolicy {
     pub rate_limit: RateLimitPolicy,
     pub bulkhead: BulkheadPolicy,
     pub circuit_breaker: CircuitBreakerPolicy,
+    /// 빈 시간 조회 결과를 캐시에서 새것으로 보는 시간. 지나면 업체에 다시 묻고, 실패하면 5분까지는 캐시 값을 준다 (stale-if-error)
+    pub availability_cache_ttl_ms: u64,
 }
 
 /// 호출 내 재시도 (지수 백오프 + full jitter)
@@ -36,12 +45,15 @@ pub struct RetryPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RateLimitPolicy {
-    /// 초당 허용 호출 수
+    /// 초당 허용 호출 수. 적응형(`adaptive`)이면 이 값이 상한이다
     pub per_second: u32,
     /// 한꺼번에 몰아서 보낼 수 있는 호출 수
     pub burst: u32,
     /// 토큰을 기다리는 최대 시간. 넘으면 호출하지 않고 `Throttled`
     pub max_wait_ms: u64,
+    /// 적응형 조절 (AIMD): 업체가 한도 초과를 알리면 허용 속도를 절반으로, 한동안 문제없으면 조금씩 되돌린다
+    /// (docs/03-resilience.md §6 ④)
+    pub adaptive: bool,
 }
 
 /// 업체별 동시 호출 수 제한
@@ -78,6 +90,7 @@ impl Default for ProviderPolicy {
             rate_limit: RateLimitPolicy::default(),
             bulkhead: BulkheadPolicy::default(),
             circuit_breaker: CircuitBreakerPolicy::default(),
+            availability_cache_ttl_ms: 30_000,
         }
     }
 }
@@ -98,6 +111,7 @@ impl Default for RateLimitPolicy {
             per_second: 10,
             burst: 5,
             max_wait_ms: 500,
+            adaptive: true,
         }
     }
 }
@@ -163,6 +177,11 @@ impl ProviderPolicy {
         if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
             return Err(format!("{name}는 1 이상이어야 합니다"));
         }
+        if self.attempt_timeout_ms > MAX_ATTEMPT_TIMEOUT_MS {
+            return Err(format!(
+                "attempt_timeout_ms는 {MAX_ATTEMPT_TIMEOUT_MS} 이하여야 합니다 (어댑터의 HTTP 안전장치 타임아웃)"
+            ));
+        }
         if self.retry.base_delay_ms > self.retry.max_delay_ms {
             return Err("retry.base_delay_ms는 retry.max_delay_ms보다 클 수 없습니다".into());
         }
@@ -187,6 +206,16 @@ impl ProviderPolicy {
 
     pub fn call_budget(&self) -> Duration {
         Duration::from_millis(self.call_budget_ms)
+    }
+
+    /// 호출 한 번이 걸릴 수 있는 최대 시간: 호출 예산 + 마지막 시도의 관문 대기(rate limiter + bulkhead).
+    /// 워커의 lease는 이보다 길어야 한다. 짧으면 호출 도중 lease가 끝나 다른 워커가 같은 작업을 다시 가져간다.
+    pub fn longest_call(&self) -> Duration {
+        self.call_budget() + self.rate_limit.max_wait() + self.bulkhead.max_wait()
+    }
+
+    pub fn availability_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.availability_cache_ttl_ms)
     }
 }
 
@@ -230,7 +259,7 @@ mod tests {
             "attempt_timeout_ms": 3000,
             "call_budget_ms": 15000,
             "retry":           { "max_attempts": 3, "base_delay_ms": 200, "max_delay_ms": 2000 },
-            "rate_limit":      { "per_second": 10, "burst": 5, "max_wait_ms": 500 },
+            "rate_limit":      { "per_second": 10, "burst": 5, "max_wait_ms": 500, "adaptive": true },
             "bulkhead":        { "max_concurrency": 8, "max_wait_ms": 200 },
             "circuit_breaker": { "window": 20, "min_calls": 10, "failure_rate": 0.5,
                                  "open_ms": 30000, "half_open_probes": 3 },
@@ -252,6 +281,20 @@ mod tests {
         assert_eq!(policy.retry.max_attempts, 1);
         assert_eq!(policy.retry.base_delay_ms, 200);
         assert_eq!(policy.circuit_breaker, CircuitBreakerPolicy::default());
+        assert!(
+            policy.rate_limit.adaptive,
+            "적응형 조절은 기본으로 켜져 있다"
+        );
+        assert_eq!(policy.availability_cache_ttl_ms, 30_000);
+    }
+
+    #[test]
+    fn 호출_한_번의_최대_시간은_예산과_관문_대기를_더한_값이다() {
+        // 15초 + rate limiter 0.5초 + bulkhead 0.2초
+        assert_eq!(
+            ProviderPolicy::default().longest_call(),
+            Duration::from_millis(15_700)
+        );
     }
 
     #[test]
@@ -263,6 +306,7 @@ mod tests {
             json!({ "circuit_breaker": { "window": 5, "min_calls": 10 } }),
             json!({ "circuit_breaker": { "failure_rate": 1.5 } }),
             json!({ "circuit_breaker": { "failure_rate": 0.0 } }),
+            json!({ "attempt_timeout_ms": 60_001 }),
         ];
         for value in invalid {
             assert!(

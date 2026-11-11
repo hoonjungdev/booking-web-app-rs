@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/admin/api/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 감사 로그 (관리자 조작 기록) */
+        get: operations["admin_audit_log"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/api/bookings": {
         parameters: {
             query?: never;
@@ -48,9 +65,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 실패한 예약을 다시 처리한다
-         * @description 예약을 `failed` → `pending`으로 되돌리고, 그 예약의 dead 작업을 되살린다 (없으면 새로 등록).
-         *     워커는 다시 보내기 전에 업체에서 이 예약을 먼저 찾아본다 (이미 만들어졌으면 확정으로 끝낸다).
+         * 실패한 예약 · 취소에 실패한 예약을 다시 처리한다
+         * @description - `failed`: `pending`으로 되돌리고 그 예약의 dead 작업을 되살린다 (없으면 새로 등록). 워커는 다시 보내기 전에
+         *       업체에서 이 예약을 먼저 찾아본다 (이미 만들어졌으면 확정으로 끝낸다).
+         *     - `cancel_failed`: `cancel_requested`로 되돌리고 취소를 다시 보낸다.
          */
         post: operations["admin_retry_booking"];
         delete?: never;
@@ -156,11 +174,50 @@ export interface paths {
         put?: never;
         /**
          * dead 작업을 다시 대기열에 넣는다
-         * @description 작업의 예약이 `failed`면 예약 재시도(`POST /bookings/{id}/retry`)와 같다: 예약을 `pending`으로 되돌리고
-         *     이 작업을 "업체에서 먼저 찾아본 뒤 제출하는" `submit_booking`으로 되살린다.
-         *     그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다. 시도 횟수는 처음부터 다시 센다.
+         * @description 작업의 예약이 `failed` · `cancel_failed`면 예약 재시도(`POST /bookings/{id}/retry`)와 같다: 예약을 되돌리고
+         *     이 작업을 "업체에서 먼저 찾아본 뒤 제출하는" `submit_booking`(또는 다시 취소하는 `cancel_booking`)으로 되살린다.
+         *     그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다. 시도 횟수는 그대로 두고 한도를 늘린다.
+         *     포기한 대사 작업(`reconcile_provider`)은 업체마다 하나뿐인 대사 자리가 이미 차 있어 되살리지 않는다:
+         *     그 행은 끝난 것으로 정리하고, 그 업체의 대사 작업을 지금으로 당겨 그 작업을 돌려준다.
          */
         post: operations["admin_requeue_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 로그인한다. 성공하면 세션 쿠키(`HttpOnly`, `SameSite=Strict`)를 준다.
+         * @description 아이디가 없는지 비밀번호가 틀렸는지는 구분해 알려 주지 않는다 (계정 이름 추측을 막는다).
+         */
+        post: operations["admin_login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 로그아웃한다. 세션을 지우고 쿠키를 지우게 한다. 로그인하지 않았어도 204다. */
+        post: operations["admin_logout"];
         delete?: never;
         options?: never;
         head?: never;
@@ -215,6 +272,116 @@ export interface paths {
          * @description 서킷 상태는 업체를 부르는 프로세스의 메모리에 있다. 워커와 같은 프로세스(`--role all`)에서만 조작할 수 있다.
          */
         post: operations["admin_control_circuit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/providers/{id}/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 업체 정책을 바꾼다 (즉시 반영)
+         * @description DB에 저장하고, 이 프로세스의 업체 파이프라인에 바로 적용한다 (다음 호출부터. 진행 중인 호출은 시작할 때의 정책으로 끝난다).
+         *     바꾼 정책으로는 업체 호출 한 번이 워커의 lease보다 길어지면 거절한다 (호출 도중 다른 워커가 같은 작업을 가져가면
+         *     멱등키 없는 업체에서는 이중 예약이 된다). admin 역할만 쓸 수 있다.
+         */
+        put: operations["admin_update_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/providers/{id}/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 업체의 대사를 지금 돌린다 (다음 정기 대사를 기다리지 않고)
+         * @description 대기 중인 대사 작업의 실행 시각을 지금으로 당기고, 없으면 새로 등록한다. 이미 실행 중이면 그 작업을 돌려준다.
+         */
+        post: operations["admin_run_reconcile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/reconciliation/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 미해결 대사 이슈 수 (대시보드) */
+        get: operations["admin_issue_counts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/reconciliation/issues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 대사 이슈 목록 */
+        get: operations["admin_list_issues"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/reconciliation/issues/{id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 이슈를 처리 완료로 표시한다 (관리자가 업체와 확인해 정리한 뒤) */
+        post: operations["admin_resolve_issue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/api/session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 지금 로그인한 관리자. 로그인하지 않았으면 401 (관리자 화면이 로그인 화면을 보여 줄지 정한다) */
+        get: operations["admin_session"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -299,6 +466,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/bookings/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 확정된 예약의 취소를 요청한다. 업체 취소는 워커가 하므로 바로 `202 Accepted`를 돌려준다.
+         * @description 취소는 원래 멱등이다: 이미 취소를 받은 예약(`cancel_requested` · `cancelled` · `cancel_failed`)이면 아무것도 바꾸지 않고
+         *     지금 상태로 202를 돌려준다. 확정되지 않은 예약은 409다 (처리 중인 예약을 취소하면 경쟁 상태가 복잡해져 받지 않는다).
+         *
+         *     예약 행을 잠그고 상태를 확인한 뒤, 상태 전이(`confirmed → cancel_requested`)와 `cancel_booking` 작업 등록을
+         *     한 트랜잭션으로 저장한다. 두 취소 요청이 동시에 와도 작업은 하나만 생긴다.
+         */
+        post: operations["cancel_booking"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 예약을 받는 업체 목록 */
+        get: operations["list_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{provider}/availability": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 자원 하나의 날짜별 빈 시간
+         * @description 업체 결과를 업체 정책의 시간(기본 30초) 동안 캐시한다. 업체 호출이 실패해도 5분 안에 가져온 값이 있으면
+         *     `"stale": true`로 돌려준다 (stale-if-error).
+         */
+        get: operations["get_availability"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -329,7 +558,10 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
-        /** @description 관리자 화면 설정. 화면이 처음 열릴 때 읽어, 쓸 수 없는 기능은 숨기거나 이유를 보여 준다. */
+        /**
+         * @description 관리자 화면 설정. 화면이 처음 열릴 때(로그인 전에도) 읽어, 쓸 수 없는 기능은 숨기거나 이유를 보여 준다.
+         *     비밀이 아닌 값만 담는다.
+         */
         AdminInfo: {
             /** @description 장애 주입을 쓸 수 있는가 (`BOOKING_CHAOS_URL`을 설정했는가) */
             chaos_enabled: boolean;
@@ -339,6 +571,47 @@ export interface components {
             provider_runtime: boolean;
             /** @description 서버 버전 */
             version: string;
+        };
+        /**
+         * @description 관리자 역할. 선언한 순서대로 권한이 커진다 (`derive(PartialOrd, Ord)`: 앞에 선언한 값이 작다).
+         * @enum {string}
+         */
+        AdminRole: "viewer" | "operator" | "admin";
+        /** @description 감사 로그 한 줄 */
+        AuditEntryView: {
+            /** @description `booking.retry`, `provider.policy.update` … */
+            action: string;
+            /** @description `admin:<이름>` */
+            actor: string;
+            /** Format: date-time */
+            at: string;
+            detail: Record<string, never>;
+            /** Format: int64 */
+            id: number;
+            /** @description 조작 대상 (예약 ID, 업체 ID, 작업 ID 등) */
+            target?: string | null;
+            /** @description 조작 요청의 trace */
+            trace_id?: string | null;
+        };
+        AuditPage: {
+            /** @description 최근 것부터 */
+            items: components["schemas"]["AuditEntryView"][];
+            next_cursor?: string | null;
+        };
+        /** @description 빈 시간 조회 결과 */
+        AvailabilityResponse: {
+            /** Format: date */
+            date: string;
+            /**
+             * Format: date-time
+             * @description 업체에서 이 값을 가져온 시각
+             */
+            fetched_at: string;
+            provider: components["schemas"]["ProviderId"];
+            resource_id: string;
+            slots: components["schemas"]["SlotView"][];
+            /** @description 업체 호출이 실패해 예전 값(최대 5분 전)을 돌려줬다 */
+            stale: boolean;
         };
         /** @description 예약 상세: 예약, 상태 이력, 업체 호출 기록, 작업 */
         BookingDetail: {
@@ -352,7 +625,7 @@ export interface components {
         };
         /** @description 상태 이력 한 줄 */
         BookingEventView: {
-            /** @description 바꾼 주체: `api`, `worker`, `admin` … */
+            /** @description 바꾼 주체: `api`, `worker`, `reconciler`, `admin:<이름>` … */
             actor: string;
             /** Format: date-time */
             at: string;
@@ -435,7 +708,7 @@ export interface components {
         CircuitBreakerPolicyView: {
             /**
              * Format: double
-             * @description 이 비율 이상 실패하면 연다 (0~1)
+             * @description 이 비율 이상 실패하면 연다 (0 초과 ~ 1)
              */
             failure_rate: number;
             /**
@@ -539,6 +812,43 @@ export interface components {
         };
         /** @enum {string} */
         ForcedStateView: "open" | "closed";
+        /** @description 미해결 이슈 수 */
+        IssueCounts: {
+            /** @description 종류별 (이슈가 없는 종류도 0으로 들어 있다) */
+            by_kind: {
+                [key: string]: number;
+            };
+            /** Format: int64 */
+            open: number;
+        };
+        /**
+         * @description 대사 이슈 종류
+         * @enum {string}
+         */
+        IssueKindView: "missing_at_provider" | "missing_locally" | "status_mismatch" | "duplicate_suspected";
+        /** @description 이슈 목록 한 페이지 */
+        IssuePage: {
+            /** @description 최근에 찾은 것부터 */
+            items: components["schemas"]["IssueView"][];
+            next_cursor?: string | null;
+        };
+        /** @description 대사 이슈 하나 */
+        IssueView: {
+            booking_id?: components["schemas"]["BookingId"] | null;
+            /** @description 무엇이 어떻게 달랐는지 (우리 상태, 업체 상태, 업체 예약 ID 목록 등) */
+            detail: Record<string, never>;
+            /** Format: date-time */
+            detected_at: string;
+            /** Format: int64 */
+            id: number;
+            kind: components["schemas"]["IssueKindView"];
+            provider: string;
+            provider_booking_id?: string | null;
+            /** Format: date-time */
+            resolved_at?: string | null;
+            /** @description `reconciler`(대사가 자동으로 바로잡음) 또는 `admin:<이름>` */
+            resolved_by?: string | null;
+        };
         /** @description 작업 큐 개수: 종류별과 전체 */
         JobCounts: {
             /** @description 이 서버가 아는 종류는 작업이 없어도 0으로 나온다 */
@@ -570,7 +880,7 @@ export interface components {
             created_at: string;
             /** Format: int64 */
             id: number;
-            /** @description `submit_booking`, `resolve_unknown` … (이 서버 버전이 모르는 종류일 수도 있다) */
+            /** @description `submit_booking`, `resolve_unknown`, `cancel_booking`, `reconcile_provider` (이 서버 버전이 모르는 종류일 수도 있다) */
             kind: string;
             /** @description 마지막 실패 · 미룸 사유 */
             last_error?: string | null;
@@ -586,11 +896,19 @@ export interface components {
             max_attempts: number;
             /** @description 작업별 진행 상황 (예: `{"lookup_first": true}`, `{"not_found_checks": 1}`) */
             payload: Record<string, never>;
+            /** @description 부를 업체 (대사 작업처럼 예약이 없는 작업도 업체는 있다) */
+            provider?: string | null;
             /**
              * Format: date-time
              * @description 실행하기로 한 시각
              */
             run_at: string;
+            /**
+             * Format: date-time
+             * @description 멱등키 없는 업체에 생성 요청을 보내고 아직 결과를 기록하지 못했으면 그 시각. 이 표시가 남은 작업을 다시 가져가면
+             *     워커는 다시 보내지 않고 결과 불명으로 넘긴다
+             */
+            sent_at?: string | null;
             status: components["schemas"]["JobStatus"];
             /** Format: date-time */
             updated_at: string;
@@ -615,13 +933,23 @@ export interface components {
             /** Format: int64 */
             min: number;
         };
-        /** @description 장애 대응 정책 (docs/03-resilience.md §3) */
+        /** @description 로그인 요청. 비밀번호가 로그에 찍히지 않도록 `Debug`를 만들지 않는다. */
+        LoginRequest: {
+            password: string;
+            username: string;
+        };
+        /** @description 장애 대응 정책 (docs/03-resilience.md §3). 응답이자 정책 변경(PUT) 요청 본문이다 (모든 필드가 필요하다). */
         PolicyView: {
             /**
              * Format: int64
-             * @description 시도 한 번의 최대 시간
+             * @description 시도 한 번의 최대 시간 (최대 60000)
              */
             attempt_timeout_ms: number;
+            /**
+             * Format: int64
+             * @description 빈 시간 조회 결과를 캐시에서 새것으로 보는 시간 (업체 호출이 실패하면 5분까지는 캐시 값을 준다)
+             */
+            availability_cache_ttl_ms: number;
             bulkhead: components["schemas"]["BulkheadPolicyView"];
             /**
              * Format: int64
@@ -691,12 +1019,15 @@ export interface components {
         /** @description 업체 상세: 목록 정보 + 정책 */
         ProviderDetail: {
             /**
-             * @description 지금 적용 중인 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 업체 파이프라인이 있으면 그 정책
-             *     (서버가 시작할 때 DB에서 읽은 값), 없으면 DB의 정책이다
+             * @description 지금 적용 중인 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 업체 파이프라인이 있으면 그 정책,
+             *     없으면 DB의 정책이다
              */
             policy: components["schemas"]["PolicyView"];
             provider: components["schemas"]["ProviderView"];
-            /** @description DB의 정책이 지금 적용 중인 정책과 다르다. 서버를 다시 시작해야 반영된다 (실시간 반영은 Phase 6) */
+            /**
+             * @description DB의 정책이 지금 적용 중인 정책과 다르다. 관리자 API로 바꾸면 바로 반영되므로, DB를 직접 고쳤거나
+             *     다른 프로세스에서 바꾼 경우다. 서버를 다시 시작하면 반영된다
+             */
             restart_required: boolean;
         };
         /**
@@ -740,9 +1071,14 @@ export interface components {
              */
             success_rate?: number | null;
         };
+        /** @description 예약을 받는 업체 */
+        ProviderSummary: {
+            display_name: string;
+            id: components["schemas"]["ProviderId"];
+        };
         /** @description 업체 한 곳 (목록의 한 줄) */
         ProviderView: {
-            /** @description 어떤 어댑터 코드로 호출하는가 (`alpha_v1` …) */
+            /** @description 어떤 어댑터 코드로 호출하는가 (`alpha_v1`, `beta_v1` …) */
             adapter_kind: string;
             base_url: string;
             display_name: string;
@@ -780,6 +1116,8 @@ export interface components {
             scheduled: number;
         };
         RateLimitPolicyView: {
+            /** @description 적응형 조절 (AIMD): 업체가 한도 초과를 알리면 속도를 절반으로, 한동안 문제없으면 조금씩 되돌린다 */
+            adaptive: boolean;
             /**
              * Format: int32
              * @description 한꺼번에 보낼 수 있는 호출 수 (버킷 크기)
@@ -792,7 +1130,7 @@ export interface components {
             max_wait_ms: number;
             /**
              * Format: int32
-             * @description 초당 허용 호출 수
+             * @description 초당 허용 호출 수 (적응형이면 상한)
              */
             per_second: number;
         };
@@ -835,7 +1173,7 @@ export interface components {
             in_flight: number;
             /**
              * Format: int32
-             * @description 우리 rate limiter 버킷에 남은 토큰 수 (추정값) / 버킷 크기
+             * @description 우리 rate limiter 버킷에 남은 토큰 수 (추정값) / 버킷 크기 (적응형 조절로 속도와 함께 줄어든다)
              */
             limiter_available: number;
             /** Format: int32 */
@@ -849,9 +1187,41 @@ export interface components {
             paused_until?: string | null;
             /**
              * Format: int32
+             * @description 우리 rate limiter가 지금 허용하는 초당 호출 수. 업체가 한도 초과를 알리면 절반으로 줄었다가 조금씩 되돌아간다 (AIMD)
+             */
+            rate_limit_allowed: number;
+            /**
+             * Format: int32
+             * @description 정책이 정한 초당 호출 수 상한
+             */
+            rate_limit_ceiling: number;
+            /**
+             * Format: int32
              * @description 업체가 마지막 응답에서 알려 준 남은 호출 수 (`X-RateLimit-Remaining`). 받은 적이 없으면 `null`
              */
             rate_limit_remaining?: number | null;
+        };
+        /** @description 로그인한 관리자 */
+        SessionView: {
+            /**
+             * Format: date-time
+             * @description 세션이 끝나는 시각. 지나면 다시 로그인해야 한다
+             */
+            expires_at: string;
+            role: components["schemas"]["AdminRole"];
+            username: string;
+        };
+        /** @description 예약할 수 있는 시간 한 칸 */
+        SlotView: {
+            /** Format: date-time */
+            end: string;
+            /**
+             * Format: int32
+             * @description 남은 자리 (0이면 마감)
+             */
+            remaining: number;
+            /** Format: date-time */
+            start: string;
         };
         SlowSettings: {
             /** Format: int64 */
@@ -931,6 +1301,49 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    admin_audit_log: {
+        parameters: {
+            query?: {
+                /** @description 다음 페이지: 앞 페이지 응답의 `next_cursor` */
+                cursor?: string;
+                /** @description 한 페이지 크기 (기본 50, 최대 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 감사 로그 한 페이지 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditPage"];
+                };
+            };
+            /** @description 조건 값 오류 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     admin_list_bookings: {
         parameters: {
             query?: {
@@ -971,6 +1384,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
         };
     };
     admin_get_booking: {
@@ -992,6 +1414,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BookingDetail"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
                 };
             };
             /** @description 없는 예약 */
@@ -1026,6 +1457,24 @@ export interface operations {
                     "application/json": components["schemas"]["RetryResult"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description 없는 예약 */
             404: {
                 headers: {
@@ -1035,7 +1484,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description failed가 아니거나 처리 중인 작업이 있음 */
+            /** @description failed · cancel_failed가 아니거나 처리 중인 작업이 있음 */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1065,6 +1514,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChaosSettings"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
                 };
             };
             /** @description mock 업체에 없는 업체 */
@@ -1123,6 +1581,24 @@ export interface operations {
             };
             /** @description 설정 값 오류 (확률이 0~1 밖 등) */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1191,6 +1667,24 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description mock 업체에 없는 업체 */
             404: {
                 headers: {
@@ -1245,7 +1739,7 @@ export interface operations {
             query?: {
                 /** @description 작업 상태 */
                 status?: components["schemas"]["JobStatus"];
-                /** @description 작업 종류 (`submit_booking`, `resolve_unknown`) */
+                /** @description 작업 종류 (`submit_booking`, `resolve_unknown`, `cancel_booking`, `reconcile_provider`) */
                 kind?: string;
                 /** @description 다음 페이지: 앞 페이지 응답의 `next_cursor` */
                 cursor?: string;
@@ -1276,6 +1770,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
         };
     };
     admin_job_counts: {
@@ -1294,6 +1797,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JobCounts"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
                 };
             };
         };
@@ -1319,6 +1831,24 @@ export interface operations {
                     "application/json": components["schemas"]["RetryResult"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description 없는 작업 */
             404: {
                 headers: {
@@ -1339,6 +1869,68 @@ export interface operations {
             };
         };
     };
+    admin_login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description 로그인함. 응답의 Set-Cookie에 세션 쿠키가 있다 */
+            200: {
+                headers: {
+                    /** @description booking_admin_session=…; Path=/admin; HttpOnly; SameSite=Strict */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionView"];
+                };
+            };
+            /** @description 요청 본문 오류 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 아이디 또는 비밀번호가 틀림 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 로그아웃함 (쿠키를 지우는 Set-Cookie) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     admin_list_providers: {
         parameters: {
             query?: never;
@@ -1355,6 +1947,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProviderView"][];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
                 };
             };
         };
@@ -1378,6 +1979,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProviderDetail"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
                 };
             };
             /** @description 없는 업체 */
@@ -1425,6 +2035,24 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description 없는 업체 */
             404: {
                 headers: {
@@ -1445,6 +2073,294 @@ export interface operations {
             };
             /** @description 이 프로세스에 업체 파이프라인이 없음 (--role api) */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_update_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 업체 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyView"];
+            };
+        };
+        responses: {
+            /** @description 바꾼 뒤의 업체 상세 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderDetail"];
+                };
+            };
+            /** @description 정책 값 오류 (0인 값, 범위 밖 비율, lease보다 긴 호출 등) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description admin 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 없는 업체 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_run_reconcile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 업체 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 대사 작업 (곧 워커가 처리한다) */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobView"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 없는 업체 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 기간별 예약 목록을 지원하지 않는 업체 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_issue_counts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 미해결 이슈 수 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueCounts"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_list_issues: {
+        parameters: {
+            query?: {
+                /** @description `false`: 미해결만 (기본), `true`: 처리 완료만 */
+                resolved?: boolean;
+                /** @description 업체 ID */
+                provider?: string;
+                /** @description 이슈 종류 */
+                kind?: components["schemas"]["IssueKindView"];
+                /** @description 다음 페이지: 앞 페이지 응답의 `next_cursor` */
+                cursor?: string;
+                /** @description 한 페이지 크기 (기본 50, 최대 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 이슈 목록 한 페이지 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuePage"];
+                };
+            };
+            /** @description 조건 값 오류 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_resolve_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 이슈 ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 처리 완료로 표시한 이슈 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueView"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description operator 권한 필요 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 없는 이슈 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 이미 처리 완료 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    admin_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 로그인한 관리자 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionView"];
+                };
+            };
+            /** @description 로그인하지 않음 · 세션 만료 */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1484,6 +2400,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description 로그인 필요 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
         };
     };
     admin_provider_timeseries: {
@@ -1516,6 +2441,15 @@ export interface operations {
             };
             /** @description 기간 · 간격 오류 (구간이 너무 많음 등) */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 로그인 필요 */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1640,6 +2574,158 @@ export interface operations {
             };
             /** @description 없거나 다른 클라이언트의 예약 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cancel_booking: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 예약 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 취소를 접수함 (업체 취소는 워커가 한다). 이미 취소를 받은 예약이면 지금 상태 */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BookingResponse"];
+                };
+            };
+            /** @description API 키가 없거나 틀림 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 없거나 다른 클라이언트의 예약 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 확정되지 않은 예약 (처리 중 · 거절 · 실패) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 사용 중인 업체 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderSummary"][];
+                };
+            };
+            /** @description API 키가 없거나 틀림 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_availability: {
+        parameters: {
+            query: {
+                /** @description 업체 안의 예약 대상 (매장 등). 형식은 업체마다 다르다 (alpha: `store-001`, beta: `GN01`) */
+                resource_id: string;
+                /** @description 업체의 현지 날짜 (`YYYY-MM-DD`). 로컬 mock 업체는 한국 날짜다 */
+                date: string;
+            };
+            header?: never;
+            path: {
+                /** @description 업체 ID */
+                provider: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 빈 시간 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AvailabilityResponse"];
+                };
+            };
+            /** @description 조건 값 오류 (자원 ID · 날짜 형식) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description API 키가 없거나 틀림 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 없는 업체 · 업체에 없는 자원 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 예약을 받지 않는 업체 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description 업체를 부를 수 없고 캐시도 없음 · 이 프로세스에 업체 파이프라인이 없음 */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

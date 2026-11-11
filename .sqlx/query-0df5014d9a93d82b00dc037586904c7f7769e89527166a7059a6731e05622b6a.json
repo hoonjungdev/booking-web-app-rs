@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n                last_error, payload, created_at, updated_at\n         FROM jobs WHERE id = $1",
+  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n                last_error, payload, provider_id, sent_at, created_at, updated_at\n         FROM jobs WHERE booking_id = $1 ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -115,6 +115,28 @@
       },
       {
         "ordinal": 10,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "sent_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "sent_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -138,7 +160,7 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -152,9 +174,11 @@
       true,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "d99b6d7dc7af14d50b1caab8da5053aa3f1d8a213ded73eaa955576360b10008"
+  "hash": "0df5014d9a93d82b00dc037586904c7f7769e89527166a7059a6731e05622b6a"
 }

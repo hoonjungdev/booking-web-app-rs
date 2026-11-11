@@ -1,8 +1,12 @@
 //! 작업 큐 워커 (docs/02-domain-and-data.md §5)
 //!
-//! 워커 루프 `concurrency`개를 동시에 돌린다. 루프 하나는 "작업 하나 가져오기 → 처리 → 다음 작업" 을 반복하고,
-//! 가져올 작업이 없으면 `poll_interval`만큼 쉰다. 작업을 가져올 때 `FOR UPDATE SKIP LOCKED`를 쓰므로
-//! 루프끼리(서버가 여러 대여도) 같은 작업을 동시에 처리하지 않는다.
+//! **업체마다 워커 루프를 따로 둔다** (Phase 6, docs/decisions.md D-30). 업체 하나에 루프 `concurrency`개(업체 bulkhead
+//! 자리 수를 넘지 않게)를 돌리고, 그 루프는 그 업체의 작업만 가져간다. 그래서 alpha가 느려져 alpha 루프가 모두
+//! 업체 응답을 기다려도, beta 루프는 그대로 beta 작업을 처리한다 (≈ 업체별 전용 스레드 풀). 이 프로세스에 파이프라인이
+//! 없는 업체의 작업(사용하지 않는 업체 등)과 업체가 없는 작업은 따로 둔 루프 하나가 맡아 포기 · 정리한다.
+//!
+//! 루프 하나는 "작업 하나 가져오기 → 처리 → 다음 작업"을 반복하고, 가져올 작업이 없으면 `poll_interval`만큼 쉰다.
+//! 작업을 가져올 때 `FOR UPDATE SKIP LOCKED`를 쓰므로 루프끼리(서버가 여러 대여도) 같은 작업을 동시에 처리하지 않는다.
 //!
 //! 종료 신호(`CancellationToken`)를 받으면 새 작업을 가져오지 않고, 처리 중이던 작업은 끝까지 마친 뒤 멈춘다.
 //!
@@ -10,11 +14,15 @@
 //! |---|---|
 //! | `submit_booking` | 접수한 예약을 업체에 제출한다 (`submit`) |
 //! | `resolve_unknown` | 결과 불명인 예약을 업체에서 조회해 확인한다 (`resolve`) |
+//! | `cancel_booking` | 취소 요청을 받은 예약을 업체에서 취소한다 (`cancel`) |
+//! | `reconcile_provider` | 업체 예약 목록과 우리 예약을 비교한다. 업체마다 하나씩 정기적으로 돈다 (`reconcile`) |
 //!
 //! 작업 하나를 처리하는 동안 `job.<종류>` span을 연다. 이 span은 새 trace의 시작이고, 작업을 등록한 요청의 trace와는
 //! link로 이어진다 (`crate::trace`, docs/05-observability-and-analytics.md §3).
 
 mod backoff;
+mod cancel;
+mod reconcile;
 mod resolve;
 mod submit;
 
@@ -23,7 +31,7 @@ use std::{sync::Arc, time::Duration};
 use db::{
     PgPool,
     bookings::{self, Transitioned},
-    jobs::{self, Job, JobKind, Lease},
+    jobs::{self, ClaimScope, Job, JobKind, Lease},
 };
 use domain::{Booking, BookingEvent, BookingStatus};
 use providers::ProviderError;
@@ -33,13 +41,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Span, field::Empty};
 
 pub use backoff::JobBackoff;
+pub use cancel::decide_cancel;
+pub use reconcile::{Finding, LOOKAHEAD, LOOKBACK, compare};
 pub use resolve::{REQUIRED_NOT_FOUND_CHECKS, decide_resolution};
-pub use submit::{SubmitPayload, decide, decide_lookup};
+pub use submit::{SubmitPayload, UNRECORDED_SEND, decide, decide_lookup};
 
 use crate::{metrics, registry::ProviderRegistry, trace};
 
 /// 워커 이름. `booking_events.actor`에 남는다.
 const ACTOR: &str = "worker";
+/// 워커 lease에 업체 호출 시간 말고도 더 남겨 둘 여유 (작업 가져오기 · 결과 저장 같은 DB 작업).
+/// lease는 `업체 호출 한 번의 최대 시간 + 이 값` 이상이어야 한다 (서버 시작 검사, 정책 변경 검사).
+pub const LEASE_MARGIN: Duration = Duration::from_secs(5);
 /// 미룬 작업을 다시 꺼내기까지 최소한 기다리는 시간 (같은 작업을 너무 자주 꺼내지 않도록)
 const MIN_DEFER: Duration = Duration::from_millis(200);
 /// 미룬 작업들이 같은 순간에 몰려 돌아오지 않도록 더하는 무작위 시간의 최대값
@@ -47,7 +60,7 @@ const DEFER_JITTER: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerConfig {
-    /// 동시에 처리할 작업 수
+    /// 업체 하나당 동시에 처리할 작업 수 (업체마다 이만큼의 루프. 업체 bulkhead 자리 수를 넘으면 그 수로 줄인다)
     pub concurrency: usize,
     /// 할 일이 없을 때 다시 확인하기까지 쉬는 시간
     pub poll_interval: Duration,
@@ -57,6 +70,8 @@ pub struct WorkerConfig {
     pub backoff: JobBackoff,
     /// 결과 불명 예약을 업체에서 찾지 못했을 때, 다시 조회하기까지 기다리는 시간 (docs/03-resilience.md §5)
     pub unknown_recheck_interval: Duration,
+    /// 업체마다 대사를 도는 간격 (docs/03-resilience.md §9)
+    pub reconcile_interval: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -67,6 +82,7 @@ impl Default for WorkerConfig {
             lease: Duration::from_secs(60),
             backoff: JobBackoff::default(),
             unknown_recheck_interval: Duration::from_secs(30),
+            reconcile_interval: Duration::from_secs(600),
         }
     }
 }
@@ -113,12 +129,26 @@ fn defer_if_blocked(error: &ProviderError, now: std::time::Instant) -> Option<De
 }
 
 /// 종료 신호가 올 때까지 워커 루프들을 돌린다.
+///
+/// 업체마다 루프를 `concurrency`개(업체 bulkhead 자리 수를 넘지 않게) 띄우고, 업체 파이프라인이 없는 작업을 맡을 루프를
+/// 하나 더 띄운다. 시작할 때 대사를 지원하는 업체마다 정기 대사 작업이 있는지 확인하고 없으면 등록한다.
 pub async fn run(ctx: WorkerContext, shutdown: CancellationToken) {
+    schedule_reconciliations(&ctx).await;
+
     // JoinSet: 여러 태스크를 띄우고 모두 끝나기를 기다리는 묶음 (≈ C#의 `Task.WhenAll`)
     let mut loops = JoinSet::new();
-    for index in 0..ctx.config.concurrency {
-        loops.spawn(run_loop(ctx.clone(), shutdown.clone(), index));
+    let assigned: Vec<_> = ctx.providers.ids().into_iter().cloned().collect();
+    for provider in ctx.providers.all() {
+        let bulkhead = provider.policy().bulkhead.max_concurrency.max(1) as usize;
+        let count = ctx.config.concurrency.clamp(1, bulkhead);
+        for index in 0..count {
+            let scope = ClaimScope::Provider(provider.id().clone());
+            loops.spawn(run_loop(ctx.clone(), shutdown.clone(), scope, index));
+        }
+        tracing::info!(provider = %provider.id(), loops = count, "업체 워커 루프를 띄운다");
     }
+    let unassigned = ClaimScope::Unassigned(assigned);
+    loops.spawn(run_loop(ctx.clone(), shutdown.clone(), unassigned, 0));
     tracing::info!(concurrency = ctx.config.concurrency, "worker started");
 
     while let Some(result) = loops.join_next().await {
@@ -129,13 +159,46 @@ pub async fn run(ctx: WorkerContext, shutdown: CancellationToken) {
     tracing::info!("worker stopped");
 }
 
-async fn run_loop(ctx: WorkerContext, shutdown: CancellationToken, index: usize) {
+/// 대사를 지원하는 업체마다 정기 대사 작업이 대기 · 실행 중인지 확인하고, 없으면 한 간격 뒤로 등록한다.
+///
+/// 대사 작업은 끝날 때 다음 실행을 스스로 등록한다 (작업 체인). 여기서는 처음 시작할 때나, 작업이 묻혀 사슬이 끊겼을 때 잇는다.
+async fn schedule_reconciliations(ctx: &WorkerContext) {
+    let mut conn = match ctx.pool.acquire().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::error!(%error, "정기 대사 작업을 등록하지 못했다");
+            return;
+        }
+    };
+    for provider in ctx.providers.all() {
+        if !provider.capabilities().list_bookings {
+            continue;
+        }
+        let interval = ctx.config.reconcile_interval;
+        match jobs::schedule_reconcile(&mut conn, provider.id(), interval, None).await {
+            Ok(Some(job_id)) => {
+                tracing::info!(provider = %provider.id(), job_id, "정기 대사 작업을 등록했다");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(provider = %provider.id(), %error, "정기 대사 작업을 등록하지 못했다");
+            }
+        }
+    }
+}
+
+async fn run_loop(
+    ctx: WorkerContext,
+    shutdown: CancellationToken,
+    scope: ClaimScope,
+    index: usize,
+) {
     while !shutdown.is_cancelled() {
-        let idle = match process_next(&ctx).await {
+        let idle = match process_next_in(&ctx, &scope).await {
             Ok(processed) => !processed,
             Err(error) => {
                 // DB가 잠깐 끊기는 등의 오류. 루프는 멈추지 않고 잠시 쉰 뒤 다시 시도한다.
-                tracing::error!(loop_index = index, %error, "작업 처리 중 오류");
+                tracing::error!(loop_index = index, ?scope, %error, "작업 처리 중 오류");
                 true
             }
         };
@@ -149,11 +212,16 @@ async fn run_loop(ctx: WorkerContext, shutdown: CancellationToken, index: usize)
     }
 }
 
-/// 실행할 작업 하나를 가져와 처리한다. 처리할 작업이 없었으면 `Ok(false)`.
+/// 실행할 작업 하나를 (업체를 가리지 않고) 가져와 처리한다. 처리할 작업이 없었으면 `Ok(false)`.
 ///
 /// 테스트는 루프를 돌리지 않고 이 함수를 직접 불러 한 단계씩 확인한다.
 pub async fn process_next(ctx: &WorkerContext) -> Result<bool, WorkerError> {
-    let Some(job) = jobs::claim_next(&ctx.pool, ctx.config.lease).await? else {
+    process_next_in(ctx, &ClaimScope::Any).await
+}
+
+/// `scope`에 맞는 작업 하나를 가져와 처리한다. 처리할 작업이 없었으면 `Ok(false)`.
+pub async fn process_next_in(ctx: &WorkerContext, scope: &ClaimScope) -> Result<bool, WorkerError> {
+    let Some(job) = jobs::claim_next(&ctx.pool, ctx.config.lease, scope).await? else {
         return Ok(false);
     };
     metrics::job_claimed(&job);
@@ -191,6 +259,8 @@ async fn process(ctx: &WorkerContext, job: Job) -> Result<(), WorkerError> {
     match job.kind.parse::<JobKind>() {
         Ok(JobKind::SubmitBooking) => submit::handle(ctx, &job).await,
         Ok(JobKind::ResolveUnknown) => resolve::handle(ctx, &job).await,
+        Ok(JobKind::CancelBooking) => cancel::handle(ctx, &job).await,
+        Ok(JobKind::ReconcileProvider) => reconcile::handle(ctx, &job).await,
         Err(_) => {
             tracing::error!("알 수 없는 작업 종류라 처리하지 않는다");
             record_decision("bury");
@@ -333,22 +403,29 @@ async fn finish(
 }
 
 /// 예약이 이 상태가 되면 이어서 처리할 작업.
-/// `pending`이 되면 업체에 (다시) 제출하고, `unknown`이 되면 업체에서 조회해 확인한다.
-fn follow_up(status: BookingStatus) -> Option<JobKind> {
+/// `pending`이 되면 업체에 (다시) 제출하고, `unknown`이 되면 업체에서 조회해 확인하고, `cancel_requested`가 되면 업체에서 취소한다.
+pub fn follow_up(status: BookingStatus) -> Option<JobKind> {
     match status {
         BookingStatus::Pending => Some(JobKind::SubmitBooking),
         BookingStatus::Unknown => Some(JobKind::ResolveUnknown),
-        // 취소 작업(cancel_booking)은 Phase 6에서 추가한다
+        BookingStatus::CancelRequested => Some(JobKind::CancelBooking),
         BookingStatus::Confirmed
         | BookingStatus::Rejected
         | BookingStatus::Failed
-        | BookingStatus::CancelRequested
         | BookingStatus::Cancelled
         | BookingStatus::CancelFailed => None,
     }
 }
 
-/// 예약을 `failed`로, 작업을 `dead`로 만든다 (한 트랜잭션)
+/// 포기할 때의 사건: 취소 흐름(`cancel_requested`)이면 취소 실패, 아니면 제출 실패
+fn give_up_event(status: BookingStatus, reason: String) -> BookingEvent {
+    match status {
+        BookingStatus::CancelRequested => BookingEvent::CancelGaveUp { reason },
+        _ => BookingEvent::GaveUp { reason },
+    }
+}
+
+/// 예약을 `failed`(취소 흐름이면 `cancel_failed`)로, 작업을 `dead`로 만든다 (한 트랜잭션)
 async fn give_up(
     ctx: &WorkerContext,
     lease: Lease,
@@ -366,7 +443,7 @@ async fn give_up(
         warn_lease_lost();
         return Ok(());
     }
-    let event = BookingEvent::GaveUp { reason };
+    let event = give_up_event(booking.status, reason);
     let transitioned = bookings::transition(
         &mut tx,
         booking.id,

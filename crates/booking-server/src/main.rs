@@ -3,26 +3,30 @@
 //! ```text
 //! booking-server serve [--role all|api|worker]   서버 실행 (기본: API와 워커를 함께)
 //! booking-server create-client --name <이름>      API 클라이언트를 만들고 키 발급
+//! booking-server create-admin --username <이름> --role <viewer|operator|admin>
+//!                                                관리자 계정을 만들고 비밀번호 발급
 //! booking-server openapi                         API 문서(OpenAPI JSON)를 표준 출력으로 (DB 불필요)
 //! ```
-//! `serve`와 `create-client`는 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
+//! `serve` · `create-client` · `create-admin`은 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
 //!
 //! `serve`는 추적 · 메트릭 · 로그를 OpenTelemetry(OTLP)로 내보낸다 (docs/05-observability-and-analytics.md).
 //! 받는 곳은 `OTEL_EXPORTER_OTLP_ENDPOINT`(기본 `http://localhost:4318`)이고, `OTEL_SDK_DISABLED=true`로 끌 수 있다.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anyhow::Context;
 use booking_server::{
     DEFAULT_LOG_FILTER,
+    admin_auth::{self, AdminRole},
     api::{self, ApiState},
     auth,
+    availability::AvailabilityCache,
     chaos::ChaosClient,
     config::Config,
     metrics, recorder,
     registry::ProviderRegistry,
     web,
-    worker::{self, WorkerContext},
+    worker::{self, LEASE_MARGIN, WorkerContext},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use db::PgPool;
@@ -31,9 +35,6 @@ use telemetry::{Export, LogFormat, Settings};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-/// 워커 lease에 업체 호출 시간 말고도 더 남겨 둘 여유 (작업 가져오기 · 결과 저장 같은 DB 작업)
-const LEASE_MARGIN: Duration = Duration::from_secs(5);
 
 /// `#[derive(Parser)]`: 구조체 정의만으로 명령줄 인자 해석과 `--help`를 만들어 준다 (≈ System.CommandLine)
 #[derive(Parser)]
@@ -60,6 +61,15 @@ enum Command {
         /// 클라이언트 이름 (예: mobile-app)
         #[arg(long)]
         name: String,
+    },
+    /// 관리자 웹에 로그인할 계정을 만들고 비밀번호를 발급한다
+    CreateAdmin {
+        /// 로그인 이름 (예: kim)
+        #[arg(long)]
+        username: String,
+        /// 역할: viewer(조회만), operator(재처리 · 서킷 조작 · 장애 주입 · 대사), admin(정책 변경까지)
+        #[arg(long, value_parser = parse_role)]
+        role: AdminRole,
     },
     /// API 문서(OpenAPI JSON)를 표준 출력으로 내보낸다. 관리자 웹의 타입 생성에 쓴다
     /// (`booking-server openapi > web/admin/openapi.json`)
@@ -94,7 +104,9 @@ async fn main() -> anyhow::Result<()> {
         // 서버만 내보낸다. `create-client`처럼 금방 끝나는 명령은 콘솔 로그면 충분하다.
         export: match cli.command {
             Command::Serve { .. } => Export::Otlp,
-            Command::CreateClient { .. } | Command::Openapi => Export::Off,
+            Command::CreateClient { .. } | Command::CreateAdmin { .. } | Command::Openapi => {
+                Export::Off
+            }
         },
     })?;
 
@@ -111,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { role } => serve(&config, pool, role).await,
         Command::CreateClient { name } => create_client(&pool, &name).await,
+        Command::CreateAdmin { username, role } => create_admin(&pool, &username, role).await,
         Command::Openapi => print_openapi(),
     }
 }
@@ -122,6 +135,7 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
     telemetry::register_runtime_metrics();
     // 관리자 API가 볼 업체 파이프라인 (서킷 · rate limit 상태). 워커와 같은 프로세스일 때만 있다.
     let mut runtime: Option<Arc<ProviderRegistry>> = None;
+    let worker_config = config.worker();
 
     if matches!(role, Role::All | Role::Worker) {
         // 업체 호출 기록 채널. 보내는 쪽은 업체 파이프라인마다 나눠 주고, 받는 쪽은 저장 태스크가 쓴다.
@@ -133,7 +147,7 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
 
         // lease가 업체 호출 한 번보다 짧으면, 호출 도중 lease가 끝나 다른 워커가 같은 작업을 다시 가져간다
         // (멱등키 없는 업체라면 이중 예약 위험). 이런 설정 실수는 시작할 때 막는다.
-        let worker_config = config.worker();
+        // 실행 중에 정책을 바꿀 때도 같은 검사를 한다 (관리자 정책 변경 API).
         let needed = registry.longest_call() + LEASE_MARGIN;
         anyhow::ensure!(
             worker_config.lease >= needed,
@@ -192,12 +206,17 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
         if let Some(url) = config.chaos_url() {
             tracing::info!(%url, "관리자 API가 mock 업체의 장애 주입 API를 중계한다 (개발 환경 전용)");
         }
+        // 같은 프로세스에서 워커가 돌 때만 그 lease로 정책 변경을 검사한다
+        let worker_lease = runtime.is_some().then_some(worker_config.lease);
         let state = ApiState {
             pool: pool.clone(),
             // 이 값이 API 쪽에서 업체 파이프라인을 쥐고 있게 된다. API 서버가 멈추면서 놓으므로 종료 순서는 그대로다.
             providers: runtime.take(),
             chaos,
             grafana_url: config.grafana_url(),
+            availability: AvailabilityCache::new(),
+            admin_auth: config.admin_auth(),
+            worker_lease,
         };
         let mut app = api::router(state);
         match web::routes(&config.admin_web_dir) {
@@ -253,6 +272,32 @@ async fn create_client(pool: &PgPool, name: &str) -> anyhow::Result<()> {
     println!("클라이언트를 만들었습니다: {} ({})", client.name, client.id);
     println!("API 키 (다시 볼 수 없으니 지금 저장하세요): {key}");
     Ok(())
+}
+
+/// 관리자 계정을 만든다. 비밀번호는 무작위로 만들어 한 번만 보여 준다 (명령줄 인자로 받지 않는다: 셸 기록에 남는다).
+// 이 명령의 목적은 발급한 비밀번호를 사람에게 보여 주는 것이라 표준 출력을 쓴다 (로그가 아님)
+#[allow(clippy::print_stdout)]
+async fn create_admin(pool: &PgPool, username: &str, role: AdminRole) -> anyhow::Result<()> {
+    let username = username.trim();
+    anyhow::ensure!(
+        !username.is_empty() && username.chars().count() <= 50,
+        "로그인 이름은 공백이 아닌 1~50자여야 합니다"
+    );
+    let password = admin_auth::generate_password();
+    let hash = admin_auth::hash_password(password.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    db::admin::create_user(pool, username, &hash, role.as_str())
+        .await
+        .context("관리자 계정을 만들 수 없습니다 (같은 이름이 이미 있는지 확인하세요)")?;
+
+    println!("관리자 계정을 만들었습니다: {username} ({})", role.as_str());
+    println!("비밀번호 (다시 볼 수 없으니 지금 저장하세요): {password}");
+    Ok(())
+}
+
+fn parse_role(value: &str) -> Result<AdminRole, String> {
+    value.parse()
 }
 
 /// API 문서를 JSON으로 출력한다. 관리자 웹이 이 파일로 TypeScript 타입을 만든다 (docs/06-admin-frontend.md §4).

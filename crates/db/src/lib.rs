@@ -7,12 +7,14 @@
 //! 쓰기 함수는 `&mut PgConnection`을 받는다. 트랜잭션(`Transaction`)도 연결로 바뀌어(`&mut *tx`) 들어갈 수 있어서,
 //! 호출하는 쪽이 여러 함수를 한 트랜잭션으로 묶을 수 있다.
 
+pub mod admin;
 pub mod bookings;
 pub mod clients;
 mod error;
 pub mod jobs;
 pub mod provider_calls;
 pub mod providers;
+pub mod reconciliation;
 
 use std::time::Duration;
 

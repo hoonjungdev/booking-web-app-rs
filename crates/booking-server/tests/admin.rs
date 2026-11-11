@@ -18,9 +18,9 @@ use booking_server::{
     web,
     worker::{self, WorkerConfig, WorkerContext},
 };
-use chrono::{TimeDelta, Utc};
+use chrono::{DurationRound, TimeDelta, Utc};
 use db::{PgPool, provider_calls::NewProviderCall};
-use domain::{BookingId, BookingStatus};
+use domain::{BookingId, BookingStatus, ProviderId};
 use providers::{ProviderBooking, ProviderError};
 use serde_json::{Value, json};
 
@@ -39,7 +39,7 @@ async fn 예약_목록은_최근_것부터_커서로_이어_읽고_고객_정보
         accept_booking(&pool, "k2").await,
         accept_booking(&pool, "k3").await,
     ];
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
 
     let first = get(&app, "/admin/api/bookings?limit=2").await;
     assert_eq!(first.status, StatusCode::OK);
@@ -91,7 +91,7 @@ async fn 예약_상세는_상태_이력과_호출_기록과_작업을_함께_보
         .await
         .unwrap();
 
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
     let reply = get(&app, &format!("/admin/api/bookings/{id}")).await;
     assert_eq!(reply.status, StatusCode::OK);
     let detail = &reply.body;
@@ -143,7 +143,7 @@ async fn 실패한_예약을_재시도하면_dead_작업을_되살리고_업체�
     let dead_job = only_job(&pool, id).await;
     assert_eq!(dead_job.status, "dead");
 
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let reply = post(&app, &format!("/admin/api/bookings/{id}/retry"), None).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
     assert_eq!(reply.body["booking"]["status"], "pending");
@@ -166,8 +166,13 @@ async fn 실패한_예약을_재시도하면_dead_작업을_되살리고_업체�
     let events = db::bookings::events(&pool, id).await.unwrap();
     let last = events.last().unwrap();
     assert_eq!(
-        (last.from_status, last.to_status, last.actor.as_str()),
-        (Some(BookingStatus::Failed), BookingStatus::Pending, "admin")
+        (last.from_status, last.to_status),
+        (Some(BookingStatus::Failed), BookingStatus::Pending)
+    );
+    assert!(
+        last.actor.starts_with("admin:admin-"),
+        "조작한 관리자의 이름이 남는다: {}",
+        last.actor
     );
 
     // 워커는 보내기 전에 업체에서 찾아보고, 이미 있으므로 다시 보내지 않는다
@@ -190,7 +195,7 @@ async fn 재시도한_예약이_업체에_없으면_다시_제출한다(pool: Pg
     let (registry, ctx) = pipeline(&pool, &adapter);
     worker::process_next(&ctx).await.unwrap();
 
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let reply = post(&app, &format!("/admin/api/bookings/{id}/retry"), None).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED);
 
@@ -223,7 +228,7 @@ async fn 기한이_지나_실패한_예약은_재시도할_때_기한을_다시_
         "기한이 지나 업체를 부르지 않았다"
     );
 
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let reply = post(&app, &format!("/admin/api/bookings/{id}/retry"), None).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
     let retried = db::bookings::get(&pool, id).await.unwrap().unwrap();
@@ -254,7 +259,7 @@ async fn 슬롯이_이미_시작한_예약은_재시도할_수_없다(pool: PgPo
         .await
         .unwrap();
 
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
     let reply = post(&app, &format!("/admin/api/bookings/{id}/retry"), None).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert!(reply.body["detail"].as_str().unwrap().contains("슬롯"));
@@ -269,7 +274,7 @@ async fn 슬롯이_이미_시작한_예약은_재시도할_수_없다(pool: PgPo
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn failed가_아닌_예약은_재시도할_수_없다(pool: PgPool) {
     let id = accept_booking(&pool, "k1").await;
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
 
     let reply = post(&app, &format!("/admin/api/bookings/{id}/retry"), None).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
@@ -299,7 +304,7 @@ async fn dead_작업을_다시_넣으면_실패한_예약도_다시_처리된다
     worker::process_next(&ctx).await.unwrap();
     let dead_job = only_job(&pool, id).await;
 
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let dead = get(&app, "/admin/api/jobs?status=dead").await;
     assert_eq!(dead.body["items"][0]["id"], dead_job.id);
     let counts = get(&app, "/admin/api/jobs/counts").await;
@@ -359,7 +364,7 @@ async fn 예약이_처리_중인_채로_묻힌_제출_작업은_업체에서_먼
         Arc::new(FakeAdapter::new(IDEMPOTENT, vec![confirmed("rsv_5")]).with_finds(vec![Ok(None)]));
     let (registry, ctx) = pipeline(&pool, &adapter);
 
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let reply = post(&app, &format!("/admin/api/jobs/{}/requeue", job.id), None).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
     assert_eq!(
@@ -394,7 +399,7 @@ async fn 예약과_상관없이_묻힌_작업은_작업만_되살린다(pool: Pg
         .await
         .unwrap();
 
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
     let reply = post(&app, &format!("/admin/api/jobs/{}/requeue", job.id), None).await;
     assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
     assert_eq!(reply.body["booking"], Value::Null, "예약 상태는 그대로다");
@@ -406,7 +411,7 @@ async fn 예약과_상관없이_묻힌_작업은_작업만_되살린다(pool: Pg
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn 업체_목록과_상세는_정책과_런타임_상태를_보여준다(pool: PgPool) {
-    let without_runtime = admin_app(ApiState::new(pool.clone()));
+    let without_runtime = admin_app(ApiState::new(pool.clone())).await;
     let list = get(&without_runtime, "/admin/api/providers").await;
     assert_eq!(list.body[0]["id"], "alpha");
     assert_eq!(
@@ -424,7 +429,7 @@ async fn 업체_목록과_상세는_정책과_런타임_상태를_보여준다(p
     // (호출 내 재시도 없음, 잘 열리지 않는 서킷)으로 만들었으므로, 서버를 다시 시작해야 DB 값이 반영되는 상황과 같다.
     let adapter = Arc::new(FakeAdapter::new(IDEMPOTENT, vec![]));
     let (registry, _ctx) = pipeline(&pool, &adapter);
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
     let detail = get(&app, "/admin/api/providers/alpha").await;
     assert_eq!(detail.status, StatusCode::OK);
     assert_eq!(detail.body["policy"]["attempt_timeout_ms"], 3000);
@@ -444,7 +449,7 @@ async fn 업체_목록과_상세는_정책과_런타임_상태를_보여준다(p
 async fn 서킷을_강제로_열면_워커가_업체를_부르지_않고_미룬다(pool: PgPool) {
     let adapter = Arc::new(FakeAdapter::new(IDEMPOTENT, vec![confirmed("rsv_1")]));
     let (registry, ctx) = pipeline(&pool, &adapter);
-    let app = admin_app(state_with(&pool, &registry));
+    let app = admin_app(state_with(&pool, &registry)).await;
 
     let opened = post(
         &app,
@@ -489,7 +494,7 @@ async fn 서킷을_강제로_열면_워커가_업체를_부르지_않고_미룬�
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
 
     // 업체 파이프라인이 없는 프로세스(--role api)에서는 조작할 수 없다
-    let without_runtime = admin_app(ApiState::new(pool.clone()));
+    let without_runtime = admin_app(ApiState::new(pool.clone())).await;
     let unavailable = post(
         &without_runtime,
         "/admin/api/providers/alpha/circuit",
@@ -511,7 +516,10 @@ async fn 서킷을_강제로_열면_워커가_업체를_부르지_않고_미룬�
 async fn 통계는_구간을_빠짐없이_채우고_막힌_시도를_지연에서_뺀다(
     pool: PgPool,
 ) {
-    let start = db::normalize_timestamp(Utc::now() - TimeDelta::minutes(30));
+    // 구간(1분) 경계에 맞춘다. 맞추지 않으면 시작 시각의 초가 52초 이후일 때 호출 4건이 두 구간으로 나뉜다
+    let start = (Utc::now() - TimeDelta::minutes(30))
+        .duration_trunc(TimeDelta::minutes(1))
+        .expect("분 단위로 자를 수 있다");
     let calls = vec![
         NewProviderCall {
             started_at: start + TimeDelta::seconds(5),
@@ -533,7 +541,7 @@ async fn 통계는_구간을_빠짐없이_채우고_막힌_시도를_지연에�
     db::provider_calls::insert_batch(&pool, &calls)
         .await
         .unwrap();
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
 
     let from = start.format("%Y-%m-%dT%H:%M:%SZ");
     let to = (start + TimeDelta::minutes(5)).format("%Y-%m-%dT%H:%M:%SZ");
@@ -595,7 +603,7 @@ async fn 끝_시각이_구간_경계_바로_뒤여도_마지막_구간을_빠뜨
         .await
         .unwrap();
 
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
     let reply = get(
         &app,
         "/admin/api/stats/providers/alpha/timeseries?from=2026-11-10T03:00:00Z&to=2026-11-10T03:05:00.500Z&interval=1m",
@@ -618,7 +626,7 @@ async fn 장애_주입_요청을_mock_업체에_중계한다(pool: PgPool) {
         chaos: Some(ChaosClient::new(&mock).expect("클라이언트를 만들 수 있어야 한다")),
         ..ApiState::new(pool.clone())
     };
-    let app = admin_app(state);
+    let app = admin_app(state).await;
 
     let current = get(&app, "/admin/api/chaos/alpha").await;
     assert_eq!(current.status, StatusCode::OK, "{:?}", current.body);
@@ -634,26 +642,12 @@ async fn 장애_주입_요청을_mock_업체에_중계한다(pool: PgPool) {
 
     let mut settings = current.body.clone();
     settings["error"]["probability"] = json!(0.5);
-    let changed = send(
-        &app,
-        Method::PUT,
-        "/admin/api/chaos/alpha",
-        &[],
-        Some(&settings),
-    )
-    .await;
+    let changed = put(&app, "/admin/api/chaos/alpha", &settings).await;
     assert_eq!(changed.status, StatusCode::OK);
     assert_eq!(changed.body["error"]["probability"], 0.5);
 
     settings["slow"]["probability"] = json!(1.5);
-    let rejected = send(
-        &app,
-        Method::PUT,
-        "/admin/api/chaos/alpha",
-        &[],
-        Some(&settings),
-    )
-    .await;
+    let rejected = put(&app, "/admin/api/chaos/alpha", &settings).await;
     assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
     assert!(
         rejected.body["detail"]
@@ -662,13 +656,16 @@ async fn 장애_주입_요청을_mock_업체에_중계한다(pool: PgPool) {
             .contains("slow.probability")
     );
 
-    let unknown_provider = get(&app, "/admin/api/chaos/beta").await;
+    // mock 업체에는 alpha와 beta가 있다
+    let beta = get(&app, "/admin/api/chaos/beta").await;
+    assert_eq!(beta.status, StatusCode::OK, "{:?}", beta.body);
+    let unknown_provider = get(&app, "/admin/api/chaos/gamma").await;
     assert_eq!(unknown_provider.status, StatusCode::NOT_FOUND);
     let unknown_preset = post(&app, "/admin/api/chaos/alpha/preset/meteor", None).await;
     assert_eq!(unknown_preset.status, StatusCode::BAD_REQUEST);
 
     // 설정하지 않았으면 꺼져 있다
-    let disabled = admin_app(ApiState::new(pool.clone()));
+    let disabled = admin_app(ApiState::new(pool.clone())).await;
     let reply = get(&disabled, "/admin/api/chaos/alpha").await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
@@ -689,7 +686,7 @@ async fn 화면_설정은_쓸_수_있는_기능을_알려_준다(pool: PgPool) {
         grafana_url: Some("http://localhost:3000".into()),
         ..state_with(&pool, &registry)
     };
-    let info = get(&admin_app(state), "/admin/api/info").await;
+    let info = get(&admin_app(state).await, "/admin/api/info").await;
     assert_eq!(info.body["grafana_url"], "http://localhost:3000");
     assert_eq!(info.body["chaos_enabled"], false);
     assert_eq!(info.body["provider_runtime"], true);
@@ -697,7 +694,7 @@ async fn 화면_설정은_쓸_수_있는_기능을_알려_준다(pool: PgPool) {
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn api_문서와_swagger_ui를_제공한다(pool: PgPool) {
-    let app = admin_app(ApiState::new(pool.clone()));
+    let app = admin_app(ApiState::new(pool.clone())).await;
     let spec = get(&app, "/openapi.json").await;
     assert_eq!(spec.status, StatusCode::OK);
     assert_eq!(spec.body["openapi"], "3.1.0");
@@ -730,25 +727,25 @@ async fn 관리자_웹은_없는_화면_경로에도_index_html을_돌려주고_
         .merge(web::routes(&dir).expect("index.html이 있으면 화면 경로를 만든다"));
 
     for path in ["/admin/", "/admin", "/admin/bookings/0193"] {
-        let page = get(&app, path).await;
+        let page = get_raw(&app, path).await;
         assert_eq!(page.status, StatusCode::OK, "{path}");
         assert!(page.body.as_str().unwrap().contains("root"), "{path}");
     }
-    let script = get(&app, "/admin/assets/app.js").await;
+    let script = get_raw(&app, "/admin/assets/app.js").await;
     assert!(
         script.headers["content-type"]
             .to_str()
             .unwrap()
             .contains("javascript")
     );
-    let api = get(&app, "/admin/api/info").await;
+    let api = get_raw(&app, "/admin/api/info").await;
     assert_eq!(
         api.body["chaos_enabled"], false,
         "API 경로는 화면 파일보다 먼저 맞는다"
     );
-    let unknown = get(&app, "/admin/api/nope").await;
+    let unknown = get_raw(&app, "/admin/api/nope").await;
     assert_eq!(unknown.status, StatusCode::NOT_FOUND);
-    let root = get(&app, "/").await;
+    let root = get_raw(&app, "/").await;
     assert_eq!(root.status, StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(root.headers["location"], "/admin/");
 
@@ -757,6 +754,396 @@ async fn 관리자_웹은_없는_화면_경로에도_index_html을_돌려주고_
         "빌드 결과가 없으면 화면을 열지 않는다"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ───────────────────────── Phase 6: 로그인 · 권한 ─────────────────────────
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 로그인하면_세션_쿠키를_주고_로그아웃하면_세션이_끝난다(
+    pool: PgPool,
+) {
+    let hash = booking_server::admin_auth::hash_password("correct horse".into())
+        .await
+        .unwrap();
+    db::admin::create_user(&pool, "kim", &hash, "operator")
+        .await
+        .unwrap();
+    let app = api::router(ApiState::new(pool.clone()));
+
+    let login = |username: &'static str, password: &'static str| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                Method::POST,
+                "/admin/api/login",
+                &[],
+                Some(&json!({ "username": username, "password": password })),
+            )
+            .await
+        }
+    };
+    let ok = login("kim", "correct horse").await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+    assert_eq!(ok.body["username"], "kim");
+    assert_eq!(ok.body["role"], "operator");
+    let set_cookie = ok.headers["set-cookie"].to_str().unwrap().to_owned();
+    for part in [
+        "booking_admin_session=",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/admin",
+    ] {
+        assert!(set_cookie.contains(part), "{set_cookie}");
+    }
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+
+    let session = send(
+        &app,
+        Method::GET,
+        "/admin/api/session",
+        &[("cookie", &cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(session.status, StatusCode::OK);
+    assert_eq!(session.body["username"], "kim");
+    let entries = db::admin::audit_log(&pool, None, 10).await.unwrap();
+    assert_eq!(
+        (entries[0].actor.as_str(), entries[0].action.as_str()),
+        ("admin:kim", "admin.login")
+    );
+
+    // 틀린 비밀번호와 없는 계정은 같은 오류다 (계정이 있는지 알려 주지 않는다)
+    let wrong = login("kim", "wrong").await;
+    let nobody = login("nobody", "correct horse").await;
+    for reply in [&wrong, &nobody] {
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            reply.body["type"],
+            "https://booking.local/problems/login-failed"
+        );
+        assert!(reply.headers.get("set-cookie").is_none());
+    }
+
+    let logout = send(
+        &app,
+        Method::POST,
+        "/admin/api/logout",
+        &[("cookie", &cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(logout.status, StatusCode::NO_CONTENT);
+    assert!(
+        logout.headers["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let after = send(
+        &app,
+        Method::GET,
+        "/admin/api/session",
+        &[("cookie", &cookie)],
+        None,
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 로그인하지_않으면_관리자_api를_쓸_수_없고_역할에_따라_조작이_막힌다(
+    pool: PgPool,
+) {
+    let anonymous = api::router(ApiState::new(pool.clone()));
+    for uri in [
+        "/admin/api/bookings",
+        "/admin/api/providers",
+        "/admin/api/audit",
+    ] {
+        let reply = get_raw(&anonymous, uri).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(
+            reply.body["type"],
+            "https://booking.local/problems/login-required"
+        );
+    }
+    // 화면 설정은 로그인 전에도 읽는다 (로그인 화면이 쓴다)
+    assert_eq!(
+        get_raw(&anonymous, "/admin/api/info").await.status,
+        StatusCode::OK
+    );
+
+    let id = accept_booking(&pool, "k1").await;
+    let viewer = as_role(ApiState::new(pool.clone()), "viewer").await;
+    assert_eq!(
+        get(&viewer, "/admin/api/bookings").await.status,
+        StatusCode::OK
+    );
+    for (uri, body) in [
+        (format!("/admin/api/bookings/{id}/retry"), None),
+        (
+            "/admin/api/providers/alpha/circuit".to_owned(),
+            Some(json!({ "action": "reset" })),
+        ),
+        ("/admin/api/providers/alpha/reconcile".to_owned(), None),
+    ] {
+        let reply = post(&viewer, &uri, body.as_ref()).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri}");
+        assert!(reply.body["detail"].as_str().unwrap().contains("operator"));
+    }
+
+    // 정책 변경은 admin만
+    let operator = as_role(ApiState::new(pool.clone()), "operator").await;
+    let policy = get(&operator, "/admin/api/providers/alpha").await.body["policy"].clone();
+    let denied = put(&operator, "/admin/api/providers/alpha/policy", &policy).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert!(denied.body["detail"].as_str().unwrap().contains("admin"));
+}
+
+// ───────────────────────── Phase 6: 정책 실시간 변경 ─────────────────────────
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 정책을_바꾸면_저장하고_실행_중인_파이프라인에_바로_반영한다(
+    pool: PgPool,
+) {
+    let adapter = Arc::new(FakeAdapter::new(IDEMPOTENT, vec![]));
+    let (registry, _ctx) = pipeline(&pool, &adapter);
+    let state = ApiState {
+        worker_lease: Some(Duration::from_secs(60)),
+        ..state_with(&pool, &registry)
+    };
+    let app = admin_app(state).await;
+    let before = get(&app, "/admin/api/providers/alpha").await.body;
+    assert_eq!(before["provider"]["runtime"]["rate_limit_allowed"], 10_000);
+
+    let mut policy = before["policy"].clone();
+    policy["rate_limit"]["per_second"] = json!(3);
+    policy["rate_limit"]["burst"] = json!(2);
+    policy["bulkhead"]["max_concurrency"] = json!(2);
+    policy["availability_cache_ttl_ms"] = json!(5_000);
+    let reply = put(&app, "/admin/api/providers/alpha/policy", &policy).await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(reply.body["policy"], policy);
+    assert_eq!(
+        reply.body["restart_required"], false,
+        "DB와 실행 중인 정책이 같다"
+    );
+    let runtime = &reply.body["provider"]["runtime"];
+    assert_eq!(runtime["rate_limit_allowed"], 3);
+    assert_eq!(runtime["rate_limit_ceiling"], 3);
+    assert_eq!(runtime["limiter_burst"], 2);
+    assert_eq!(runtime["max_concurrency"], 2);
+
+    // 파이프라인과 DB 모두 바뀌었다
+    let alpha = registry.get(&ProviderId::parse("alpha").unwrap()).unwrap();
+    assert_eq!(alpha.policy().rate_limit.per_second, 3);
+    let stored = db::providers::find(&pool, &ProviderId::parse("alpha").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.policy["rate_limit"]["per_second"], 3);
+    let audit = get(&app, "/admin/api/audit").await;
+    let entry = &audit.body["items"][0];
+    assert_eq!(entry["action"], "provider.policy.update");
+    assert_eq!(entry["target"], "alpha");
+    assert_eq!(entry["detail"]["after"]["rate_limit"]["per_second"], 3);
+    assert!(entry["actor"].as_str().unwrap().starts_with("admin:"));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 동작할_수_없거나_lease보다_긴_호출이_되는_정책은_거절한다(
+    pool: PgPool,
+) {
+    let adapter = Arc::new(FakeAdapter::new(IDEMPOTENT, vec![]));
+    let (registry, _ctx) = pipeline(&pool, &adapter);
+    let state = ApiState {
+        worker_lease: Some(Duration::from_secs(60)),
+        ..state_with(&pool, &registry)
+    };
+    let app = admin_app(state).await;
+    let policy = get(&app, "/admin/api/providers/alpha").await.body["policy"].clone();
+
+    let mut broken = policy.clone();
+    broken["circuit_breaker"]["failure_rate"] = json!(2.0);
+    let reply = put(&app, "/admin/api/providers/alpha/policy", &broken).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("failure_rate")
+    );
+
+    // 호출 한 번이 최대 59초 + 대기 → lease 60초 - 여유 5초를 넘는다
+    let mut too_long = policy.clone();
+    too_long["call_budget_ms"] = json!(59_000);
+    let reply = put(&app, "/admin/api/providers/alpha/policy", &too_long).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply.body["detail"].as_str().unwrap().contains("lease"),
+        "{:?}",
+        reply.body
+    );
+
+    let mut unknown_field = policy.clone();
+    unknown_field["surprise"] = json!(1);
+    let reply = put(&app, "/admin/api/providers/alpha/policy", &unknown_field).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+
+    let missing = put(&app, "/admin/api/providers/nope/policy", &policy).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    // 아무것도 바뀌지 않았다
+    let alpha = registry.get(&ProviderId::parse("alpha").unwrap()).unwrap();
+    assert_eq!(alpha.policy().call_budget_ms, 15_000);
+}
+
+// ───────────────────────── Phase 6: 대사 이슈 ─────────────────────────
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 대사_이슈를_보고_처리_완료로_표시한다(pool: PgPool) {
+    use db::reconciliation::{IssueKind, NewIssue};
+    let mut conn = pool.acquire().await.unwrap();
+    let mut ids = Vec::new();
+    for (kind, resolved_by) in [
+        (IssueKind::DuplicateSuspected, None),
+        (IssueKind::MissingAtProvider, None),
+        (IssueKind::StatusMismatch, Some("reconciler")),
+    ] {
+        let issue = NewIssue {
+            provider_id: ProviderId::parse("alpha").unwrap(),
+            booking_id: Some(BookingId::from_uuid(uuid::Uuid::now_v7())),
+            provider_booking_id: Some("rsv_1".into()),
+            kind,
+            detail: json!({ "ours": "confirmed" }),
+            resolved_by: resolved_by.map(str::to_owned),
+        };
+        ids.push(
+            db::reconciliation::record(&mut conn, &issue)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let app = admin_app(ApiState::new(pool.clone())).await;
+
+    let open = get(&app, "/admin/api/reconciliation/issues").await;
+    assert_eq!(open.status, StatusCode::OK, "{:?}", open.body);
+    let kinds: Vec<_> = open.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|issue| issue["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["missing_at_provider", "duplicate_suspected"],
+        "미해결만, 최근 것부터"
+    );
+    let fixed = get(&app, "/admin/api/reconciliation/issues?resolved=true").await;
+    assert_eq!(fixed.body["items"][0]["resolved_by"], "reconciler");
+    let counts = get(&app, "/admin/api/reconciliation/counts").await;
+    assert_eq!(counts.body["open"], 2);
+    assert_eq!(counts.body["by_kind"]["duplicate_suspected"], 1);
+    assert_eq!(counts.body["by_kind"]["missing_locally"], 0);
+
+    let resolved = post(
+        &app,
+        &format!("/admin/api/reconciliation/issues/{}/resolve", ids[0]),
+        None,
+    )
+    .await;
+    assert_eq!(resolved.status, StatusCode::OK, "{:?}", resolved.body);
+    assert!(
+        resolved.body["resolved_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("admin:")
+    );
+    assert!(resolved.body["resolved_at"].is_string());
+    let again = post(
+        &app,
+        &format!("/admin/api/reconciliation/issues/{}/resolve", ids[0]),
+        None,
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+    let missing = post(
+        &app,
+        "/admin/api/reconciliation/issues/999999/resolve",
+        None,
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        get(&app, "/admin/api/reconciliation/counts").await.body["open"],
+        1
+    );
+    let bad = get(&app, "/admin/api/reconciliation/issues?kind=nope").await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 지금_대사를_돌리면_대사_작업을_당겨_오고_하나만_둔다(pool: PgPool) {
+    let app = admin_app(ApiState::new(pool.clone())).await;
+    let first = post(&app, "/admin/api/providers/beta/reconcile", None).await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{:?}", first.body);
+    assert_eq!(first.body["kind"], "reconcile_provider");
+    assert_eq!(first.body["provider"], "beta");
+    assert_eq!(first.body["status"], "queued");
+    let again = post(&app, "/admin/api/providers/beta/reconcile", None).await;
+    assert_eq!(
+        again.body["id"], first.body["id"],
+        "업체마다 대사 작업은 하나뿐이다"
+    );
+    let missing = post(&app, "/admin/api/providers/nope/reconcile", None).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 포기한_대사_작업을_다시_넣으면_그_업체의_대사를_지금_돌린다(
+    pool: PgPool,
+) {
+    // 대사 작업은 포기할(dead) 때 같은 트랜잭션에서 다음 정기 대사를 등록한다. 그래서 dead 행 옆에 대기 중인 대사 작업이 늘 있다
+    let beta = ProviderId::parse("beta").expect("업체 ID");
+    let mut conn = pool.acquire().await.expect("DB 연결");
+    let dead = db::jobs::schedule_reconcile(&mut conn, &beta, Duration::ZERO, None)
+        .await
+        .expect("대사 등록")
+        .expect("새 대사 작업");
+    sqlx::query("UPDATE jobs SET status = 'dead', last_error = 'reconcile_failed' WHERE id = $1")
+        .bind(dead)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = db::jobs::schedule_reconcile(&mut conn, &beta, Duration::from_secs(600), None)
+        .await
+        .expect("대사 등록")
+        .expect("다음 대사 작업");
+
+    let app = admin_app(ApiState::new(pool.clone())).await;
+    let reply = post(&app, &format!("/admin/api/jobs/{dead}/requeue"), None).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
+    assert_eq!(
+        reply.body["job"]["id"], next,
+        "업체마다 하나뿐인 대사 작업을 지금으로 당긴다"
+    );
+    assert_eq!(reply.body["job"]["status"], "queued");
+    let (pulled,): (bool,) = sqlx::query_as("SELECT run_at <= now() FROM jobs WHERE id = $1")
+        .bind(next)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(pulled, "다음 정기 대사를 기다리지 않는다");
+    let closed = db::jobs::get(&mut conn, dead)
+        .await
+        .unwrap()
+        .expect("포기한 대사 작업");
+    assert_eq!(
+        closed.status, "done",
+        "포기한 행은 정리해 dead 알림이 그친다"
+    );
 }
 
 // ───────────────────────── 준비 코드 ─────────────────────────
@@ -804,16 +1191,62 @@ fn state_with(pool: &PgPool, registry: &Arc<ProviderRegistry>) -> ApiState {
     }
 }
 
-fn admin_app(state: ApiState) -> Router {
-    api::router(state)
+/// 관리자 API를 부르는 테스트 클라이언트: 라우터 + 로그인 세션 쿠키
+struct Admin {
+    app: Router,
+    cookie: String,
 }
 
-async fn get(app: &Router, uri: &str) -> common::Reply {
+/// admin 역할(모든 권한)로 로그인한 테스트 클라이언트
+async fn admin_app(state: ApiState) -> Admin {
+    as_role(state, "admin").await
+}
+
+/// 주어진 역할로 로그인한 테스트 클라이언트
+async fn as_role(state: ApiState, role: &str) -> Admin {
+    let cookie = common::admin_cookie(&state.pool, role).await;
+    Admin {
+        app: api::router(state),
+        cookie,
+    }
+}
+
+async fn get(admin: &Admin, uri: &str) -> common::Reply {
+    send(
+        &admin.app,
+        Method::GET,
+        uri,
+        &[("cookie", &admin.cookie)],
+        None,
+    )
+    .await
+}
+
+async fn post(admin: &Admin, uri: &str, body: Option<&Value>) -> common::Reply {
+    send(
+        &admin.app,
+        Method::POST,
+        uri,
+        &[("cookie", &admin.cookie)],
+        body,
+    )
+    .await
+}
+
+async fn put(admin: &Admin, uri: &str, body: &Value) -> common::Reply {
+    send(
+        &admin.app,
+        Method::PUT,
+        uri,
+        &[("cookie", &admin.cookie)],
+        Some(body),
+    )
+    .await
+}
+
+/// 로그인 없이 라우터를 직접 부른다 (공개 경로 · 정적 파일)
+async fn get_raw(app: &Router, uri: &str) -> common::Reply {
     send(app, Method::GET, uri, &[], None).await
-}
-
-async fn post(app: &Router, uri: &str, body: Option<&Value>) -> common::Reply {
-    send(app, Method::POST, uri, &[], body).await
 }
 
 fn item_ids(page: &Value) -> Vec<BookingId> {

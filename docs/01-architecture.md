@@ -47,11 +47,11 @@ flowchart LR
 | 구성 요소 | 책임 |
 |---|---|
 | API 계층 | 요청 검증, 인증, 멱등성 처리, 예약 저장과 작업 등록(한 트랜잭션), 조회 |
-| 워커 | `jobs` 테이블에서 할 일을 꺼내 업체를 호출하고, 결과에 따라 예약 상태를 바꾸고, 실패하면 다시 예약 |
+| 워커 | `jobs` 테이블에서 할 일을 꺼내 업체를 호출하고, 결과에 따라 예약 상태를 바꾸고, 실패하면 다시 예약. 업체마다 루프를 따로 둬 한 업체가 느려도 다른 업체 작업이 밀리지 않는다 ([D-30](decisions.md#d-30-워커는-업체마다-루프를-따로-두고-작업에-업체를-적는다-jobsprovider_id)). 업체마다 정기적으로 대사를 돈다 |
 | Provider 계층 | 업체별 API 차이를 숨기는 **어댑터**, 그 바깥을 감싸는 **장애 대응 파이프라인**(타임아웃 · 재시도 · rate limit · 서킷 브레이커 · bulkhead), 호출 기록 |
 | mock-provider | 성격이 다른 가짜 업체 2개(alpha, beta)와 장애 주입 API |
-| 관리자 웹 | 대시보드, 예약 · 작업 조회와 재처리, 업체 정책 편집, 장애 주입 제어 |
-| PostgreSQL | 예약, 상태 이력, 작업 큐, 업체 호출 기록 |
+| 관리자 웹 | 대시보드, 예약 · 작업 조회와 재처리, 업체 정책 편집, 대사 이슈 확인, 장애 주입 제어, 감사 로그. 로그인과 역할별 권한 |
+| PostgreSQL | 예약, 상태 이력, 작업 큐, 업체 호출 기록, 대사 이슈, 관리자 계정 · 세션 · 감사 로그 |
 | Grafana LGTM | 추적(Tempo), 메트릭(Prometheus), 로그(Loki), 대시보드(Grafana) |
 
 ## 4. 핵심 흐름: 예약 생성
@@ -149,6 +149,7 @@ mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업
 | 설정 | figment (파일 + 환경 변수) | IConfiguration + IOptions |
 | 런타임 설정 교체 | arc-swap | IOptionsMonitor |
 | 캐시 | moka | IMemoryCache |
+| 비밀번호 해시 | argon2 (argon2id) | ASP.NET Core Identity의 `PasswordHasher` (PBKDF2) |
 | 로그 · 추적 | tracing + opentelemetry | ILogger + Activity (System.Diagnostics) |
 | API 문서 | utoipa + Swagger UI | Swashbuckle / NSwag |
 | 에러 타입 | thiserror(라이브러리), anyhow(실행 파일) | 커스텀 Exception 계층 |
@@ -193,3 +194,10 @@ mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업
 | 예외 필터에서 `FormatException` → 400 | `impl From<QueryRejection> for ApiError` + `?` | `?`는 에러를 돌려주기 전에 `From`으로 함수의 에러 타입에 맞게 바꾼다 |
 | `SortedDictionary<K, V>` | `BTreeMap<K, V>` | 키 순서로 정렬된 맵 (통계 구간 채우기, 종류별 개수) |
 | `UPDLOCK` 힌트, `SELECT … FOR UPDATE` | sqlx로 `SELECT … FOR UPDATE` | 트랜잭션이 끝날 때까지 그 행을 다른 곳에서 바꾸지 못하게 잠근다 (관리자 재시도) |
+| `IOptionsMonitor<T>.CurrentValue` | `ArcSwap<T>` (arc-swap) | 잠금 없이 읽고, 바꿀 때는 새 값으로 통째로 교체한다. `load_full()`로 받은 `Arc`는 그 뒤에 교체되어도 그대로라, 호출 하나가 시작할 때의 정책을 끝까지 쓴다 (업체 정책, D-34) |
+| `Task.Run(() => CPU 작업)` | `tokio::task::spawn_blocking` | 오래 걸리는 CPU 작업(argon2 비밀번호 해시)을 블로킹 작업용 스레드에서 돌린다. async 태스크에서 그대로 돌리면 그 스레드의 다른 요청이 멈춘다 |
+| `IMemoryCache` + 만료 시간 | moka `Cache` | 빈 시간 캐시. `time_to_live`가 지난 항목을 알아서 지운다 |
+| `[Authorize(Roles = "...")]` | axum 추출기(`FromRequestParts`)를 구현한 타입 | 핸들러 매개변수에 `RequireOperator`를 두면 axum이 핸들러를 부르기 전에 권한을 확인한다. 실패하면 핸들러는 실행되지 않는다 |
+| enum 값끼리 크기 비교 (`role >= Role.Operator`) | `#[derive(PartialOrd, Ord)]`를 붙인 enum | 선언한 순서대로 크기가 정해진다 (`Viewer < Operator < Admin`) |
+| `Task.WhenAll(tasks)` | `tokio::task::JoinSet` | 업체별 워커 루프를 띄우고 모두 끝나기를 기다린다 |
+| SQL Server의 필터된 유니크 인덱스(`WHERE`가 붙은 인덱스) + 중복 키 예외 처리 | PostgreSQL 부분 유니크 인덱스 + `INSERT … ON CONFLICT … DO NOTHING` | 예외 없이 "이미 있으면 넣지 않는다". "업체마다 대사 작업 하나", "같은 미해결 이슈는 하나"를 DB가 지킨다 |

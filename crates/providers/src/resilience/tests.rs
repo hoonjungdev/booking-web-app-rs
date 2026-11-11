@@ -32,6 +32,7 @@ struct Scripted {
     capabilities: Capabilities,
     creates: Mutex<VecDeque<Step<ProviderBooking>>>,
     finds: Mutex<VecDeque<Step<Option<ProviderBooking>>>>,
+    cancels: Mutex<VecDeque<Step<()>>>,
     calls: AtomicUsize,
 }
 
@@ -41,6 +42,7 @@ impl Scripted {
             capabilities,
             creates: Mutex::new(VecDeque::new()),
             finds: Mutex::new(VecDeque::new()),
+            cancels: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
         }
     }
@@ -52,6 +54,11 @@ impl Scripted {
 
     fn find(self, result: Result<Option<ProviderBooking>, ProviderError>) -> Self {
         lock(&self.finds).push_back((Duration::ZERO, result.into()));
+        self
+    }
+
+    fn cancel(self, result: Result<(), ProviderError>) -> Self {
+        lock(&self.cancels).push_back((Duration::ZERO, result.into()));
         self
     }
 
@@ -87,6 +94,13 @@ impl ProviderAdapter for Scripted {
         tokio::time::sleep(delay).await;
         reply
     }
+
+    async fn cancel_booking(&self, _provider_booking_id: &str) -> AdapterReply<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (delay, reply) = lock(&self.cancels).pop_front().unwrap_or_else(exhausted);
+        tokio::time::sleep(delay).await;
+        reply
+    }
 }
 
 fn booked(id: &str) -> Result<ProviderBooking, ProviderError> {
@@ -109,6 +123,7 @@ fn fast_policy() -> ProviderPolicy {
             per_second: 1_000,
             burst: 1_000,
             max_wait_ms: 100,
+            ..RateLimitPolicy::default()
         },
         bulkhead: crate::BulkheadPolicy {
             max_concurrency: 8,
@@ -119,6 +134,7 @@ fn fast_policy() -> ProviderPolicy {
             min_calls: 100,
             ..Default::default()
         },
+        ..ProviderPolicy::default()
     }
 }
 
@@ -401,6 +417,7 @@ async fn rate_limiter_토큰을_기다릴_수_없으면_호출하지_않는다()
             per_second: 1,
             burst: 1,
             max_wait_ms: 50,
+            ..RateLimitPolicy::default()
         },
         ..fast_policy()
     };
@@ -436,6 +453,7 @@ async fn rate_limiter는_짧은_대기는_기다렸다가_보낸다() {
             per_second: 10,
             burst: 1,
             max_wait_ms: 500,
+            ..RateLimitPolicy::default()
         },
         ..fast_policy()
     };
@@ -641,6 +659,7 @@ async fn limiter_여유는_토큰을_쓰면_줄고_시간이_지나면_다시_�
             per_second: 10,
             burst: 3,
             max_wait_ms: 50,
+            ..RateLimitPolicy::default()
         },
         ..fast_policy()
     };
@@ -706,4 +725,210 @@ fn 런타임_상태는_정책의_크기를_함께_알려_준다() {
     assert_eq!(status.paused_until, None);
     assert_eq!(status.rate_limit_remaining, None);
     assert_eq!(status.circuit.state, CircuitState::Closed);
+}
+
+// ───────────────────────── Phase 6: 취소, AIMD, 정책 실시간 변경 ─────────────────────────
+
+#[tokio::test]
+async fn 취소는_멱등키가_없어도_결과를_모르는_실패_뒤에_다시_보낸다() {
+    // 이미 취소된 예약을 다시 취소해도 결과가 같으므로 (어댑터가 "이미 취소됨"을 성공으로 분류) 안전하다
+    let adapter = Scripted::new(NOT_IDEMPOTENT)
+        .cancel(Err(ProviderError::Timeout))
+        .cancel(Ok(()));
+    let (provider, adapter, mut records) = provider(adapter, fast_policy());
+
+    let result = provider
+        .cancel_booking("rsv_1", CallContext::default())
+        .await;
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(adapter.calls(), 2);
+    let operations: Vec<_> = std::iter::from_fn(|| records.try_recv().ok())
+        .map(|record| (record.operation, record.outcome))
+        .collect();
+    assert_eq!(
+        operations,
+        vec![("cancel_booking", "timeout"), ("cancel_booking", "success")]
+    );
+}
+
+#[tokio::test]
+async fn 업체가_한도_초과를_알리면_허용_속도를_절반으로_줄인다() {
+    let adapter = Scripted::new(IDEMPOTENT).create(
+        MS,
+        Err(ProviderError::RateLimited {
+            retry_after: Some(Duration::from_secs(5)),
+        }),
+    );
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 10,
+            burst: 4,
+            max_wait_ms: 100,
+            adaptive: true,
+        },
+        ..fast_policy()
+    };
+    let (provider, _adapter, _records) = provider(adapter, policy);
+    assert_eq!(provider.rate_limit_allowed(), 10);
+
+    let result = provider
+        .create_booking(&request(), CallContext::default())
+        .await;
+    assert!(matches!(result, Err(ProviderError::RateLimited { .. })));
+
+    let status = provider.runtime_status();
+    assert_eq!(
+        (status.rate_limit_allowed, status.rate_limit_ceiling),
+        (5, 10)
+    );
+    assert_eq!(status.limiter_burst, 2, "버킷도 같은 비율로 줄인다");
+}
+
+#[tokio::test]
+async fn 적응형_조절을_끄면_한도_초과에도_속도를_바꾸지_않는다() {
+    let adapter = Scripted::new(IDEMPOTENT).create(
+        MS,
+        Err(ProviderError::RateLimited {
+            retry_after: Some(Duration::from_secs(5)),
+        }),
+    );
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 10,
+            burst: 4,
+            max_wait_ms: 100,
+            adaptive: false,
+        },
+        ..fast_policy()
+    };
+    let (provider, _adapter, _records) = provider(adapter, policy);
+    let _ = provider
+        .create_booking(&request(), CallContext::default())
+        .await;
+    assert_eq!(provider.rate_limit_allowed(), 10);
+}
+
+#[tokio::test]
+async fn 정책을_바꾸면_다음_호출부터_새_정책을_쓴다() {
+    let adapter = Scripted::new(IDEMPOTENT)
+        .create(MS, booked("rsv_1"))
+        .create(MS, booked("rsv_2"))
+        .create(MS, booked("rsv_3"));
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 1,
+            burst: 1,
+            max_wait_ms: 50,
+            adaptive: true,
+        },
+        ..fast_policy()
+    };
+    let (provider, adapter, _records) = provider(adapter, policy.clone());
+
+    provider
+        .create_booking(&request(), CallContext::default())
+        .await
+        .unwrap();
+    // 초당 1개라 바로 다음 호출은 토큰을 기다리다 포기한다
+    let throttled = provider
+        .create_booking(&request(), CallContext::default())
+        .await;
+    assert!(matches!(throttled, Err(ProviderError::Throttled { .. })));
+
+    // 관리자가 속도를 올리면 새 limiter(가득 찬 버킷)로 바로 부를 수 있다
+    let faster = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 100,
+            burst: 10,
+            ..policy.rate_limit
+        },
+        bulkhead: crate::BulkheadPolicy {
+            max_concurrency: 3,
+            ..policy.bulkhead
+        },
+        ..policy
+    };
+    provider.update_policy(faster.clone());
+    assert_eq!(*provider.policy(), faster);
+    provider
+        .create_booking(&request(), CallContext::default())
+        .await
+        .unwrap();
+    provider
+        .create_booking(&request(), CallContext::default())
+        .await
+        .unwrap();
+    assert_eq!(adapter.calls(), 3);
+
+    let status = provider.runtime_status();
+    assert_eq!(status.max_concurrency, 3);
+    assert_eq!(status.rate_limit_allowed, 100);
+    assert_eq!(status.limiter_burst, 10);
+}
+
+#[tokio::test]
+async fn 정책을_바꿔도_진행_중인_호출은_시작할_때의_정책으로_끝난다() {
+    // 첫 시도가 503 → 재시도 1회 허용 정책. 첫 시도가 도는 동안 재시도를 끈 정책으로 바꾼다.
+    let adapter = Scripted::new(IDEMPOTENT)
+        .create(100 * MS, Err(ProviderError::Server { status: 503 }))
+        .create(MS, booked("rsv_1"));
+    let policy = ProviderPolicy {
+        retry: crate::RetryPolicy {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        },
+        ..fast_policy()
+    };
+    let (provider, adapter, _records) = provider(adapter, policy.clone());
+
+    let request = request();
+    let (result, ()) = tokio::join!(
+        provider.create_booking(&request, CallContext::default()),
+        async {
+            tokio::time::sleep(20 * MS).await;
+            provider.update_policy(ProviderPolicy {
+                retry: crate::RetryPolicy {
+                    max_attempts: 1,
+                    ..policy.retry
+                },
+                ..policy.clone()
+            });
+        }
+    );
+
+    assert_eq!(result, booked("rsv_1"), "시작할 때의 정책대로 재시도했다");
+    assert_eq!(adapter.calls(), 2);
+    assert_eq!(provider.policy().retry.max_attempts, 1);
+}
+
+#[tokio::test]
+async fn 토큰이_절반_넘게_남아_있을_때만_여유가_있다고_본다() {
+    let adapter = Scripted::new(IDEMPOTENT)
+        .create(MS, booked("rsv_1"))
+        .create(MS, booked("rsv_2"))
+        .create(MS, booked("rsv_3"));
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 1,
+            burst: 4,
+            max_wait_ms: 50,
+            adaptive: false,
+        },
+        ..fast_policy()
+    };
+    let (provider, _adapter, _records) = provider(adapter, policy);
+    assert!(provider.has_spare_capacity(), "4 / 4");
+
+    provider
+        .create_booking(&request(), CallContext::default())
+        .await
+        .unwrap();
+    assert!(provider.has_spare_capacity(), "3 / 4");
+    provider
+        .create_booking(&request(), CallContext::default())
+        .await
+        .unwrap();
+    assert!(!provider.has_spare_capacity(), "2 / 4는 절반을 넘지 않는다");
 }

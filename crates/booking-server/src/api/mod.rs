@@ -12,8 +12,9 @@ mod bookings;
 mod docs;
 mod error;
 mod health;
+mod providers;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{Router, routing::get};
 use db::PgPool;
@@ -25,7 +26,10 @@ use utoipa_swagger_ui::SwaggerUi;
 pub use bookings::BookingResponse;
 pub use error::{ApiError, Problem};
 
-use crate::{chaos::ChaosClient, registry::ProviderRegistry};
+use crate::{
+    admin_auth::AdminAuthConfig, availability::AvailabilityCache, chaos::ChaosClient,
+    registry::ProviderRegistry,
+};
 
 /// API 핸들러가 공유하는 상태 (≈ ASP.NET Core에서 DI 컨테이너에 등록한 서비스들. 여기서는 명시적인 구조체다)
 ///
@@ -41,6 +45,13 @@ pub struct ApiState {
     pub chaos: Option<ChaosClient>,
     /// 관리자 화면의 trace 링크에 쓸 Grafana 주소
     pub grafana_url: Option<String>,
+    /// 빈 시간 조회 캐시 (TTL + stale-if-error)
+    pub availability: AvailabilityCache,
+    /// 관리자 로그인 세션 설정 (유지 시간, 쿠키의 `Secure`)
+    pub admin_auth: AdminAuthConfig,
+    /// 같은 프로세스에서 도는 워커의 lease. 정책을 바꿀 때 업체 호출 한 번이 lease보다 길어지지 않는지 검사한다
+    /// (길면 호출 도중 다른 워커가 같은 작업을 가져간다). 워커가 없는 프로세스(`--role api`)면 `None`.
+    pub worker_lease: Option<Duration>,
 }
 
 impl ApiState {
@@ -51,6 +62,9 @@ impl ApiState {
             providers: None,
             chaos: None,
             grafana_url: None,
+            availability: AvailabilityCache::new(),
+            admin_auth: AdminAuthConfig::default(),
+            worker_lease: None,
         }
     }
 }
@@ -60,6 +74,9 @@ fn documented_routes() -> OpenApiRouter<ApiState> {
     OpenApiRouter::with_openapi(docs::ApiDoc::openapi())
         .routes(routes!(bookings::create))
         .routes(routes!(bookings::get))
+        .routes(routes!(bookings::cancel))
+        .routes(routes!(providers::list_providers))
+        .routes(routes!(providers::availability))
         .nest("/admin/api", admin::routes())
 }
 

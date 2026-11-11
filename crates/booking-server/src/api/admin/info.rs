@@ -6,7 +6,8 @@ use utoipa::ToSchema;
 
 use crate::api::{ApiState, docs::tags};
 
-/// 관리자 화면 설정. 화면이 처음 열릴 때 읽어, 쓸 수 없는 기능은 숨기거나 이유를 보여 준다.
+/// 관리자 화면 설정. 화면이 처음 열릴 때(로그인 전에도) 읽어, 쓸 수 없는 기능은 숨기거나 이유를 보여 준다.
+/// 비밀이 아닌 값만 담는다.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AdminInfo {
     /// 서버 버전

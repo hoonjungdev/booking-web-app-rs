@@ -79,7 +79,8 @@ impl BookingStatus {
             (Self::Pending, E::ProviderRejected { .. }) => Self::Rejected,
             (Self::Pending, E::OutcomeUnknown { .. }) => Self::Unknown,
             (Self::Pending | Self::Unknown, E::GaveUp { .. }) => Self::Failed,
-            (Self::Unknown, E::FoundAtProvider { .. }) => Self::Confirmed,
+            // 실패한 예약도 대사(reconciliation)가 업체에서 확정된 것을 찾으면 확정으로 바로잡는다 (Phase 6)
+            (Self::Unknown | Self::Failed, E::FoundAtProvider { .. }) => Self::Confirmed,
             (Self::Unknown, E::NotFoundAtProvider) => Self::Pending,
             (Self::Failed, E::AdminRetry) => Self::Pending,
             (Self::Confirmed, E::CancelRequested) => Self::CancelRequested,
@@ -128,6 +129,8 @@ pub enum RejectReason {
     SlotUnavailable,
     /// 업체에 없는 자원(매장 등)
     ResourceNotFound,
+    /// 업체에 그 예약이 없음 (취소하려는 예약을 업체가 모른다)
+    BookingNotFound,
     /// 업체가 요청 내용을 받아들이지 않음. `code`는 업체가 준 에러 코드
     InvalidRequest { code: String },
 }
@@ -138,6 +141,7 @@ impl RejectReason {
         match self {
             Self::SlotUnavailable => "slot_unavailable".to_owned(),
             Self::ResourceNotFound => "resource_not_found".to_owned(),
+            Self::BookingNotFound => "booking_not_found".to_owned(),
             Self::InvalidRequest { code } => format!("invalid_request:{code}"),
         }
     }
@@ -156,7 +160,7 @@ pub enum BookingEvent {
     OutcomeUnknown { detail: String },
     /// 기술적 실패로 포기함 (재시도 소진, 기한 초과 등)
     GaveUp { reason: String },
-    /// 결과 불명이던 예약을 업체에서 찾음
+    /// 결과 불명이거나 실패로 끝난 예약을 업체에서 찾음 (결과 불명 확인 작업, 대사)
     FoundAtProvider { provider_booking_id: String },
     /// 결과 불명이던 예약이 업체에 없음 → 다시 제출
     NotFoundAtProvider,
@@ -300,6 +304,7 @@ mod tests {
             (S::Unknown, "not_found_at_provider", S::Pending),
             (S::Unknown, "gave_up", S::Failed),
             (S::Failed, "admin_retry", S::Pending),
+            (S::Failed, "found_at_provider", S::Confirmed),
             (S::Confirmed, "cancel_requested", S::CancelRequested),
             (S::Confirmed, "cancelled_externally", S::Cancelled),
             (S::CancelRequested, "cancel_confirmed", S::Cancelled),
@@ -331,7 +336,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(allowed, 13, "전이표의 13개 전이가 모두 검사되어야 한다");
+        assert_eq!(allowed, 14, "전이표의 14개 전이가 모두 검사되어야 한다");
     }
 
     #[test]

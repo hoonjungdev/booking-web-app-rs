@@ -27,6 +27,7 @@ stateDiagram-v2
   unknown --> pending: 조회 결과 없음 → 재제출
   unknown --> failed: 조회도 계속 실패
   failed --> pending: 관리자 재시도
+  failed --> confirmed: 대사에서 업체 확정 발견 (Phase 6)
   confirmed --> cancel_requested: 취소 요청
   confirmed --> cancelled: 대사에서 업체측 취소 발견
   cancel_requested --> cancelled: 업체 취소 완료
@@ -46,6 +47,8 @@ stateDiagram-v2
 | `cancel_requested` | 취소 요청 접수. 업체 취소 진행 중 | |
 | `cancelled` | 취소 완료 | ✅ |
 | `cancel_failed` | 취소 재시도 소진. 관리자 개입 필요 | 관리자 대기 |
+
+`failed --> confirmed`는 Phase 6에서 추가했다. 결과 불명이었다가 조회도 실패해 포기한 예약이 실제로는 업체에 만들어져 있을 수 있는데, 대사가 그런 예약을 업체 목록에서 찾으면(`FoundAtProvider`) 확정으로 바로잡는다 ([03 §9](03-resilience.md#9-대사-reconciliation)). 전이는 모두 14개다.
 
 규칙:
 - 취소는 `confirmed` 상태에서만 받는다. `pending`이나 `unknown`에서 취소 요청이 오면 `409`를 돌려준다. 처리 중인 예약을 취소하면 경쟁 상태가 복잡해지므로 1차 범위에서는 뺀다.
@@ -82,7 +85,7 @@ impl BookingStatus {
     pub fn apply(self, event: &BookingEvent) -> Result<BookingStatus, InvalidTransition> {
         match (self, event) {
             (Self::Pending, BookingEvent::ProviderConfirmed { .. }) => Ok(Self::Confirmed),
-            // ... 전이표의 13개 전이
+            // ... 전이표의 14개 전이
             (from, event) => Err(InvalidTransition { from, event: event.name() }),
         }
     }
@@ -225,6 +228,7 @@ CREATE TABLE reconciliation_issues (
 ```
 
 관리자 인증용 `admin_users` 테이블은 Phase 6에서 추가한다.
+→ Phase 6에서 추가: `admin_users` · `admin_sessions` · `admin_audit_log`, 그리고 `jobs.provider_id` · `jobs.sent_at` (아래 "구현 메모 (Phase 6)").
 
 ### 구현 메모 (Phase 2)
 - 테이블은 그 기능을 만드는 Phase에서 마이그레이션으로 추가한다. Phase 2 마이그레이션(`migrations/20261110000001_create_booking_core.sql`)에는 `api_clients`, `providers`, `bookings`, `booking_events`, `jobs`만 있다. `provider_calls`는 Phase 3, `reconciliation_issues`는 Phase 6.
@@ -263,6 +267,24 @@ CREATE TABLE reconciliation_issues (
 - `submit_booking` 작업의 `payload`에 `{"lookup_first": true}`가 있으면 워커가 보내기 전에 업체에서 먼저 찾는다 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)). payload 형식이 깨졌으면 더 조심하는 쪽(조회부터)으로 읽는다.
 - `JobRecord`에 `locked_until` · `created_at` · `updated_at`을 더했다 (관리자 화면의 작업 목록).
 - dead 작업 목록은 전용 쿼리(`status = 'dead'`를 상수로 적은 것)로 읽는다. "조건이 NULL이면 건너뛰는" 쿼리는 prepared statement의 일반 실행 계획에서 부분 인덱스 `jobs_dead_idx`를 쓰지 못해, 끝난 작업이 쌓일수록 느려진다.
+
+### 구현 메모 (Phase 6)
+
+| 마이그레이션 | 내용 |
+|---|---|
+| `20261113000001_add_jobs_provider_and_sent.sql` | `jobs.provider_id`(작업이 부르는 업체, 기존 작업은 예약에서 채움) + 업체별 대기 인덱스 `jobs_provider_ready_idx`, `jobs.sent_at`("보냄" 표시), 업체마다 대사 작업을 하나로 묶는 부분 유니크 인덱스 `jobs_reconcile_active_idx` |
+| `20261113000002_create_reconciliation_issues.sql` | `reconciliation_issues` (종류 CHECK 제약), 미해결 이슈를 (업체, 종류, 예약, 업체 예약)마다 하나로 묶는 부분 유니크 인덱스 (`NULLS NOT DISTINCT`) |
+| `20261113000003_create_admin_auth.sql` | `admin_users`(argon2 해시, 역할 CHECK), `admin_sessions`(토큰의 SHA-256 해시가 기본 키), `admin_audit_log` |
+| `20261113000004_add_beta_provider.sql` | 로컬 개발용 업체 `beta` (`http://127.0.0.1:9090/beta/api`, 멱등키 없음) |
+
+- **작업의 업체** ([D-30](decisions.md#d-30-워커는-업체마다-루프를-따로-두고-작업에-업체를-적는다-jobsprovider_id)): 예약 작업은 등록하는 SQL 안에서 예약의 업체를 읽어 넣는다 (`(SELECT provider_id FROM bookings WHERE id = $2)`). 예약의 업체는 바뀌지 않으므로 함께 바꿀 일이 없다. 워커 루프는 `provider_id = $1` 조건으로 자기 업체의 작업만 가져간다 (§5).
+- **"보냄" 표시** ([D-31](decisions.md#d-31-멱등키-없는-업체에는-보내기-직전에-보냄-표시를-커밋한다-jobssent_at)): `jobs::mark_sent`가 lease 증표 조건으로 `sent_at = now()`를 남기고, 결과를 남기는 SQL(`complete` · `retry_later` · `defer` · `mark_dead` · `requeue` 등)이 모두 `sent_at = NULL`로 지운다.
+- **대사 작업은 업체마다 하나** ([D-33](decisions.md#d-33-대사는-업체별-작업-체인으로-돌고-자동으로-바로잡을-것과-사람에게-넘길-것을-나눈다)): `jobs::schedule_reconcile`은 `INSERT … ON CONFLICT (provider_id) WHERE kind = 'reconcile_provider' AND status IN ('queued', 'running') DO NOTHING`이다. 부분 유니크 인덱스를 `ON CONFLICT`의 대상으로 쓰려면 인덱스와 **같은 `WHERE` 조건**을 적어야 PostgreSQL이 그 인덱스를 찾는다. `jobs::run_reconcile_now`는 대기 중인 대사 작업의 `run_at`을 지금으로 당긴다 (없으면 새로 등록, 실행 중이면 그 작업).
+- **이슈 기록** (`db::reconciliation::record`): `ON CONFLICT … DO NOTHING`이라 같은 미해결 이슈가 있으면 새로 넣지 않는다. 자동으로 바로잡은 이슈는 처음부터 `resolved_at` · `resolved_by = 'reconciler'`를 채워 넣는다 (부분 인덱스 밖이라 겹쳐도 남는다).
+- **대사가 실패 예약을 바로잡을 때** 그 예약의 dead 작업을 `status = 'done'`으로 정리한다 (`jobs::close_dead_for_booking`). 포기한 대사 작업을 관리자가 다시 넣을 때도 그 행을 `done`으로 정리하고(`jobs::close_dead`) 대기 중인 대사를 당긴다. 되살리면 하나뿐인 대사 자리와 겹쳐 유니크 인덱스에 걸린다 (처음 구현은 500이 났다. 문서를 쓰다 발견).
+- **대사의 우리 쪽 예약** (`bookings::for_reconciliation`): 업체와 슬롯 기간으로 고른다 (`bookings_provider_idx (provider_id, slot_start)`).
+- **관리자 세션**: 쿠키의 토큰을 SHA-256으로 해시해 `admin_sessions`의 기본 키로 바로 찾는다 (만료 시각 조건 포함). 끝난 세션 행은 아직 지우지 않는다 (§6).
+- 관리자 조작과 감사 로그는 한 트랜잭션이다. `admin_audit_log.actor`와 `booking_events.actor`는 `admin:<이름>`이다.
 
 ## 5. 작업 큐 동작
 
@@ -304,6 +326,12 @@ RETURNING *;
 
 폴링 간격은 500ms로 시작한다. 지연을 더 줄이고 싶으면 나중에 PostgreSQL `LISTEN/NOTIFY`로 워커를 깨우는 방식을 더한다.
 
+**업체별 루프 (Phase 6)**: 워커는 업체마다 루프를 따로 두고, 위 SQL의 안쪽 `SELECT`에 업체 조건을 더해 자기 업체의 작업만 가져간다 ([D-30](decisions.md#d-30-워커는-업체마다-루프를-따로-두고-작업에-업체를-적는다-jobsprovider_id)). 실제 구현은 한 번에 한 건씩(`LIMIT 1`) 가져온다.
+```sql
+WHERE provider_id = $1 AND ((status = 'queued' AND run_at <= now()) OR (status = 'running' AND locked_until < now()))
+-- 나머지 루프 하나: provider_id IS NULL OR provider_id <> ALL($이_프로세스의_업체들)
+```
+
 **lease와 fencing**: 작업을 가져갈 때 늘어난 `attempts` 값이 "이 작업을 쥐고 있다"는 증표다. 완료 · 재예약 · 포기 SQL은 모두 `WHERE id = $1 AND status = 'running' AND attempts = $n`으로 이 증표를 확인한다. 처리 도중 lease가 만료되어 다른 워커가 같은 작업을 다시 가져가면 `attempts`가 또 늘어나므로, 늦게 끝난 원래 워커의 결과는 반영되지 않는다. 작업 완료와 예약 상태 전이는 한 트랜잭션으로 저장한다.
 
 미루기(`defer`)는 `attempts`를 1 되돌리므로, 미룬 작업을 다시 가져가면 같은 번호가 다시 나온다. 그래도 fencing은 깨지지 않는다: 미룬 워커는 그 쓰기가 마지막이라 그 번호로 다시 쓰지 않고, lease를 잃은 워커의 번호보다 작은 값으로는 돌아가지 않는다 (다른 워커가 가져가면서 이미 1을 더했으므로).
@@ -316,4 +344,5 @@ RETURNING *;
 |---|---|---|
 | `provider_calls` | 30일 | 매일 정리 작업이 삭제. 장기 추세가 필요하면 시간 단위 집계 테이블을 추가 (Phase 7 이후) |
 | `jobs` (`done`) | 7일 | 매일 정리 |
-| 나머지 | 영구 | |
+| `admin_sessions` (만료된 것) | 만료 즉시 | 정리 작업과 함께 (Phase 7). 그 전까지는 찾을 때 만료 시각을 확인하고 행은 남는다 |
+| 나머지 (`reconciliation_issues`, `admin_audit_log` 포함) | 영구 | |

@@ -5,12 +5,12 @@ Grafana 대시보드와 알림 규칙을 코드로 관리한다. `docker compose
 ```
 observability/grafana/
 ├─ dashboards/                      # 대시보드 JSON (Grafana의 Booking 폴더에 등록된다)
-│  ├─ provider-overview.json        #   업체 호출: 호출량, 성공률, p50/p95/p99, 호출 제한, 서킷, 느린 호출의 trace
-│  ├─ booking-pipeline.json         #   예약 흐름: 상태 전이, 접수 → 종료 시간, 작업 큐, 포기한 작업의 trace
+│  ├─ provider-overview.json        #   업체 호출: 호출량, 성공률, p50/p95/p99, 호출 제한, 서킷, AIMD 허용 속도, 느린 호출의 trace
+│  ├─ booking-pipeline.json         #   예약 흐름: 상태 전이, 접수 → 종료 시간, 작업 큐, 미해결 대사 이슈, 포기한 작업의 trace
 │  └─ service.json                  #   HTTP 요청 수 · 오류 비율 · 응답 시간, tokio 런타임, 경고 · 오류 로그
 └─ provisioning/
    ├─ dashboards/booking.yaml       # "dashboards/ 폴더의 JSON을 읽어라"는 설정
-   └─ alerting/booking.yaml         # 알림 규칙 6개
+   └─ alerting/booking.yaml         # 알림 규칙 7개 (Phase 6: 대사에서 이중 예약 의심 발견, 긴급)
 ```
 
 ## 보는 법
@@ -29,13 +29,14 @@ observability/grafana/
 curl -X POST localhost:9090/_chaos/alpha/preset/slow     # 30% 확률로 +3초 → 타임아웃 · 재시도
 curl -X POST localhost:9090/_chaos/alpha/preset/outage   # 모든 요청에 503 → 서킷 Open
 curl -X POST localhost:9090/_chaos/alpha/preset/healthy  # 복구
+curl -X POST localhost:9090/_chaos/beta/preset/lossy     # beta(멱등키 없음): 쓰기의 20% 응답 유실 → 결과 불명 → 조회로 확정
 ```
 
 | 프리셋 | Provider Overview에서 볼 것 |
 |---|---|
 | `slow` | 호출 지연 p95 · p99가 3초로 붙고 `timeout`이 늘어난다. "느린 업체 호출" 표에서 행을 누르면 mock 내부의 `chaos.delay`까지 보인다 |
 | `flaky` | 결과별 시도 수에 `server_error`가 섞이고 "호출 내 재시도"가 늘어난다. 성공률은 조금만 떨어진다 (재시도가 흡수) |
-| `throttled` | "호출 제한" 패널에 `remote`(업체의 429), 이어서 `local`(pause 중이라 부르지 않음)이 나타난다. 업체 pause가 "쉬는 중"이 된다 |
+| `throttled` | "호출 제한" 패널에 `remote`(업체의 429), 이어서 `local`(pause 중이라 부르지 않음)이 나타난다. 업체 pause가 "쉬는 중"이 된다. "적응형 rate limit (AIMD)" 줄에서 우리 limiter의 허용 속도가 절반으로 꺾였다가 계단처럼 올라간다 |
 | `outage` | 서킷 상태가 Open이 되고 `circuit_open`이 대부분을 차지한다. Booking Pipeline에서는 대기 작업이 쌓였다가 복구 뒤에 빠진다 |
 
 ## 대시보드를 고칠 때
@@ -73,6 +74,8 @@ docker compose up -d --force-recreate otel-lgtm
 | `provider.call.duration` (histogram, 단위 `s`) | `provider_call_duration_seconds_bucket` · `_count` · `_sum` |
 | `provider.call.retries` (counter) | `provider_call_retries_total` |
 | `provider.circuit.state` (gauge) | `provider_circuit_state` |
+| `provider.rate_limit.allowed` (gauge, Phase 6) | `provider_rate_limit_allowed` |
+| `reconciliation.issues.open` (gauge, Phase 6) | `reconciliation_issues_open` |
 | 라벨 `http.route` | `http_route` |
 | 서비스 이름 (`service.name`) | `job` 라벨 (`booking-server`, `mock-provider`) |
 

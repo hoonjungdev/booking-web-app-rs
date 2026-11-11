@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, provider_id, booking_id, provider_booking_id, kind, detail, detected_at,\n                resolved_at, resolved_by\n         FROM reconciliation_issues WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "booking_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "booking_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "provider_booking_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "provider_booking_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "detail",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "detail"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "detected_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "detected_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "resolved_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "resolved_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "resolved_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "reconciliation_issues",
+            "name": "resolved_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "11ee9ffe3593da7600e90e638bd3240ec9fc980ae9ce6862b66742b55ae021e5"
+}

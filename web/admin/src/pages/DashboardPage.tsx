@@ -1,4 +1,4 @@
-// 대시보드: 업체별 상태 카드, 작업 큐, 최근 실패한 예약. 5초마다 다시 읽는다.
+// 대시보드: 업체별 상태 카드, 작업 큐, 미해결 대사 이슈, 최근 실패한 예약. 5초마다 다시 읽는다.
 //
 // 장애를 주입하면 이 화면에서 서킷이 열리고(빨강) 성공률이 떨어지는 것을 보고,
 // 복구한 뒤 dead 작업을 재처리하는 흐름의 출발점이다 (docs/07-roadmap.md Phase 5 완료 기준).
@@ -24,6 +24,7 @@ import type { Schemas } from '../api/client'
 import { useBookingList } from '../api/queries/bookings'
 import { useJobCounts } from '../api/queries/jobs'
 import { useProviders } from '../api/queries/providers'
+import { useIssueCounts } from '../api/queries/reconciliation'
 import { type SummaryWindow, useStatsSummary } from '../api/queries/stats'
 import { BookingStatusBadge, CircuitBadge } from '../components/Badges'
 import { ErrorAlert, Loading } from '../components/QueryState'
@@ -35,6 +36,7 @@ import {
   formatRelative,
   shortId,
 } from '../lib/format'
+import { ISSUE_KIND, ISSUE_KINDS } from '../lib/labels'
 
 const WINDOWS: { value: SummaryWindow; label: string }[] = [
   { value: '5m', label: '5분' },
@@ -79,8 +81,9 @@ export default function DashboardPage() {
         </SimpleGrid>
       )}
 
-      <SimpleGrid cols={{ base: 1, lg: 2 }}>
+      <SimpleGrid cols={{ base: 1, lg: 3 }}>
         <JobQueueCard />
+        <IssuesCard />
         <FailedBookingsCard />
       </SimpleGrid>
     </Stack>
@@ -143,7 +146,8 @@ function ProviderCard({
           </Text>
           <Progress value={(runtime.in_flight / runtime.max_concurrency) * 100} size="sm" />
           <Text size="xs" c="dimmed">
-            우리 limiter 토큰 {runtime.limiter_available} / {runtime.limiter_burst}
+            우리 limiter 토큰 {runtime.limiter_available} / {runtime.limiter_burst} · 초당 {runtime.rate_limit_allowed}
+            {runtime.rate_limit_allowed < runtime.rate_limit_ceiling && ` (상한 ${runtime.rate_limit_ceiling}에서 줄임)`}
             {runtime.rate_limit_remaining != null && ` · 업체가 알려 준 남은 호출 ${runtime.rate_limit_remaining}`}
           </Text>
           <Progress
@@ -206,6 +210,49 @@ function JobQueueCard() {
               업체 장애가 끝났다면 <Anchor component={Link} to="/jobs?status=dead">작업 큐</Anchor>에서 다시
               넣으세요. 실패한 예약은 업체에서 먼저 찾아본 뒤 처리합니다.
             </Alert>
+          )}
+        </>
+      )}
+    </Card>
+  )
+}
+
+/** 미해결 대사 이슈: 종류별 개수. 이중 예약 의심이 있으면 빨갛게 알린다. */
+function IssuesCard() {
+  const counts = useIssueCounts()
+  const duplicates = counts.data?.by_kind['duplicate_suspected'] ?? 0
+  return (
+    <Card withBorder>
+      <Group justify="space-between" mb="sm">
+        <Title order={4}>대사 이슈</Title>
+        <Anchor component={Link} to="/reconciliation" size="sm">
+          대사 이슈 보기
+        </Anchor>
+      </Group>
+      {counts.isError && <ErrorAlert error={counts.error} />}
+      {counts.data && (
+        <>
+          <SimpleGrid cols={2}>
+            {ISSUE_KINDS.map((kind) => (
+              <Metric
+                key={kind}
+                label={ISSUE_KIND[kind].label}
+                value={formatCount(counts.data.by_kind[kind] ?? 0)}
+                hint={ISSUE_KIND[kind].description}
+                alert={(counts.data.by_kind[kind] ?? 0) > 0}
+              />
+            ))}
+          </SimpleGrid>
+          {duplicates > 0 && (
+            <Alert color="red" mt="sm" title="이중 예약 의심">
+              업체에 같은 예약이 두 번 있습니다. <Anchor component={Link} to="/reconciliation?kind=duplicate_suspected">대사 이슈</Anchor>에서
+              확인하세요.
+            </Alert>
+          )}
+          {counts.data.open === 0 && (
+            <Text size="sm" c="dimmed" mt="sm">
+              미해결 이슈가 없습니다
+            </Text>
           )}
         </>
       )}

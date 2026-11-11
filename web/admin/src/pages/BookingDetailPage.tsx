@@ -2,6 +2,7 @@
 import {
   Alert,
   Anchor,
+  Badge,
   Button,
   Card,
   Code,
@@ -22,7 +23,9 @@ import { Link, useParams } from 'react-router'
 import type { Schemas } from '../api/client'
 import { useBooking, useRetryBooking } from '../api/queries/bookings'
 import { useRequeueJob } from '../api/queries/jobs'
+import { useCan } from '../api/queries/session'
 import { BookingStatusBadge, JobStatusBadge, OutcomeBadge } from '../components/Badges'
+import { NeedsRole } from '../components/Permission'
 import { ErrorAlert, Loading } from '../components/QueryState'
 import { TraceLink } from '../components/TraceLink'
 import { formatDateTime, formatMs, formatRelative, formatTime } from '../lib/format'
@@ -48,6 +51,9 @@ export default function BookingDetailPage() {
 function BookingDetail({ detail }: { detail: Schemas['BookingDetail'] }) {
   const { booking, events, calls, jobs } = detail
   const retry = useRetryBooking()
+  const canOperate = useCan('operator')
+  // 실패한 예약은 다시 제출하고, 취소에 실패한 예약은 취소를 다시 보낸다
+  const retryable = booking.status === 'failed' || booking.status === 'cancel_failed'
 
   return (
     <Stack gap="lg">
@@ -68,17 +74,30 @@ function BookingDetail({ detail }: { detail: Schemas['BookingDetail'] }) {
             </CopyButton>
           </Group>
         </Stack>
-        {booking.status === 'failed' && (
-          <Button
-            leftSection={<IconRefresh size={16} />}
-            color="orange"
-            loading={retry.isPending}
-            onClick={() => retry.mutate(booking.id)}
-          >
-            재시도
-          </Button>
+        {retryable && (
+          <NeedsRole role="operator">
+            <Button
+              leftSection={<IconRefresh size={16} />}
+              color="orange"
+              disabled={!canOperate}
+              loading={retry.isPending}
+              onClick={() => retry.mutate(booking.id)}
+            >
+              {booking.status === 'cancel_failed' ? '취소 재시도' : '재시도'}
+            </Button>
+          </NeedsRole>
         )}
       </Group>
+
+      {booking.status === 'cancel_failed' && (
+        <Alert color="orange" title="취소에 실패한 예약">
+          {booking.status_reason ?? '사유 없음'}
+          <Text size="sm" mt={4}>
+            업체에서 취소하지 못했습니다. 업체와 확인한 뒤 &quot;취소 재시도&quot;를 누르면 취소를 다시 보냅니다 (이미 취소된
+            예약이어도 결과가 같습니다).
+          </Text>
+        </Alert>
+      )}
 
       {booking.status === 'failed' && (
         <Alert color="orange" title="실패한 예약">
@@ -196,6 +215,7 @@ function EventTimeline({ events }: { events: Schemas['BookingEventView'][] }) {
 
 function JobTable({ jobs }: { jobs: Schemas['JobView'][] }) {
   const requeue = useRequeueJob()
+  const canOperate = useCan('operator')
   if (jobs.length === 0) {
     return <Text c="dimmed">작업이 없습니다</Text>
   }
@@ -231,15 +251,25 @@ function JobTable({ jobs }: { jobs: Schemas['JobView'][] }) {
             <Table.Td>{formatTime(job.run_at)}</Table.Td>
             <Table.Td>
               {job.status === 'dead' && (
-                <Button
-                  size="compact-xs"
-                  variant="light"
-                  color="orange"
-                  loading={requeue.isPending}
-                  onClick={() => requeue.mutate(job.id)}
-                >
-                  다시 넣기
-                </Button>
+                <NeedsRole role="operator">
+                  <Button
+                    size="compact-xs"
+                    variant="light"
+                    color="orange"
+                    disabled={!canOperate}
+                    loading={requeue.isPending}
+                    onClick={() => requeue.mutate(job.id)}
+                  >
+                    다시 넣기
+                  </Button>
+                </NeedsRole>
+              )}
+              {job.sent_at && (
+                <Tooltip label="멱등키 없는 업체에 보내고 아직 결과를 기록하지 못했다. 다시 가져가면 다시 보내지 않고 결과 불명으로 넘긴다">
+                  <Badge size="xs" color="yellow" variant="light">
+                    보냄
+                  </Badge>
+                </Tooltip>
               )}
             </Table.Td>
           </Table.Tr>

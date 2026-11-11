@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE jobs\n        SET status = 'running',\n            attempts = attempts + 1,\n            locked_until = now() + make_interval(secs => $1),\n            updated_at = now()\n        WHERE id = (\n            SELECT id FROM jobs\n            WHERE (status = 'queued' AND run_at <= now())\n               OR (status = 'running' AND locked_until < now())\n            ORDER BY run_at\n            LIMIT 1\n            FOR UPDATE SKIP LOCKED\n        )\n        RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,\n                  EXTRACT(EPOCH FROM (now() - run_at))::float8 AS \"lag_secs!\"\n        ",
+  "query": "\n                UPDATE jobs\n                SET status = 'running',\n                    attempts = attempts + 1,\n                    locked_until = now() + make_interval(secs => $1),\n                    updated_at = now()\n                WHERE id = (\n                    SELECT id FROM jobs\n                    WHERE (provider_id IS NULL OR provider_id <> ALL($2))\n                      AND ((status = 'queued' AND run_at <= now())\n                           OR (status = 'running' AND locked_until < now()))\n                    ORDER BY run_at\n                    LIMIT 1\n                    FOR UPDATE SKIP LOCKED\n                )\n                RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,\n                          EXTRACT(EPOCH FROM (now() - run_at))::float8 AS \"lag_secs!\",\n                          provider_id, sent_at\n                ",
   "describe": {
     "columns": [
       {
@@ -85,11 +85,34 @@
         "name": "lag_secs!",
         "type_info": "Float8",
         "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "sent_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "sent_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Float8"
+        "Float8",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -100,8 +123,10 @@
       false,
       false,
       true,
-      null
+      null,
+      true,
+      true
     ]
   },
-  "hash": "5a1bdb6a6808ea91220a1345e838017f10f7de9ab50b55f9ffa438797acea38e"
+  "hash": "f7ea8d6867db02eddb299dae4632ba9d1dbffbfef83c98483703dec0dd4fd84f"
 }

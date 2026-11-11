@@ -51,6 +51,7 @@ pub enum ProviderError {
 | `throttled` | ❌ | - | 작업 수준에서 재예약 |
 
 "멱등 안전"하다는 것은 조회 호출(availability, find, list)이거나, 업체가 멱등키를 지원하는 생성 · 취소 호출이라는 뜻이다.
+→ Phase 6: 취소는 멱등키가 없어도 멱등 안전으로 본다. 이미 취소된 예약을 다시 취소해도 결과가 같고, 어댑터가 "이미 취소됨"을 성공으로 분류하기 때문이다 ([D-32](decisions.md#d-32-취소는-결과를-모르는-실패-뒤에도-다시-보내고-cancel_failed는-관리자가-다시-시도한다)). 그래서 멱등 안전하지 않은 호출은 "멱등키 없는 업체의 생성" 하나뿐이다 (`Operation::safe_to_resend`).
 
 오류 메시지에는 업체가 보낸 글자를 넣지 않는다 (Phase 4). `client_error`의 본문과 `decode_error`의 내용에는 업체가 되돌려 준 고객 정보가 들어 있을 수 있는데, 오류 메시지는 로그 · 추적 · 예약의 실패 사유(`status_reason`)로 퍼져 나간다. 그 내용은 `ProviderError::detail()`로 꺼내 호출 기록(`provider_calls.error_detail`)에만 남긴다.
 
@@ -64,6 +65,8 @@ pub enum ProviderError {
 | `circuit_open`, `throttled` | 시도 횟수를 쓰지 않고 미룸 (`retry_at`까지 기다린 뒤 + 무작위 0~0.5초) |
 | `connect_error`, `rate_limited` | 작업 재예약 (요청이 처리되지 않았으므로 항상 안전) |
 | `timeout`, `transport_error`, `server_error`, `decode_error` | 멱등키를 지원하는 업체면 작업 재예약, 아니면 `unknown` + `resolve_unknown` 작업 등록 (다시 보내지 않음) |
+
+취소(`cancel_booking`, Phase 6)는 결과 불명이 없다: 성공이면 `cancelled`, 업무적 거절(업체에 없는 예약 등)이면 `cancel_failed`, 막혔으면 미룸, 그 밖의 실패는 재예약하고 횟수를 다 쓰면 `cancel_failed` (`worker/cancel.rs`의 `decide_cancel`).
 
 ## 2. 파이프라인 구성
 
@@ -95,18 +98,21 @@ Polly가 권장하는 순서(Retry → CircuitBreaker → Timeout)와 같은 이
 - 호출 한 번은 최대 `call_budget_ms + rate_limit.max_wait_ms + bulkhead.max_wait_ms`가 걸린다. 워커의 lease가 이보다 짧으면 호출 도중 다른 워커가 같은 작업을 다시 가져가므로, 서버가 시작할 때 lease가 이 값 + 5초 이상인지 검사하고 아니면 시작하지 않는다.
 - 업체가 처리했을지 모르는 실패 뒤에는 멱등 안전할 때만 다시 보낸다. 그래서 멱등키 없는 업체의 생성 요청은 한 호출 안에서 두 번 나가지 않고, 그 실패가 그대로 워커에 전달된다.
 - 어댑터는 결과와 함께 응답 메타(HTTP 상태, `X-RateLimit-Remaining`)를 돌려준다. `ResilientProvider`가 메타는 호출 기록에 쓰고 결과만 바깥에 넘긴다 ([D-17](decisions.md#d-17-어댑터는-결과와-함께-응답-메타를-돌려준다)).
+- **정책은 호출 단위로 고정된다 (Phase 6)**: 정책 · rate limiter · bulkhead를 `ArcSwap`에 담아 실행 중에 통째로 바꾼다. 호출 하나는 시작할 때 읽은 정책으로 끝까지 가므로, 도중에 정책이 바뀌어도 한 호출 안의 예산 · 재시도 판단이 섞이지 않는다. 시도 타임아웃은 HTTP 클라이언트가 아니라 `ResilientProvider`가 건다 (클라이언트에는 안전장치로 60초만). → [D-34](decisions.md#d-34-정책은-실행-중에-통째로-바꾸고arcswap-호출-하나는-시작할-때의-정책으로-끝까지-간다)
+- **업체를 부른 뒤 속도를 조절한다 (Phase 6)**: 실제로 부른 시도마다 결과가 `rate_limited`면 AIMD로 허용 속도를 줄이고, 한동안 아니었으면 조금 올린다 (§6 ④).
 - 메트릭과 추적 (Phase 4): 호출 하나가 `provider.call` span, 그 안의 시도 하나하나가 `provider.attempt` span이다. 시도가 끝날 때 `provider.call.duration`(결과별), 재시도할 때 `provider.call.retries`, 호출 제한에 걸리면 `provider.throttled`를 기록한다. 서킷 상태 · pause · 동시 실행 수 · 업체가 알려 준 남은 호출 수는 `ResilientProvider`가 현재 값을 내주고 서버가 지표로 내보낸다 ([05 §3 · §4](05-observability-and-analytics.md#3-추적-traces), [D-20](decisions.md#d-20-라이브러리-크레이트는-opentelemetry-api만-쓰고-sdk-구성은-telemetry-크레이트에만-둔다)).
 
 ## 3. 업체별 정책 (기본값)
 
 `providers.policy`(jsonb)에 저장한다. 관리자 화면에서 바꾸면 재시작 없이 반영된다(arc-swap으로 교체).
+→ Phase 6에서 구현: `PUT /admin/api/providers/{id}/policy`(admin 역할)와 업체 상세의 편집 폼. 워커 lease보다 긴 호출이 될 수 있는 정책은 거절한다 ([D-34](decisions.md#d-34-정책은-실행-중에-통째로-바꾸고arcswap-호출-하나는-시작할-때의-정책으로-끝까지-간다)). DB에는 기본값과 다른 항목만 적어 둬도 된다 (빠진 항목은 아래 기본값).
 
 ```json
 {
   "attempt_timeout_ms": 3000,
   "call_budget_ms": 15000,
   "retry":           { "max_attempts": 3, "base_delay_ms": 200, "max_delay_ms": 2000 },
-  "rate_limit":      { "per_second": 10, "burst": 5, "max_wait_ms": 500 },
+  "rate_limit":      { "per_second": 10, "burst": 5, "max_wait_ms": 500, "adaptive": true },
   "bulkhead":        { "max_concurrency": 8, "max_wait_ms": 200 },
   "circuit_breaker": { "window": 20, "min_calls": 10, "failure_rate": 0.5,
                        "open_ms": 30000, "half_open_probes": 3 },
@@ -161,7 +167,9 @@ pub struct Capabilities {
 - `unknown`에서 `failed`가 된 예약은 업체에 실제로 있을 수 있다. 관리자 재시도(Phase 5)는 다시 제출하기 전에 업체 조회를 먼저 하게 만들어야 한다.
   → Phase 5에서 구현: 관리자 재시도는 작업에 `{"lookup_first": true}`를 붙이고, 워커(`submit::decide_lookup`)가 참조값으로 먼저 찾아 있으면 보내지 않고 `confirmed`, 없으면 제출, 조회 실패면 작업 재예약(표시는 남아 다음에도 조회부터)한다. 관리자 재시도는 실패하고 한참 뒤라 "없음"은 한 번만 확인한다. 기한(`deadline_at`)도 그 시각부터 다시 잡는다 ([D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다)).
 - alpha는 멱등키를 지원하므로 실제로는 `unknown`이 되지 않는다. 이 경로는 멱등키 없는 업체를 메모리로 흉내 내 시나리오 테스트로 검증한다 (beta 어댑터는 Phase 6).
+  → Phase 6: beta(멱등키 없음)를 붙였다. 실제 mock beta에 응답 유실을 주입한 시나리오 테스트(`멱등키가_없는_beta는_응답이_유실되어도_조회로_확인해_이중_예약이_없다`)가 `unknown` → 조회 → `confirmed`를 확인한다.
 - **알려진 한계 (Phase 6에서 해결)**: 워커가 멱등키 없는 업체에 생성 요청을 보낸 직후, 결과를 저장하기 전에 죽으면(또는 그 저장이 DB 오류로 실패하면) lease가 만료된 뒤 다른 워커가 같은 예약을 **다시 보낸다**. 멱등키가 있는 alpha는 업체가 중복을 막아 주므로 문제가 없고, 지금은 멱등키 없는 업체가 없다. beta를 붙이기 전에 "보내기 직전에 작업에 '보냄' 표시를 커밋하고, 그 표시가 있는 작업을 다시 가져가면 보내지 않고 `unknown`으로 넘긴다"를 만든다.
+  → Phase 6에서 해결 ([D-31](decisions.md#d-31-멱등키-없는-업체에는-보내기-직전에-보냄-표시를-커밋한다-jobssent_at)): 보내기 직전에 `jobs.sent_at`을 lease 증표 조건으로 커밋하고, 결과를 남기는 모든 SQL이 지운다. 가져온 작업에 표시가 남아 있으면 다시 보내지 않고 `unknown`(사유 `unrecorded_send`)으로 넘긴다. 워커 통합 테스트 `보낸_뒤_결과를_남기지_못하고_멈춘_작업은_다시_보내지_않고_결과_불명으로_넘긴다`가 확인한다.
 
 ## 6. Rate limit 관리
 
@@ -173,6 +181,11 @@ pub struct Capabilities {
 | ④ 적응형 조절 (Phase 6) | 429를 받으면 허용 속도를 절반으로, 한동안 문제없으면 조금씩 회복 (AIMD) | 업체 한도를 몰라도 자동으로 맞춤 |
 
 업체 한도는 여러 작업이 나눠 쓰는 자원이다. 사용자가 기다리는 조회(availability)가 백그라운드 작업(대사)에 밀리지 않도록, 대사 작업은 토큰이 50% 넘게 남아 있을 때만 호출한다 (Phase 6).
+
+**구현 (Phase 6)**
+- ④ AIMD (`providers::resilience::adaptive`, [D-35](decisions.md#d-35-적응형-rate-limitaimd-한도-초과면-절반으로-조용하면-상한의-10씩-올린다)): 업체가 한도 초과를 알리면(alpha 429, beta 503 + `Retry-After`) 허용 속도를 절반으로(최소 초당 1, 1초 안의 신호는 한 번으로), 한도 초과 없이 5초가 지나면 상한(`per_second`)의 10%씩 올린다. 버킷 크기도 같은 비율로 줄이고, 속도가 바뀌면 그 속도의 limiter를 새로 만들어 교체한다. 정책 `rate_limit.adaptive = false`면 상한에 머문다. ②의 pause와 함께 동작한다: pause는 `Retry-After` 동안 멈추고, AIMD는 그 뒤의 속도를 낮춘다.
+- 지금 허용 속도는 `provider.rate_limit.allowed` 지표, 관리자 화면의 업체 런타임 상태("상한 20에서 줄임")로 본다.
+- 대사의 "토큰이 절반 넘게 남았을 때만"은 `ResilientProvider::has_spare_capacity`다. 남은 토큰은 추정값이다 (`limiter_available`, [04 §3](04-api.md#3-관리자-api-adminapi)). 여유가 없으면 대사 작업을 시도 횟수를 쓰지 않고 5초 미룬다.
 
 ## 7. 서킷 브레이커
 
@@ -205,6 +218,14 @@ stateDiagram-v2
 
 **Phase 3 구현 상태**: 업체별 Semaphore는 구현했다 (`max_wait_ms` 안에 자리가 나지 않으면 `Throttled` → 작업 미루기). 워커의 업체별 동시 처리 제한은 두 번째 업체를 추가하는 Phase 6에서 만든다 ([D-19](decisions.md#d-19-워커의-업체별-동시-처리-제한은-두-번째-업체phase-6와-함께-만든다)).
 
+**Phase 6 구현** ([D-30](decisions.md#d-30-워커는-업체마다-루프를-따로-두고-작업에-업체를-적는다-jobsprovider_id)): 작업에 업체를 적고(`jobs.provider_id`), 워커가 업체마다 루프를 따로 둔다. 업체 하나에 `BOOKING_WORKER_CONCURRENCY`(기본 4, 그 업체 bulkhead 자리 수를 넘지 않게)개의 루프가 그 업체의 작업만 가져간다. alpha가 느려져 alpha 루프가 모두 응답을 기다려도 beta 루프는 그대로 beta 작업을 처리한다. 업체가 없거나 이 프로세스에 파이프라인이 없는 업체의 작업은 따로 둔 루프 하나가 맡아 정리한다.
+
+```text
+업체 alpha ── 루프 ×4 ─▶ alpha 작업만 (jobs_provider_ready_idx) ─▶ alpha bulkhead (8자리)
+업체 beta  ── 루프 ×4 ─▶ beta 작업만                            ─▶ beta bulkhead (8자리)
+나머지     ── 루프 ×1 ─▶ 업체가 없거나 파이프라인이 없는 업체의 작업 (포기 · 정리)
+```
+
 ## 9. 대사 (Reconciliation)
 
 정기 작업(`reconcile_provider`, 업체마다 10분 간격)이 최근 24시간 슬롯의 예약을 업체 목록과 비교한다.
@@ -215,6 +236,30 @@ stateDiagram-v2
 | 우리는 `confirmed`, 업체에는 없음 | 이슈 기록 (자동 처리하지 않음) |
 | 우리 참조값을 단 예약이 업체에 2건 이상 | 이슈 기록 (이중 예약 의심, 긴급 알림) |
 | 우리는 `failed`/`unknown`, 업체에서는 확정됨 | 이슈 기록, 예약 → `confirmed` |
+
+**구현 (Phase 6)**: `crates/booking-server/src/worker/reconcile.rs` ([D-33](decisions.md#d-33-대사는-업체별-작업-체인으로-돌고-자동으로-바로잡을-것과-사람에게-넘길-것을-나눈다)).
+
+```text
+업체마다 대사 작업 하나 (끝날 때 다음 실행을 등록하는 작업 체인, 기본 10분 간격)
+├─ 우리 limiter 토큰이 절반 넘게 남았을 때만 업체를 부른다 (아니면 5초 미룸, 시도 횟수를 쓰지 않음)
+├─ 슬롯이 지난 24시간 ~ 앞으로 7일인 업체 예약 목록(list_bookings)과 우리 예약을 비교한다 (compare: 순수 함수)
+└─ 찾은 것마다 한 트랜잭션: 바로잡을 수 있으면 상태 전이(actor reconciler) + 이슈(처리 완료로), 아니면 이슈만
+```
+
+| 찾은 것 | 처리 | 이슈 종류 |
+|---|---|---|
+| 우리는 `confirmed`, 업체에서는 취소됨 | 예약 → `cancelled` (`CancelledExternally`) | `status_mismatch` (처리 완료) |
+| 우리는 `failed` · `unknown`, 업체에서는 확정 | 예약 → `confirmed` (`FoundAtProvider`, `failed → confirmed`는 Phase 6에 추가한 전이). 실패할 때 묻힌 dead 작업은 끝난 것으로 정리 | `status_mismatch` (처리 완료) |
+| 우리는 `confirmed`, 업체에는 없음 | 이슈만 (자동으로 처리하지 않음) | `missing_at_provider` |
+| 같은 참조값으로 확정된 업체 예약이 2건 이상 | 이슈만 (긴급 알림) | `duplicate_suspected` |
+| 업체에 우리 참조값의 예약이 있는데 우리에게는 없음 | 이슈만 | `missing_locally` |
+| 그 밖에 양쪽 상태가 다름 (우리는 취소 · 거절인데 업체는 확정, `cancel_failed`인데 업체에서는 취소됨 등) | 이슈만 | `status_mismatch` |
+
+- 처음 설계에서 바꾼 것: 비교 범위를 "최근 24시간 슬롯"에서 "지난 24시간 ~ 앞으로 7일"로 넓혔다 (예약은 대부분 앞으로의 슬롯에 있다). 자동으로 바로잡은 것도 이슈로 남기되 처리 완료로 넣는다.
+- 처리 중인 예약(`pending` · `cancel_requested`)은 다른 작업이 다루므로 상태를 비교하지 않는다 (이중 예약 검사만 한다).
+- 미해결 이슈는 (업체, 종류, 예약, 업체 예약)마다 하나라서, 10분마다 같은 불일치를 다시 찾아도 쌓이지 않는다.
+- 업체 목록을 받지 못하면 작업을 재예약하고, 횟수를 다 쓰면 이번 대사만 포기(dead)한다. 다음 정기 대사는 그대로 돈다.
+- 관리자: 대사 이슈 화면에서 확인 · 처리 완료 표시, 업체별 "지금 대사" ([04 §3](04-api.md#3-관리자-api-adminapi)). 미해결 수는 `reconciliation.issues.open` 지표, 이중 예약 의심은 긴급 알림 ([05 §8](05-observability-and-analytics.md#8-대시보드와-알림)).
 
 ## 10. 장애 시나리오와 기대 동작
 
@@ -241,5 +286,8 @@ mock-provider의 장애 주입으로 아래 시나리오를 자동화된 통합 
 | 호출 제한 | `업체_한도보다_낮게_호출하면_429_없이_모두_처리된다`, `업체가_429를_보내면_pause했다가_재개한다` | 우리 limiter가 막아 429 없음 / 429를 받으면 pause(`throttled` 기록) 후 재개 |
 | 커밋 후 응답 유실 | `응답이_유실되어도_같은_멱등키로_재시도해_이중_예약이_없다`, `멱등키가_없는_업체는_결과_불명을_조회로_확인해_이중_예약이_없다` | alpha: 같은 멱등키 재시도 / 멱등키 없는 업체(메모리로 흉내): `unknown` → 조회 → `confirmed` 또는 다시 제출 |
 | 완전 장애 | `업체가_멈추면_예약을_보류하고_기한이_지난_것만_실패시킨다` | 장애 중 `pending` 유지, 기한이 지난 예약만 `failed`, 복구 후 나머지 `confirmed` |
-| 업체측 취소 | (Phase 6) | 대사 작업과 함께 |
-| 한 업체만 장애 | (Phase 6) | 두 번째 업체와 함께 |
+| 업체측 취소 | `업체에서_취소한_예약을_대사가_찾아_취소로_바꾸고_이중_예약을_알린다` (Phase 6) | mock beta에서 업체측 취소 + 같은 참조값으로 한 건 더 → 대사가 취소를 찾아 `cancelled`(actor `reconciler`, 이슈는 처리 완료), 이중 예약 의심 이슈를 남김 |
+| 한 업체만 장애 | `한_업체가_느려져도_다른_업체의_예약은_밀리지_않는다` (Phase 6) | alpha가 느려 alpha 루프가 모두 응답을 기다리는 동안에도 beta 예약은 모두 `confirmed` (업체별 워커 루프) |
+| 커밋 후 응답 유실 (beta) | `멱등키가_없는_beta는_응답이_유실되어도_조회로_확인해_이중_예약이_없다` (Phase 6) | 실제 mock beta(멱등키 없음): `unknown` → 참조값 조회 → `confirmed`, 업체 예약은 참조값마다 1건 |
+
+**Phase 6에서 더한 것**: 시나리오 테스트가 두 업체(alpha · beta 어댑터 + mock 업체)를 함께 띄운다. 워커 통합 테스트(`tests/worker.rs`)에는 "보냄" 표시(보내기 전 커밋, 남은 표시를 보면 다시 보내지 않음), 취소 흐름(성공 · 거절 · 결과를 모르는 실패 뒤 다시 보내기 · `cancel_failed` 관리자 재시도), 대사(업체에서 확정된 실패 예약을 `confirmed`로 바꾸고 dead 작업 정리, 호출 한도 여유가 없으면 미룸)를 더했다. 대사의 비교 규칙은 순수 함수 `compare`의 단위 테스트(업체측 취소 · 업체에 없음 · 이중 예약 의심 · 우리에게 없음 · 상태 불일치 · 처리 중 건너뛰기)로, 이슈 저장(같은 미해결 이슈를 다시 쌓지 않음)은 db 테스트로 확인한다. 실제 서버 · mock 업체로도 끝까지 돌려 확인했다: beta 응답 유실 50%에서 예약 6건 중 3건이 결과 불명을 거쳐 모두 확정, 업체 예약 중복 0건.
