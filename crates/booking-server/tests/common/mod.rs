@@ -17,16 +17,17 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
 };
 use booking_server::{
+    admin_auth,
     api::{self, ApiState, BookingResponse},
     auth,
 };
-use chrono::{Days, Utc};
+use chrono::{DateTime, Days, TimeDelta, Utc};
 use db::PgPool;
 use domain::{BookingId, BookingStatus, ClientId, ProviderId};
 use providers::{
-    AdapterReply, CallRecorder, Capabilities, CircuitBreakerPolicy, CreateBooking, ProviderAdapter,
-    ProviderBooking, ProviderError, ProviderPolicy, RateLimitPolicy, ResilientProvider,
-    RetryPolicy,
+    AdapterReply, AvailableSlot, CallRecorder, Capabilities, CircuitBreakerPolicy, CreateBooking,
+    ListedBooking, ProviderAdapter, ProviderBooking, ProviderError, ProviderPolicy,
+    RateLimitPolicy, ResilientProvider, RetryPolicy,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -49,6 +50,25 @@ pub async fn create_client(pool: &PgPool, name: &str) -> TestClient {
 
 pub fn app(pool: &PgPool) -> Router {
     api::router(ApiState::new(pool.clone()))
+}
+
+/// 관리자 계정과 로그인 세션을 DB에 바로 만들고 `Cookie` 헤더 값을 돌려준다.
+/// 로그인 API를 거치지 않는다 (argon2 계산을 아낀다. 로그인 자체는 따로 테스트한다).
+pub async fn admin_cookie(pool: &PgPool, role: &str) -> String {
+    let username = format!("{role}-{}", Uuid::now_v7().simple());
+    let user = db::admin::create_user(pool, &username, "not-a-real-hash", role)
+        .await
+        .expect("관리자 계정을 만들 수 있어야 한다");
+    let token = admin_auth::generate_session_token();
+    db::admin::create_session(
+        pool,
+        &admin_auth::hash_token(&token),
+        user.id,
+        Utc::now() + TimeDelta::hours(1),
+    )
+    .await
+    .expect("세션을 만들 수 있어야 한다");
+    format!("{}={token}", admin_auth::SESSION_COOKIE)
 }
 
 pub struct Reply {
@@ -164,8 +184,14 @@ pub struct FakeAdapter {
     capabilities: Capabilities,
     creates: Mutex<VecDeque<Result<ProviderBooking, ProviderError>>>,
     finds: Mutex<VecDeque<Result<Option<ProviderBooking>, ProviderError>>>,
+    cancels: Mutex<VecDeque<Result<(), ProviderError>>>,
+    availabilities: Mutex<VecDeque<Result<Vec<AvailableSlot>, ProviderError>>>,
+    lists: Mutex<VecDeque<Result<Vec<ListedBooking>, ProviderError>>>,
     create_calls: AtomicUsize,
     find_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    availability_calls: AtomicUsize,
+    list_calls: AtomicUsize,
 }
 
 impl FakeAdapter {
@@ -178,8 +204,14 @@ impl FakeAdapter {
             capabilities,
             creates: Mutex::new(creates.into()),
             finds: Mutex::new(VecDeque::new()),
+            cancels: Mutex::new(VecDeque::new()),
+            availabilities: Mutex::new(VecDeque::new()),
+            lists: Mutex::new(VecDeque::new()),
             create_calls: AtomicUsize::new(0),
             find_calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
+            availability_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
         }
     }
 
@@ -192,12 +224,54 @@ impl FakeAdapter {
         self
     }
 
+    /// 취소 호출에 차례로 돌려줄 응답
+    pub fn with_cancels(self, cancels: Vec<Result<(), ProviderError>>) -> Self {
+        *self
+            .cancels
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다") = cancels.into();
+        self
+    }
+
+    /// 빈 시간 조회에 차례로 돌려줄 응답
+    pub fn with_availabilities(
+        self,
+        availabilities: Vec<Result<Vec<AvailableSlot>, ProviderError>>,
+    ) -> Self {
+        *self
+            .availabilities
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다") = availabilities.into();
+        self
+    }
+
+    /// 기간별 예약 목록(대사)에 차례로 돌려줄 응답
+    pub fn with_lists(self, lists: Vec<Result<Vec<ListedBooking>, ProviderError>>) -> Self {
+        *self
+            .lists
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다") = lists.into();
+        self
+    }
+
     pub fn create_calls(&self) -> usize {
         self.create_calls.load(Ordering::SeqCst)
     }
 
     pub fn find_calls(&self) -> usize {
         self.find_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn cancel_calls(&self) -> usize {
+        self.cancel_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn availability_calls(&self) -> usize {
+        self.availability_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -226,6 +300,44 @@ impl ProviderAdapter for FakeAdapter {
             .unwrap_or(Err(ProviderError::Server { status: 599 }))
             .into()
     }
+
+    async fn cancel_booking(&self, _provider_booking_id: &str) -> AdapterReply<()> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancels
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다")
+            .pop_front()
+            .unwrap_or(Err(ProviderError::Server { status: 599 }))
+            .into()
+    }
+
+    async fn availability(
+        &self,
+        _resource_id: &str,
+        _date: chrono::NaiveDate,
+    ) -> AdapterReply<Vec<AvailableSlot>> {
+        self.availability_calls.fetch_add(1, Ordering::SeqCst);
+        self.availabilities
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다")
+            .pop_front()
+            .unwrap_or(Err(ProviderError::Server { status: 599 }))
+            .into()
+    }
+
+    async fn list_bookings(
+        &self,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> AdapterReply<Vec<ListedBooking>> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.lists
+            .lock()
+            .expect("테스트 중에는 잠금이 오염되지 않는다")
+            .pop_front()
+            .unwrap_or(Err(ProviderError::Server { status: 599 }))
+            .into()
+    }
 }
 
 /// 워커 판단만 보려고 장애 대응 계층을 사실상 끈 정책: 호출 내 재시도 없음, 넉넉한 rate limit, 잘 열리지 않는 서킷
@@ -239,6 +351,7 @@ pub fn single_attempt_policy() -> ProviderPolicy {
             per_second: 10_000,
             burst: 10_000,
             max_wait_ms: 100,
+            ..RateLimitPolicy::default()
         },
         circuit_breaker: CircuitBreakerPolicy {
             window: 1_000,

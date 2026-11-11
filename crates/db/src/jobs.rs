@@ -8,11 +8,14 @@
 //!
 //! 작업을 등록할 때 등록한 쪽의 trace 정보(`trace_context`)를 함께 저장한다. 작업은 나중에 다른 태스크가 처리하므로,
 //! 이 값이 "접수 요청의 trace"와 "작업 처리의 trace"를 잇는 유일한 끈이다 (docs/05-observability-and-analytics.md §3).
+//!
+//! 작업마다 부를 업체(`provider_id`)가 정해져 있다 (Phase 6). 워커는 업체마다 따로 둔 루프로 그 업체의 작업만 가져가서,
+//! 한 업체가 느려져도 다른 업체 작업이 밀리지 않는다 ([`ClaimScope`], docs/decisions.md D-30).
 
 use std::{str::FromStr, time::Duration};
 
 use chrono::{DateTime, Utc};
-use domain::BookingId;
+use domain::{BookingId, ProviderId};
 use sqlx::PgConnection;
 
 use crate::{DbError, PgPool};
@@ -20,23 +23,34 @@ use crate::{DbError, PgPool};
 /// 작업 하나가 최대 몇 번까지 시도되는가 (docs/03-resilience.md §4)
 pub const DEFAULT_MAX_ATTEMPTS: i32 = 8;
 
-/// 작업 종류. Phase 6에서 `cancel_booking`, `reconcile_provider`가 추가된다.
+/// 작업 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     /// 접수한 예약을 업체에 제출한다
     SubmitBooking,
     /// 결과 불명(`unknown`)인 예약을 업체에서 조회해 확인한다 (docs/03-resilience.md §5)
     ResolveUnknown,
+    /// 취소 요청을 받은 예약을 업체에서 취소한다 (Phase 6)
+    CancelBooking,
+    /// 업체 예약 목록과 우리 예약을 비교한다. 업체마다 하나씩 정기적으로 돈다 (Phase 6, docs/03-resilience.md §9)
+    ReconcileProvider,
 }
 
 impl JobKind {
     /// 모든 종류. 종류를 추가하면 여기에도 넣는다 (종류별 지표를 0으로 채울 때 쓴다).
-    pub const ALL: [Self; 2] = [Self::SubmitBooking, Self::ResolveUnknown];
+    pub const ALL: [Self; 4] = [
+        Self::SubmitBooking,
+        Self::ResolveUnknown,
+        Self::CancelBooking,
+        Self::ReconcileProvider,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitBooking => "submit_booking",
             Self::ResolveUnknown => "resolve_unknown",
+            Self::CancelBooking => "cancel_booking",
+            Self::ReconcileProvider => "reconcile_provider",
         }
     }
 }
@@ -45,12 +59,23 @@ impl FromStr for JobKind {
     type Err = DbError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "submit_booking" => Ok(Self::SubmitBooking),
-            "resolve_unknown" => Ok(Self::ResolveUnknown),
-            other => Err(DbError::corrupt(format!("알 수 없는 작업 종류: {other}"))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| DbError::corrupt(format!("알 수 없는 작업 종류: {value}")))
     }
+}
+
+/// 워커 루프 하나가 가져갈 작업의 범위
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimScope {
+    /// 아무 작업이나 (테스트가 한 단계씩 처리할 때)
+    Any,
+    /// 이 업체의 작업만 (업체별 루프)
+    Provider(ProviderId),
+    /// 업체가 없거나, 이 목록에 없는 업체의 작업 (이 프로세스에 업체 파이프라인이 없는 작업을 맡는 루프).
+    /// 이 루프가 없으면 그런 작업은 아무도 가져가지 않아 영영 대기열에 남는다.
+    Unassigned(Vec<ProviderId>),
 }
 
 /// 워커가 가져간 작업
@@ -69,6 +94,11 @@ pub struct Job {
     pub trace_context: Option<serde_json::Value>,
     /// 실행하기로 한 시각(`run_at`)부터 실제로 가져가기까지 밀린 시간. 워커가 바쁘거나 멈춰 있으면 길어진다.
     pub lag: Duration,
+    /// 부를 업체 (대사 작업처럼 예약이 없는 작업도 업체는 있다)
+    pub provider_id: Option<String>,
+    /// 앞선 실행이 업체에 생성 요청을 보낸 시각. 결과를 기록하면 지워지므로, 가져온 작업에 이 값이 있으면
+    /// 앞선 워커가 보낸 뒤 결과를 남기지 못하고 멈춘 것이다 ([`mark_sent`], docs/decisions.md D-31).
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 /// 작업 종류별 큐 상태 (지표용)
@@ -112,6 +142,10 @@ pub struct JobRecord {
     pub locked_until: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub payload: serde_json::Value,
+    /// 부를 업체
+    pub provider_id: Option<String>,
+    /// 업체에 생성 요청을 보내고 아직 결과를 기록하지 못한 시각 ([`Job::sent_at`])
+    pub sent_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -155,6 +189,8 @@ pub async fn enqueue(
 
 /// [`enqueue`]와 같지만 작업의 진행 상황(`payload`)을 처음부터 정해 둔다.
 /// 예: 관리자 재시도는 `{"lookup_first": true}`로 "다시 보내기 전에 업체에서 먼저 찾아본다"를 남긴다.
+///
+/// 작업의 업체(`provider_id`)는 예약에서 가져온다 (예약의 업체는 바뀌지 않는다).
 #[tracing::instrument(name = "db.jobs.enqueue", skip_all, fields(kind = kind.as_str()))]
 pub async fn enqueue_with_payload(
     conn: &mut PgConnection,
@@ -166,8 +202,9 @@ pub async fn enqueue_with_payload(
 ) -> Result<i64, DbError> {
     let booking_id = booking_id.map(|id| id.as_uuid());
     let id = sqlx::query_scalar!(
-        "INSERT INTO jobs (kind, booking_id, max_attempts, payload, trace_context)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO jobs (kind, booking_id, max_attempts, payload, trace_context, provider_id)
+         VALUES ($1, $2, $3, $4, $5, (SELECT provider_id FROM bookings WHERE id = $2))
+         RETURNING id",
         kind.as_str(),
         booking_id,
         max_attempts,
@@ -179,53 +216,196 @@ pub async fn enqueue_with_payload(
     Ok(id)
 }
 
+/// 가져온 작업 행 (세 가지 가져오기 쿼리가 함께 쓴다)
+struct ClaimedRow {
+    id: i64,
+    kind: String,
+    booking_id: Option<uuid::Uuid>,
+    attempts: i32,
+    max_attempts: i32,
+    payload: serde_json::Value,
+    trace_context: Option<serde_json::Value>,
+    lag_secs: f64,
+    provider_id: Option<String>,
+    sent_at: Option<DateTime<Utc>>,
+}
+
+impl From<ClaimedRow> for Job {
+    fn from(r: ClaimedRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            booking_id: r.booking_id.map(BookingId::from_uuid),
+            attempts: r.attempts,
+            max_attempts: r.max_attempts,
+            payload: r.payload,
+            trace_context: r.trace_context,
+            lag: crate::non_negative_secs(r.lag_secs),
+            provider_id: r.provider_id,
+            sent_at: r.sent_at,
+        }
+    }
+}
+
 /// 실행할 작업 하나를 가져간다. 없으면 `None`.
 ///
 /// `FOR UPDATE SKIP LOCKED`: 다른 워커가 잠근 행은 기다리지 않고 건너뛴다. 그래서 워커가 여러 개여도 같은 작업을 동시에 집지 않는다.
 /// `lease` 동안 끝내지 못하면(워커가 죽는 등) 다른 워커가 다시 가져갈 수 있다.
 ///
+/// `scope`로 가져갈 작업의 업체를 고른다. 조건마다 SQL을 따로 쓴다: "조건이 NULL이면 건너뛰는" 쿼리 하나로 합치면
+/// 실행 계획이 업체별 인덱스(`jobs_provider_ready_idx`)를 확신하고 쓰지 못한다.
+///
 /// 이 함수에는 span을 열지 않는다. 워커가 할 일이 없을 때도 계속 부르는 함수라서, 열면 빈 trace가 끝없이 쌓인다.
-pub async fn claim_next(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
-    let row = sqlx::query!(
-        r#"
-        UPDATE jobs
-        SET status = 'running',
-            attempts = attempts + 1,
-            locked_until = now() + make_interval(secs => $1),
-            updated_at = now()
-        WHERE id = (
-            SELECT id FROM jobs
-            WHERE (status = 'queued' AND run_at <= now())
-               OR (status = 'running' AND locked_until < now())
-            ORDER BY run_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,
-                  EXTRACT(EPOCH FROM (now() - run_at))::float8 AS "lag_secs!"
-        "#,
-        lease.as_secs_f64(),
-    )
-    .fetch_optional(pool)
-    .await?;
+pub async fn claim_next(
+    pool: &PgPool,
+    lease: Duration,
+    scope: &ClaimScope,
+) -> Result<Option<Job>, DbError> {
+    let lease = lease.as_secs_f64();
+    let row = match scope {
+        ClaimScope::Any => {
+            sqlx::query_as!(
+                ClaimedRow,
+                r#"
+                UPDATE jobs
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    locked_until = now() + make_interval(secs => $1),
+                    updated_at = now()
+                WHERE id = (
+                    SELECT id FROM jobs
+                    WHERE (status = 'queued' AND run_at <= now())
+                       OR (status = 'running' AND locked_until < now())
+                    ORDER BY run_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,
+                          EXTRACT(EPOCH FROM (now() - run_at))::float8 AS "lag_secs!",
+                          provider_id, sent_at
+                "#,
+                lease,
+            )
+            .fetch_optional(pool)
+            .await?
+        }
+        ClaimScope::Provider(provider) => {
+            sqlx::query_as!(
+                ClaimedRow,
+                r#"
+                UPDATE jobs
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    locked_until = now() + make_interval(secs => $1),
+                    updated_at = now()
+                WHERE id = (
+                    SELECT id FROM jobs
+                    WHERE provider_id = $2
+                      AND ((status = 'queued' AND run_at <= now())
+                           OR (status = 'running' AND locked_until < now()))
+                    ORDER BY run_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,
+                          EXTRACT(EPOCH FROM (now() - run_at))::float8 AS "lag_secs!",
+                          provider_id, sent_at
+                "#,
+                lease,
+                provider.as_str(),
+            )
+            .fetch_optional(pool)
+            .await?
+        }
+        ClaimScope::Unassigned(assigned) => {
+            let assigned: Vec<String> = assigned.iter().map(ToString::to_string).collect();
+            sqlx::query_as!(
+                ClaimedRow,
+                r#"
+                UPDATE jobs
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    locked_until = now() + make_interval(secs => $1),
+                    updated_at = now()
+                WHERE id = (
+                    SELECT id FROM jobs
+                    WHERE (provider_id IS NULL OR provider_id <> ALL($2))
+                      AND ((status = 'queued' AND run_at <= now())
+                           OR (status = 'running' AND locked_until < now()))
+                    ORDER BY run_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,
+                          EXTRACT(EPOCH FROM (now() - run_at))::float8 AS "lag_secs!",
+                          provider_id, sent_at
+                "#,
+                lease,
+                &assigned,
+            )
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+    Ok(row.map(Job::from))
+}
 
-    Ok(row.map(|r| Job {
-        id: r.id,
-        kind: r.kind,
-        booking_id: r.booking_id.map(BookingId::from_uuid),
-        attempts: r.attempts,
-        max_attempts: r.max_attempts,
-        payload: r.payload,
-        trace_context: r.trace_context,
-        lag: crate::non_negative_secs(r.lag_secs),
-    }))
+/// 멱등키 없는 업체에 생성 요청을 보내기 **직전에** "보냄" 표시를 커밋하고, lease를 지금부터 `lease_for`로 새로 잡는다.
+/// lease를 잃었으면 `false` (보내면 안 된다).
+///
+/// 보낸 뒤 결과를 기록하기 전에 워커가 죽거나 그 기록이 DB 오류로 실패하면, lease가 끝난 뒤 다른 워커가 이 작업을 다시
+/// 가져간다. 그 워커는 이 표시를 보고 다시 보내지 않고 결과 불명(`unknown`)으로 넘겨 업체에서 조회부터 한다.
+/// 결과를 기록하는 함수들(완료 · 재예약 · 미루기 · 포기)은 모두 이 표시를 지운다.
+///
+/// lease를 새로 잡는 이유: 한 작업이 업체를 두 번 부를 수 있다 (관리자 재시도의 "조회 → 제출"). lease 검사는 업체 호출
+/// 한 번만 계산하므로, 조회에 lease를 거의 다 쓰면 제출하는 도중에 lease가 끝나 다른 워커가 이 작업을 가져갈 수 있다.
+/// 보내기 직전에 lease를 새로 잡으면 제출 한 번이 끝날 시간이 늘 남는다.
+#[tracing::instrument(name = "db.jobs.mark_sent", skip_all)]
+pub async fn mark_sent(
+    conn: &mut PgConnection,
+    lease: Lease,
+    lease_for: Duration,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs SET sent_at = now(), locked_until = now() + make_interval(secs => $3),
+                         updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2",
+        lease.job_id,
+        lease.attempt,
+        lease_for.as_secs_f64(),
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 쥐고 있는 작업의 lease를 지금부터 `lease_for`로 늘린다. lease를 잃었으면 `false`.
+///
+/// 업체 호출 뒤에도 할 일이 많이 남은 작업(대사: 찾은 것마다 트랜잭션)이 남은 일을 하는 동안 lease가 끝나지 않게 한다.
+#[tracing::instrument(name = "db.jobs.extend_lease", skip_all)]
+pub async fn extend_lease(
+    conn: &mut PgConnection,
+    lease: Lease,
+    lease_for: Duration,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs SET locked_until = now() + make_interval(secs => $3), updated_at = now()
+         WHERE id = $1 AND status = 'running' AND attempts = $2",
+        lease.job_id,
+        lease.attempt,
+        lease_for.as_secs_f64(),
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// 작업을 끝낸다. lease를 잃었으면(다른 워커가 다시 가져감) `false`.
 #[tracing::instrument(name = "db.jobs.complete", skip_all)]
 pub async fn complete(conn: &mut PgConnection, lease: Lease) -> Result<bool, DbError> {
     let result = sqlx::query!(
-        "UPDATE jobs SET status = 'done', locked_until = NULL, last_error = NULL, updated_at = now()
+        "UPDATE jobs SET status = 'done', locked_until = NULL, last_error = NULL, sent_at = NULL,
+                         updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
@@ -246,7 +426,7 @@ pub async fn retry_later(
     let result = sqlx::query!(
         "UPDATE jobs
          SET status = 'queued', run_at = now() + make_interval(secs => $3),
-             locked_until = NULL, last_error = $4, updated_at = now()
+             locked_until = NULL, last_error = $4, sent_at = NULL, updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
@@ -270,7 +450,7 @@ pub async fn retry_later_with_payload(
     let result = sqlx::query!(
         "UPDATE jobs
          SET status = 'queued', run_at = now() + make_interval(secs => $3),
-             locked_until = NULL, last_error = $4, payload = $5, updated_at = now()
+             locked_until = NULL, last_error = $4, payload = $5, sent_at = NULL, updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
@@ -297,7 +477,7 @@ pub async fn defer(
     let result = sqlx::query!(
         "UPDATE jobs
          SET status = 'queued', attempts = attempts - 1, run_at = now() + make_interval(secs => $3),
-             locked_until = NULL, last_error = $4, updated_at = now()
+             locked_until = NULL, last_error = $4, sent_at = NULL, updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
@@ -317,7 +497,8 @@ pub async fn mark_dead(
     error: &str,
 ) -> Result<bool, DbError> {
     let result = sqlx::query!(
-        "UPDATE jobs SET status = 'dead', locked_until = NULL, last_error = $3, updated_at = now()
+        "UPDATE jobs SET status = 'dead', locked_until = NULL, last_error = $3, sent_at = NULL,
+                         updated_at = now()
          WHERE id = $1 AND status = 'running' AND attempts = $2",
         lease.job_id,
         lease.attempt,
@@ -369,6 +550,8 @@ struct JobRow {
     locked_until: Option<DateTime<Utc>>,
     last_error: Option<String>,
     payload: serde_json::Value,
+    provider_id: Option<String>,
+    sent_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -386,6 +569,8 @@ impl From<JobRow> for JobRecord {
             locked_until: r.locked_until,
             last_error: r.last_error,
             payload: r.payload,
+            provider_id: r.provider_id,
+            sent_at: r.sent_at,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -398,7 +583,7 @@ pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<Job
     let rows = sqlx::query_as!(
         JobRow,
         "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
-                last_error, payload, created_at, updated_at
+                last_error, payload, provider_id, sent_at, created_at, updated_at
          FROM jobs WHERE booking_id = $1 ORDER BY id",
         booking_id.as_uuid(),
     )
@@ -413,7 +598,7 @@ pub async fn get(conn: &mut PgConnection, id: i64) -> Result<Option<JobRecord>, 
     let row = sqlx::query_as!(
         JobRow,
         "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
-                last_error, payload, created_at, updated_at
+                last_error, payload, provider_id, sent_at, created_at, updated_at
          FROM jobs WHERE id = $1",
         id,
     )
@@ -440,7 +625,7 @@ pub async fn list(
         JobRow,
         r#"
         SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
-               last_error, payload, created_at, updated_at
+               last_error, payload, provider_id, sent_at, created_at, updated_at
         FROM jobs
         WHERE ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR kind = $2)
@@ -469,7 +654,7 @@ async fn list_dead(
         JobRow,
         r#"
         SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
-               last_error, payload, created_at, updated_at
+               last_error, payload, provider_id, sent_at, created_at, updated_at
         FROM jobs
         WHERE status = 'dead'
           AND ($1::text IS NULL OR kind = $1)
@@ -532,7 +717,8 @@ pub async fn requeue(
     let result = sqlx::query!(
         "UPDATE jobs
          SET status = 'queued', kind = $2, payload = $3, trace_context = $4,
-             max_attempts = attempts + $5, run_at = now(), locked_until = NULL, updated_at = now()
+             max_attempts = attempts + $5, run_at = now(), locked_until = NULL, sent_at = NULL,
+             updated_at = now()
          WHERE id = $1 AND status = 'dead'",
         id,
         kind,
@@ -573,4 +759,118 @@ pub async fn latest_dead_for_booking(
     .fetch_optional(conn)
     .await?;
     Ok(id)
+}
+
+/// 업체의 다음 대사 작업을 `delay` 뒤로 등록한다. 그 업체의 대사 작업이 이미 대기 · 실행 중이면 아무것도 하지 않고 `None`.
+///
+/// 업체마다 대사 작업은 하나뿐이다 (부분 유니크 인덱스 `jobs_reconcile_active_idx`). 대사 작업은 끝날 때 다음 실행을
+/// 이 함수로 등록해 정기 실행을 이어 가고(작업 체인), 서버가 시작할 때도 불러 사슬이 끊겼으면 다시 잇는다.
+/// 서버가 여러 대여도 DB가 하나만 남기므로 대사가 겹쳐 돌지 않는다.
+#[tracing::instrument(name = "db.jobs.schedule_reconcile", skip_all, fields(provider = %provider))]
+pub async fn schedule_reconcile(
+    conn: &mut PgConnection,
+    provider: &ProviderId,
+    delay: Duration,
+    trace_context: Option<&serde_json::Value>,
+) -> Result<Option<i64>, DbError> {
+    let id = sqlx::query_scalar!(
+        "INSERT INTO jobs (kind, provider_id, max_attempts, run_at, trace_context)
+         VALUES ('reconcile_provider', $1, $2, now() + make_interval(secs => $3), $4)
+         ON CONFLICT (provider_id) WHERE kind = 'reconcile_provider' AND status IN ('queued', 'running')
+         DO NOTHING
+         RETURNING id",
+        provider.as_str(),
+        DEFAULT_MAX_ATTEMPTS,
+        delay.as_secs_f64(),
+        trace_context,
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(id)
+}
+
+/// 업체의 대사를 지금 바로 돌게 한다 (관리자의 "지금 대사"). 돌게 된 대사 작업을 돌려준다.
+///
+/// 대기 중인 대사 작업이 있으면 실행 시각을 지금으로 당기고, 없으면 새로 등록한다. 이미 실행 중이면 그 작업을 그대로 돌려준다.
+#[tracing::instrument(name = "db.jobs.run_reconcile_now", skip_all, fields(provider = %provider))]
+pub async fn run_reconcile_now(
+    conn: &mut PgConnection,
+    provider: &ProviderId,
+    trace_context: Option<&serde_json::Value>,
+) -> Result<JobRecord, DbError> {
+    let pulled = sqlx::query_scalar!(
+        "UPDATE jobs SET run_at = now(), trace_context = $2, updated_at = now()
+         WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status = 'queued'
+         RETURNING id",
+        provider.as_str(),
+        trace_context,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let id = match pulled {
+        Some(id) => Some(id),
+        None => schedule_reconcile(conn, provider, Duration::ZERO, trace_context).await?,
+    };
+    let id = match id {
+        Some(id) => id,
+        // 대기 중인 것도 없고 새로 넣지도 못했다 = 지금 실행 중이다
+        None => {
+            let active = sqlx::query_scalar!(
+                "SELECT id FROM jobs
+                 WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status IN ('queued', 'running')",
+                provider.as_str(),
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
+            match active {
+                Some(id) => id,
+                // 그 짧은 사이에 실행 중이던 대사가 다음 실행을 등록하지 않고 끝났다 (파이프라인이 없는 업체 등).
+                // 자리가 비었으니 다시 등록한다.
+                None => schedule_reconcile(conn, provider, Duration::ZERO, trace_context)
+                    .await?
+                    .ok_or_else(|| DbError::corrupt("대사 작업을 등록할 수 없습니다"))?,
+            }
+        }
+    };
+    get(conn, id)
+        .await?
+        .ok_or_else(|| DbError::corrupt("방금 찾은 대사 작업이 없습니다"))
+}
+
+/// dead 작업 하나를 되살리지 않고 끝난 것으로 정리한다 (다른 방법으로 대신했을 때). 정리했으면 `true`.
+///
+/// 포기한 대사 작업을 관리자가 다시 넣을 때 쓴다. 업체마다 대사 작업은 하나만 대기 · 실행 중일 수 있어서
+/// 그 행을 되살리지 못하고, 대신 그 업체의 대사를 지금 돌게 한다 ([`run_reconcile_now`]).
+#[tracing::instrument(name = "db.jobs.close_dead", skip_all, fields(job_id = id))]
+pub async fn close_dead(conn: &mut PgConnection, id: i64, note: &str) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs SET status = 'done', last_error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'dead'",
+        id,
+        note,
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 예약의 dead 작업을 끝난 것으로 정리한다. 정리한 작업 수를 돌려준다.
+///
+/// 실패(`failed`)로 끝났던 예약을 대사가 업체에서 확정된 것으로 찾아 바로잡을 때 쓴다. 그 예약을 위해 포기했던 작업은
+/// 이제 할 일이 없는데, dead로 남겨 두면 "dead 작업이 있음" 알림이 계속 울린다.
+#[tracing::instrument(name = "db.jobs.close_dead_for_booking", skip_all)]
+pub async fn close_dead_for_booking(
+    conn: &mut PgConnection,
+    booking_id: BookingId,
+    note: &str,
+) -> Result<u64, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs SET status = 'done', last_error = $2, updated_at = now()
+         WHERE booking_id = $1 AND status = 'dead'",
+        booking_id.as_uuid(),
+        note,
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected())
 }

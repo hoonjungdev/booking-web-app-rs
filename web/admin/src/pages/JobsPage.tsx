@@ -17,7 +17,9 @@ import { IconRefresh } from '@tabler/icons-react'
 import { Link, useSearchParams } from 'react-router'
 
 import { type JobFilters, useJobCounts, useJobList, useRequeueJob } from '../api/queries/jobs'
+import { useCan } from '../api/queries/session'
 import { JobStatusBadge } from '../components/Badges'
+import { NeedsRole } from '../components/Permission'
 import { ErrorAlert, Loading } from '../components/QueryState'
 import { formatCount, formatDateTime, formatRelative, shortId } from '../lib/format'
 import { JOB_STATUS, JOB_STATUSES, type JobStatus } from '../lib/labels'
@@ -32,6 +34,7 @@ export default function JobsPage() {
   const counts = useJobCounts()
   const list = useJobList(filters)
   const requeue = useRequeueJob()
+  const canOperate = useCan('operator')
   const jobs = list.data?.pages.flatMap((page) => page.items) ?? []
 
   const setFilter = (key: string, value: string | null) => {
@@ -126,7 +129,7 @@ export default function JobsPage() {
               <Table.Tr>
                 <Table.Th>ID</Table.Th>
                 <Table.Th>종류</Table.Th>
-                <Table.Th>예약</Table.Th>
+                <Table.Th>예약 · 업체</Table.Th>
                 <Table.Th>상태</Table.Th>
                 <Table.Th>시도</Table.Th>
                 <Table.Th>실행 시각</Table.Th>
@@ -145,6 +148,10 @@ export default function JobsPage() {
                     {job.booking_id ? (
                       <Anchor component={Link} to={`/bookings/${job.booking_id}`} ff="monospace">
                         {shortId(job.booking_id)}
+                      </Anchor>
+                    ) : job.provider ? (
+                      <Anchor component={Link} to={`/providers/${job.provider}`}>
+                        {job.provider}
                       </Anchor>
                     ) : (
                       '–'
@@ -170,16 +177,19 @@ export default function JobsPage() {
                   </Table.Td>
                   <Table.Td>
                     {job.status === 'dead' && (
-                      <Button
-                        size="compact-sm"
-                        variant="light"
-                        color="orange"
-                        leftSection={<IconRefresh size={14} />}
-                        loading={requeue.isPending && requeue.variables === job.id}
-                        onClick={() => requeue.mutate(job.id)}
-                      >
-                        다시 넣기
-                      </Button>
+                      <NeedsRole role="operator">
+                        <Button
+                          size="compact-sm"
+                          variant="light"
+                          color="orange"
+                          leftSection={<IconRefresh size={14} />}
+                          disabled={!canOperate}
+                          loading={requeue.isPending && requeue.variables === job.id}
+                          onClick={() => requeue.mutate(job.id)}
+                        >
+                          다시 넣기
+                        </Button>
+                      </NeedsRole>
                     )}
                   </Table.Td>
                 </Table.Tr>

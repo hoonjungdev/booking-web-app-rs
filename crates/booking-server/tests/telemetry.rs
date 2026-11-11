@@ -327,6 +327,11 @@ async fn 예약_한_건의_trace가_업체_내부까지_이어지고_지표가_�
     );
     // mock 업체가 응답 헤더(X-RateLimit-Remaining)로 알려 준 값
     assert!(point(&captured.metric("provider.rate_limit.remaining"), &alpha).value > 0.0);
+    // 우리 rate limiter가 지금 허용하는 초당 호출 수 (한도 초과가 없었으므로 정책의 상한 그대로)
+    assert_eq!(
+        point(&captured.metric("provider.rate_limit.allowed"), &alpha).value,
+        f64::from(single_attempt_policy().rate_limit.per_second)
+    );
 
     // ── 6. 지표: 큐 상태 (DB를 읽어 갱신한다) ──
     send(
@@ -362,6 +367,44 @@ async fn 예약_한_건의_trace가_업체_내부까지_이어지고_지표가_�
     assert_eq!(
         point(&captured.metric("booking.unknown.oldest_age"), &[]).value,
         0.0
+    );
+    for kind in ["cancel_booking", "reconcile_provider"] {
+        assert_eq!(point(&ready, &[("kind", kind)]).value, 0.0, "{kind}");
+    }
+    // 미해결 대사 이슈: 종류마다 0으로 시작하고, 이중 예약 의심이 기록되면 1이 된다 (긴급 알림의 원천)
+    let issues = captured.metric("reconciliation.issues.open");
+    for kind in [
+        "missing_at_provider",
+        "missing_locally",
+        "status_mismatch",
+        "duplicate_suspected",
+    ] {
+        assert_eq!(point(&issues, &[("kind", kind)]).value, 0.0, "{kind}");
+    }
+    let mut conn = pool.acquire().await.expect("연결을 얻을 수 있어야 한다");
+    db::reconciliation::record(
+        &mut conn,
+        &db::reconciliation::NewIssue {
+            provider_id: ProviderId::parse("alpha").expect("올바른 업체 ID"),
+            booking_id: Some(booking_id),
+            provider_booking_id: None,
+            kind: db::reconciliation::IssueKind::DuplicateSuspected,
+            detail: json!({ "provider_booking_ids": ["rsv_1", "rsv_2"] }),
+            resolved_by: None,
+        },
+    )
+    .await
+    .expect("이슈를 기록할 수 있어야 한다");
+    metrics::refresh_queue_gauges(&pool)
+        .await
+        .expect("큐 상태를 읽을 수 있어야 한다");
+    assert_eq!(
+        point(
+            &captured.metric("reconciliation.issues.open"),
+            &[("kind", "duplicate_suspected")]
+        )
+        .value,
+        1.0
     );
 
     // ── 7. 지표: 실패 경로 (5xx 뒤 재시도, 업체의 429, 그 뒤 pause) ──
@@ -529,8 +572,7 @@ async fn 예약_한_건의_trace가_업체_내부까지_이어지고_지표가_�
     };
     let impatient = ResilientProvider::new(
         ProviderId::parse("impatient").expect("올바른 업체 ID"),
-        providers::build_adapter("alpha_v1", &mock_url, &impatient_policy)
-            .expect("어댑터를 만들 수 있어야 한다"),
+        providers::build_adapter("alpha_v1", &mock_url).expect("어댑터를 만들 수 있어야 한다"),
         impatient_policy,
         CallRecorder::discard(),
     );

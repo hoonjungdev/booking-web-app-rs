@@ -10,7 +10,8 @@ use chrono::{Days, Utc};
 use domain::{BookingId, Customer, RejectReason};
 use mock_provider::{AppState, catalog, chaos::ChaosConfig};
 use providers::{
-    AlphaAdapter, CreateBooking, ProviderAdapter, ProviderBooking, ProviderError, ProviderPolicy,
+    AlphaAdapter, AvailableSlot, CreateBooking, ListedStatus, ProviderAdapter, ProviderBooking,
+    ProviderError,
 };
 use uuid::Uuid;
 
@@ -29,14 +30,8 @@ async fn spawn_mock(config: &ChaosConfig) -> (String, AppState) {
 }
 
 fn adapter(base_url: &str, timeout_ms: u64) -> AlphaAdapter {
-    AlphaAdapter::new(
-        base_url,
-        &ProviderPolicy {
-            attempt_timeout_ms: timeout_ms,
-            ..ProviderPolicy::default()
-        },
-    )
-    .expect("HTTP 클라이언트를 만들 수 있어야 한다")
+    AlphaAdapter::new(base_url, Duration::from_millis(timeout_ms))
+        .expect("HTTP 클라이언트를 만들 수 있어야 한다")
 }
 
 /// 내일 정원이 1 이상인 첫 슬롯
@@ -246,4 +241,124 @@ async fn 연결할_수_없으면_connect로_분류한다() {
     let error = reply.result.unwrap_err();
     assert!(matches!(error, ProviderError::Connect { .. }), "{error:?}");
     assert!(error.definitely_not_processed());
+}
+
+#[tokio::test]
+async fn 예약을_취소하고_다시_취소해도_성공이다() {
+    let (url, mock) = spawn_mock(&ChaosConfig::passthrough()).await;
+    let alpha = adapter(&url, 1000);
+    let created = alpha
+        .create_booking(&create_request(&open_slot()))
+        .await
+        .result
+        .unwrap();
+
+    let first = alpha.cancel_booking(&created.provider_booking_id).await;
+    assert_eq!(first.meta.http_status, Some(200));
+    assert_eq!(first.result, Ok(()));
+    // 취소는 멱등이다: 이미 취소된 예약을 다시 취소해도 같은 결과
+    let again = alpha.cancel_booking(&created.provider_booking_id).await;
+    assert_eq!(again.result, Ok(()));
+    let stored = mock
+        .alpha
+        .lock()
+        .unwrap()
+        .get(&created.provider_booking_id)
+        .unwrap();
+    assert_eq!(
+        stored.status,
+        mock_provider::alpha::model::ReservationStatus::Cancelled
+    );
+
+    let missing = alpha.cancel_booking("rsv_does_not_exist").await;
+    assert_eq!(missing.meta.http_status, Some(404));
+    assert_eq!(
+        missing.result,
+        Err(ProviderError::Rejected {
+            reason: RejectReason::BookingNotFound
+        })
+    );
+}
+
+#[tokio::test]
+async fn 기간별_목록은_참조값과_상태를_돌려준다() {
+    let (url, mock) = spawn_mock(&ChaosConfig::passthrough()).await;
+    let alpha = adapter(&url, 1000);
+    let slot = open_slot();
+    let request = create_request(&slot);
+    let kept = alpha.create_booking(&request).await.result.unwrap();
+    let other = alpha
+        .create_booking(&create_request(&slot))
+        .await
+        .result
+        .unwrap();
+    mock.alpha
+        .lock()
+        .unwrap()
+        .cancel(&other.provider_booking_id, Utc::now())
+        .unwrap();
+
+    let listed = alpha
+        .list_bookings(slot.start, slot.end)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    let kept_row = listed
+        .iter()
+        .find(|b| b.provider_booking_id == kept.provider_booking_id)
+        .unwrap();
+    assert_eq!(
+        kept_row.reference.as_deref(),
+        Some(request.reference.to_string().as_str())
+    );
+    assert_eq!(kept_row.slot_start, slot.start);
+    assert_eq!(kept_row.status, ListedStatus::Confirmed);
+    assert!(
+        listed
+            .iter()
+            .any(|b| b.provider_booking_id == other.provider_booking_id
+                && b.status == ListedStatus::Cancelled)
+    );
+
+    // 범위 밖의 예약은 나오지 않는다 (to는 포함하지 않는다)
+    let before = alpha
+        .list_bookings(slot.start - chrono::TimeDelta::hours(1), slot.start)
+        .await
+        .result
+        .unwrap();
+    assert!(before.is_empty());
+}
+
+#[tokio::test]
+async fn 빈_시간을_읽고_없는_자원은_업무적_거절로_분류한다() {
+    let (url, _mock) = spawn_mock(&ChaosConfig::passthrough()).await;
+    let alpha = adapter(&url, 1000);
+    let slot = open_slot();
+    let date = slot.start.with_timezone(&catalog::kst()).date_naive();
+    alpha
+        .create_booking(&create_request(&slot))
+        .await
+        .result
+        .unwrap();
+
+    let slots = alpha.availability("store-001", date).await.result.unwrap();
+    assert_eq!(slots.len(), 11, "한국 시간 10:00~20:00 시작 슬롯");
+    let booked = slots.iter().find(|s| s.start == slot.start).unwrap();
+    assert_eq!(
+        *booked,
+        AvailableSlot {
+            start: slot.start,
+            end: slot.end,
+            remaining: slot.capacity - 1
+        }
+    );
+
+    let missing = alpha.availability("store-999", date).await;
+    assert_eq!(
+        missing.result,
+        Err(ProviderError::Rejected {
+            reason: RejectReason::ResourceNotFound
+        })
+    );
 }

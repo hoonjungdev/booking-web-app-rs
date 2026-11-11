@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n               last_error, payload, created_at, updated_at\n        FROM jobs\n        WHERE status = 'dead'\n          AND ($1::text IS NULL OR kind = $1)\n          AND ($2::int8 IS NULL OR id < $2)\n        ORDER BY id DESC\n        LIMIT $3\n        ",
+  "query": "\n                UPDATE jobs\n                SET status = 'running',\n                    attempts = attempts + 1,\n                    locked_until = now() + make_interval(secs => $1),\n                    updated_at = now()\n                WHERE id = (\n                    SELECT id FROM jobs\n                    WHERE (status = 'queued' AND run_at <= now())\n                       OR (status = 'running' AND locked_until < now())\n                    ORDER BY run_at\n                    LIMIT 1\n                    FOR UPDATE SKIP LOCKED\n                )\n                RETURNING id, kind, booking_id, attempts, max_attempts, payload, trace_context,\n                          EXTRACT(EPOCH FROM (now() - run_at))::float8 AS \"lag_secs!\",\n                          provider_id, sent_at\n                ",
   "describe": {
     "columns": [
       {
@@ -38,17 +38,6 @@
       },
       {
         "ordinal": 3,
-        "name": "status",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "jobs",
-            "name": "status"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
         "name": "attempts",
         "type_info": "Int4",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "max_attempts",
         "type_info": "Int4",
         "origin": {
@@ -70,40 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
-        "name": "run_at",
-        "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "jobs",
-            "name": "run_at"
-          }
-        }
-      },
-      {
-        "ordinal": 7,
-        "name": "locked_until",
-        "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "jobs",
-            "name": "locked_until"
-          }
-        }
-      },
-      {
-        "ordinal": 8,
-        "name": "last_error",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "jobs",
-            "name": "last_error"
-          }
-        }
-      },
-      {
-        "ordinal": 9,
+        "ordinal": 5,
         "name": "payload",
         "type_info": "Jsonb",
         "origin": {
@@ -114,33 +70,48 @@
         }
       },
       {
-        "ordinal": 10,
-        "name": "created_at",
-        "type_info": "Timestamptz",
+        "ordinal": 6,
+        "name": "trace_context",
+        "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "jobs",
-            "name": "created_at"
+            "name": "trace_context"
           }
         }
       },
       {
-        "ordinal": 11,
-        "name": "updated_at",
+        "ordinal": 7,
+        "name": "lag_secs!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "sent_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
             "table": "jobs",
-            "name": "updated_at"
+            "name": "sent_at"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8",
-        "Int8"
+        "Float8"
       ]
     },
     "nullable": [
@@ -150,13 +121,11 @@
       false,
       false,
       false,
-      false,
       true,
+      null,
       true,
-      false,
-      false,
-      false
+      true
     ]
   },
-  "hash": "1c493514e4ede4fc0ad9c50c76d7e603427b39166c32110828d4575d6448550e"
+  "hash": "e140bca4b3b15cd75e5fd3c32d10fa44ad08f760f94414bb3873097eb5e2836a"
 }

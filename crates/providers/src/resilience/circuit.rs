@@ -194,6 +194,17 @@ impl CircuitBreaker {
         snapshot
     }
 
+    /// 정책을 바꾼다 (관리자 정책 편집, Phase 6). 지금 상태는 그대로 두고, 이후의 판단부터 새 기준을 쓴다.
+    /// 열린 서킷이 정책을 바꿨다고 닫히지는 않는다. 창(`window`)이 줄었으면 오래된 결과부터 버린다.
+    pub fn update_policy(&mut self, policy: CircuitBreakerPolicy) {
+        self.policy = policy;
+        if let State::Closed { recent } = &mut self.state {
+            while recent.len() > policy.window as usize {
+                recent.pop_front();
+            }
+        }
+    }
+
     /// 관리자 조작. 상태가 바뀌므로 그 전에 받은 허락의 늦은 결과는 세지 않는다 (세대가 바뀐다).
     pub fn control(&mut self, action: CircuitAction, now: Instant) {
         let (forced, state) = match action {
@@ -634,6 +645,36 @@ mod tests {
             (half_open.probes_succeeded, half_open.probes_in_flight),
             (1, 1)
         );
+    }
+
+    #[test]
+    fn 정책을_바꾸면_상태는_그대로_두고_다음_판단부터_새_기준을_쓴다() {
+        let mut breaker = CircuitBreaker::new(policy());
+        let t0 = Instant::now();
+        for verdict in [Success, Success, Failure] {
+            call(&mut breaker, verdict, t0);
+        }
+        // 창을 2로 줄이면 오래된 결과(성공 하나)를 버린다: [성공, 실패]
+        breaker.update_policy(CircuitBreakerPolicy {
+            window: 2,
+            min_calls: 2,
+            ..policy()
+        });
+        let snapshot = breaker.snapshot();
+        assert_eq!((snapshot.recent_calls, snapshot.recent_failures), (2, 1));
+        assert_eq!(
+            breaker.state(),
+            CircuitState::Closed,
+            "바꾸는 것만으로는 열리지 않는다"
+        );
+
+        // 다음 결과부터 새 기준(최근 2회 중 50%)으로 판단한다
+        call(&mut breaker, Failure, t0);
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        // 열린 서킷은 정책을 바꿔도 열린 채로 있다
+        breaker.update_policy(policy());
+        assert_eq!(breaker.state(), CircuitState::Open);
     }
 
     #[test]

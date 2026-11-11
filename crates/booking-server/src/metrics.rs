@@ -7,7 +7,8 @@
 //! | `booking.unknown.oldest_age` | gauge (초) | | 큐 상태 태스크 (DB 조회) |
 //! | `jobs.lag` | histogram (초) | kind | 워커가 작업을 가져갔을 때 |
 //! | `jobs.ready`, `jobs.dead` | gauge | kind | 큐 상태 태스크 (DB 조회) |
-//! | `provider.circuit.state` 등 4개 | gauge | provider | 내보낼 때마다 업체 파이프라인의 현재 상태를 읽음 |
+//! | `reconciliation.issues.open` | gauge | kind | 큐 상태 태스크 (DB 조회). 이중 예약 의심 알림의 원천 |
+//! | `provider.circuit.state` 등 5개 | gauge | provider | 내보낼 때마다 업체 파이프라인의 현재 상태를 읽음 |
 //!
 //! 업체 호출 시도마다 쌓이는 지표(`provider.call.duration` 등)는 providers 크레이트가, HTTP 요청 지표는 telemetry 크레이트가 기록한다.
 //!
@@ -25,6 +26,7 @@ use chrono::Utc;
 use db::{
     DbError, PgPool,
     jobs::{Job, JobKind},
+    reconciliation::IssueKind,
 };
 use domain::{Booking, BookingStatus};
 use opentelemetry::{
@@ -56,6 +58,7 @@ struct Instruments {
     jobs_lag: Histogram<f64>,
     jobs_ready: Gauge<u64>,
     jobs_dead: Gauge<u64>,
+    issues_open: Gauge<u64>,
 }
 
 /// 처음 쓸 때 한 번 만들어지는 계측기 묶음 (≈ C#의 `static readonly Counter<long> ...`).
@@ -93,6 +96,12 @@ static INSTRUMENTS: LazyLock<Instruments> = LazyLock::new(|| {
         jobs_dead: meter
             .u64_gauge("jobs.dead")
             .with_description("더 시도하지 않고 묻어 둔 작업 수 (관리자 확인 대상)")
+            .build(),
+        issues_open: meter
+            .u64_gauge("reconciliation.issues.open")
+            .with_description(
+                "대사에서 찾은 미해결 불일치 수 (duplicate_suspected는 이중 예약 의심)",
+            )
             .build(),
     }
 });
@@ -173,7 +182,7 @@ pub async fn run_queue_gauges(pool: PgPool, shutdown: CancellationToken) {
     }
 }
 
-/// 큐 상태 지표를 한 번 갱신한다 (`jobs.ready`, `jobs.dead`, `booking.unknown.oldest_age`)
+/// 큐 상태 지표를 한 번 갱신한다 (`jobs.ready`, `jobs.dead`, `booking.unknown.oldest_age`, `reconciliation.issues.open`)
 pub async fn refresh_queue_gauges(pool: &PgPool) -> Result<(), DbError> {
     let depths = db::jobs::queue_depths(pool).await?;
 
@@ -202,6 +211,18 @@ pub async fn refresh_queue_gauges(pool: &PgPool) -> Result<(), DbError> {
     INSTRUMENTS
         .unknown_oldest_age
         .record(oldest_unknown.as_secs_f64(), &[]);
+
+    // 미해결 대사 이슈 수. 이슈가 없는 종류도 0으로 내보낸다 (처리 완료로 바뀌면 0으로 내려가야 알림이 풀린다).
+    let mut open: BTreeMap<IssueKind, u64> =
+        IssueKind::ALL.into_iter().map(|kind| (kind, 0)).collect();
+    for (kind, issues) in db::reconciliation::open_counts(pool).await? {
+        open.insert(kind, count(issues));
+    }
+    for (kind, issues) in open {
+        INSTRUMENTS
+            .issues_open
+            .record(issues, &[KeyValue::new("kind", kind.as_str())]);
+    }
     Ok(())
 }
 
@@ -247,6 +268,19 @@ pub fn register_provider_gauges(registry: &Arc<ProviderRegistry>) {
         .with_callback(move |observer| {
             for_each_provider(&providers, |provider, label| {
                 observer.observe(provider.in_flight() as u64, label);
+            });
+        })
+        .build();
+
+    let providers = Arc::downgrade(registry);
+    let _allowed = meter
+        .u64_observable_gauge("provider.rate_limit.allowed")
+        .with_description(
+            "우리 rate limiter가 지금 허용하는 초당 호출 수 (업체가 한도 초과를 알리면 AIMD로 줄었다가 되돌아간다)",
+        )
+        .with_callback(move |observer| {
+            for_each_provider(&providers, |provider, label| {
+                observer.observe(u64::from(provider.rate_limit_allowed()), label);
             });
         })
         .build();

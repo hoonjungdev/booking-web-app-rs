@@ -7,16 +7,15 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::Utc;
 
 use crate::{
     AppState, Provider,
-    alpha::{
-        AlphaError,
-        model::{Reservation, ReservationList, ReservationQuery},
-    },
+    alpha::model::{ReservationList, ReservationQuery},
+    beta::{BetaError, model::BookingList},
     chaos::{ChaosConfig, Preset},
     lock,
 };
@@ -65,31 +64,62 @@ async fn apply_preset(
     Json(config)
 }
 
-/// 예약 데이터를 비우고 장애 설정을 healthy로 되돌린다.
+/// 모든 업체의 예약 데이터를 비우고(beta의 예약 번호도 1부터 다시) 장애 설정을 healthy로 되돌린다.
 async fn reset(State(state): State<AppState>) -> StatusCode {
     *lock(&state.alpha) = crate::alpha::Store::default();
+    *lock(&state.beta) = crate::beta::Store::default();
     state.chaos.reset_all(&Preset::Healthy.config());
     tracing::info!("mock provider state reset");
     StatusCode::NO_CONTENT
 }
 
+/// 저장된 예약 전체를 그 업체의 JSON 형식으로 돌려준다.
+/// alpha는 `{"reservations": [...]}`, beta는 `{"bookings": [...]}`.
+///
+/// 업체마다 본문 타입이 달라서 `Json<T>` 하나로 적을 수 없다. 그래서 각 갈래에서 `Response`로 바꿔 돌려준다
+/// (≈ ASP.NET Core에서 반환 타입을 `IActionResult`로 두는 것).
 async fn inspect_reservations(
     State(state): State<AppState>,
     Path(provider): Path<Provider>,
-) -> Json<ReservationList> {
-    let reservations = match provider {
-        Provider::Alpha => lock(&state.alpha).search(&ReservationQuery::default()),
-    };
-    Json(ReservationList { reservations })
+) -> Response {
+    match provider {
+        Provider::Alpha => {
+            let reservations = lock(&state.alpha).search(&ReservationQuery::default());
+            Json(ReservationList { reservations }).into_response()
+        }
+        Provider::Beta => {
+            let bookings = lock(&state.beta).all();
+            Json(BookingList { bookings }).into_response()
+        }
+    }
 }
 
-/// 업체 쪽에서 임의로 예약을 취소한다 (대사 작업 테스트용)
+/// 업체 쪽에서 임의로 예약을 취소한다 (대사 작업 테스트용). 취소한 예약을 그 업체의 JSON 형식으로 돌려준다.
 async fn cancel_at_provider(
     State(state): State<AppState>,
     Path((provider, id)): Path<(Provider, String)>,
-) -> Result<Json<Reservation>, AlphaError> {
-    let reservation = match provider {
-        Provider::Alpha => lock(&state.alpha).cancel(&id, Utc::now())?,
-    };
-    Ok(Json(reservation))
+) -> Response {
+    let now = Utc::now();
+    match provider {
+        // alpha의 취소는 멱등이라 이미 취소된 예약도 200. 없는 예약은 alpha 형식의 404.
+        Provider::Alpha => match lock(&state.alpha).cancel(&id, now) {
+            Ok(reservation) => Json(reservation).into_response(),
+            Err(error) => error.into_response(),
+        },
+        Provider::Beta => match lock(&state.beta).cancel(&id, now) {
+            Ok(booking) => Json(booking).into_response(),
+            // beta 업체 API는 에러도 200으로 주지만, 관리용 API는 테스트가 알아보기 쉽게 상태 코드로도 알린다.
+            // `(상태 코드, 응답)` 튜플은 본문은 그대로 두고 상태 코드만 바꾼다.
+            Err(error) => (inspect_status(&error), error).into_response(),
+        },
+    }
+}
+
+/// 관리용 취소 API가 beta 에러에 붙이는 상태 코드
+fn inspect_status(error: &BetaError) -> StatusCode {
+    match error {
+        BetaError::NotFound(_) => StatusCode::NOT_FOUND,
+        BetaError::AlreadyCancelled => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    }
 }

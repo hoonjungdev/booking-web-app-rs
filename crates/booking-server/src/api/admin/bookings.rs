@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::{AdminBooking, JobView, page_size, paginate};
 use crate::{
+    admin_auth::{AdminSession, RequireOperator},
     api::{ApiError, ApiState, Problem, docs::tags},
     trace,
 };
@@ -72,7 +73,7 @@ pub struct BookingEventView {
     pub from_status: Option<BookingStatus>,
     pub to_status: BookingStatus,
     pub reason: Option<String>,
-    /// 바꾼 주체: `api`, `worker`, `admin` …
+    /// 바꾼 주체: `api`, `worker`, `reconciler`, `admin:<이름>` …
     pub actor: String,
     /// 이 변경이 일어난 trace (접수는 요청의 trace, 확정 · 실패는 작업의 trace)
     pub trace_id: Option<String>,
@@ -128,15 +129,18 @@ impl TryFrom<super::RetryOutcome> for RetryResult {
     path = "/bookings",
     operation_id = "admin_list_bookings",
     tag = tags::ADMIN_BOOKINGS,
+    security(("admin_session" = [])),
     params(BookingListQuery),
     responses(
         (status = 200, description = "예약 목록 한 페이지", body = BookingPage),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "조건 값 오류", body = Problem, content_type = "application/problem+json"),
     ),
 )]
 #[tracing::instrument(name = "admin.bookings.list", skip_all)]
 pub async fn list_bookings(
     State(state): State<ApiState>,
+    _session: AdminSession,
     query: Result<Query<BookingListQuery>, QueryRejection>,
 ) -> Result<Json<BookingPage>, ApiError> {
     let Query(query) = query?;
@@ -166,15 +170,18 @@ pub async fn list_bookings(
     path = "/bookings/{id}",
     operation_id = "admin_get_booking",
     tag = tags::ADMIN_BOOKINGS,
+    security(("admin_session" = [])),
     params(("id" = Uuid, Path, description = "예약 ID")),
     responses(
         (status = 200, description = "예약과 상태 이력 · 업체 호출 기록 · 작업", body = BookingDetail),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "없는 예약", body = Problem, content_type = "application/problem+json"),
     ),
 )]
 #[tracing::instrument(name = "admin.bookings.get", skip_all, fields(booking_id = Empty))]
 pub async fn get_booking(
     State(state): State<ApiState>,
+    _session: AdminSession,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<BookingDetail>, ApiError> {
     let id = booking_id(id)?;
@@ -226,29 +233,35 @@ pub async fn get_booking(
     }))
 }
 
-/// 실패한 예약을 다시 처리한다
+/// 실패한 예약 · 취소에 실패한 예약을 다시 처리한다
 ///
-/// 예약을 `failed` → `pending`으로 되돌리고, 그 예약의 dead 작업을 되살린다 (없으면 새로 등록).
-/// 워커는 다시 보내기 전에 업체에서 이 예약을 먼저 찾아본다 (이미 만들어졌으면 확정으로 끝낸다).
+/// - `failed`: `pending`으로 되돌리고 그 예약의 dead 작업을 되살린다 (없으면 새로 등록). 워커는 다시 보내기 전에
+///   업체에서 이 예약을 먼저 찾아본다 (이미 만들어졌으면 확정으로 끝낸다).
+/// - `cancel_failed`: `cancel_requested`로 되돌리고 취소를 다시 보낸다.
 #[utoipa::path(
     post,
     path = "/bookings/{id}/retry",
     operation_id = "admin_retry_booking",
     tag = tags::ADMIN_BOOKINGS,
+    security(("admin_session" = [])),
     params(("id" = Uuid, Path, description = "예약 ID")),
     responses(
         (status = 202, description = "다시 처리하도록 작업을 넣음", body = RetryResult),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "operator 권한 필요", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "없는 예약", body = Problem, content_type = "application/problem+json"),
-        (status = 409, description = "failed가 아니거나 처리 중인 작업이 있음", body = Problem, content_type = "application/problem+json"),
+        (status = 409, description = "failed · cancel_failed가 아니거나 처리 중인 작업이 있음", body = Problem, content_type = "application/problem+json"),
     ),
 )]
 #[tracing::instrument(name = "admin.bookings.retry", skip_all, fields(booking_id = Empty))]
 pub async fn retry_booking(
     State(state): State<ApiState>,
+    RequireOperator(session): RequireOperator,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<(StatusCode, Json<RetryResult>), ApiError> {
     let id = booking_id(id)?;
-    let outcome = super::retry_booking(&state.pool, id, &trace::current()).await?;
+    let outcome =
+        super::retry_booking(&state.pool, id, &trace::current(), &session.actor()).await?;
     Ok((StatusCode::ACCEPTED, Json(outcome.try_into()?)))
 }
 

@@ -34,8 +34,7 @@ impl ProviderRegistry {
         let mut registry = Self::default();
         for record in db::providers::list_enabled(pool).await? {
             let built = ProviderPolicy::from_json(record.policy).and_then(|policy| {
-                let adapter =
-                    providers::build_adapter(&record.adapter_kind, &record.base_url, &policy)?;
+                let adapter = providers::build_adapter(&record.adapter_kind, &record.base_url)?;
                 Ok((adapter, policy))
             });
             let (adapter, policy) = built.map_err(|source| RegistryError::Build {

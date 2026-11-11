@@ -13,6 +13,11 @@ publish = false
 # 각 크레이트에서는 `tokio.workspace = true`처럼 가져다 쓰고, 필요한 feature만 덧붙인다.
 [workspace.dependencies]
 anyhow = "1.0.104"
+# 정책 · rate limiter를 실행 중에 통째로 바꾼다 (읽기는 잠금 없이, 바꾸기는 드물게. ≈ .NET의 IOptionsMonitor).
+# 1.9.4 · 1.9.5는 공개된 지 1주가 안 되어 그 전 버전을 쓴다.
+arc-swap = "1.9.3"
+# 관리자 비밀번호 해시 (docs/06-admin-frontend.md §6). 기본 기능: 솔트를 OS 난수로 만든다(getrandom)
+argon2 = "0.6.0"
 async-trait = "0.1.92"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
@@ -30,6 +35,8 @@ governor = { version = "0.10.4", default-features = false, features = ["std"] }
 opentelemetry = "0.33.1"
 # tracing 이벤트 → OpenTelemetry 로그
 opentelemetry-appender-tracing = "0.33.1"
+# 빈 시간 조회 캐시 (TTL + 크기 제한, ≈ .NET의 IMemoryCache). 동기 캐시만 쓴다 (`sync`)
+moka = { version = "0.12.16", features = ["sync"] }
 # HTTP 헤더 ↔ trace 정보(`traceparent`) 변환 도우미
 opentelemetry-http = "0.33.1"
 # 기본 기능: HTTP + protobuf 전송, 전용 스레드에서 도는 reqwest blocking 클라이언트 (gRPC · tonic 없이 가볍다)

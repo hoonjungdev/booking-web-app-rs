@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET run_at = now(), trace_context = $2, updated_at = now()\n         WHERE provider_id = $1 AND kind = 'reconcile_provider' AND status = 'queued'\n         RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5ea364add77fe2235a32297e0a543eee79a1aea558e19dc7f462219d887f6a5c"
+}

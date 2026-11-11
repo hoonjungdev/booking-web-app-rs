@@ -7,17 +7,21 @@
 //! |---|---|
 //! | [`config`] | 환경 변수에서 설정 읽기 |
 //! | [`auth`] | API 키 발급 · 해시 · 요청 인증 |
+//! | [`admin_auth`] | 관리자 로그인 세션 · 역할(viewer · operator · admin) · 비밀번호 해시 |
+//! | [`availability`] | 빈 시간 조회 캐시 (TTL + stale-if-error) |
 //! | [`api`] | 예약 API (`/v1`), 관리자 API (`/admin/api`), API 문서 (`/openapi.json`, `/docs`), 헬스 체크 |
 //! | [`web`] | 관리자 웹 정적 파일 (`/admin`) |
 //! | [`chaos`] | mock 업체 장애 주입 API 중계 (개발 환경 전용) |
 //! | [`registry`] | 업체 ID → 장애 대응 파이프라인으로 감싼 업체 (`ResilientProvider`) |
-//! | [`worker`] | 작업 큐 처리 (업체에 예약 제출, 결과 불명 예약 확인) |
+//! | [`worker`] | 작업 큐 처리 (업체에 예약 제출 · 취소, 결과 불명 예약 확인, 대사) |
 //! | [`recorder`] | 업체 호출 기록을 모아 `provider_calls`에 저장 |
 //! | [`metrics`] | 예약 · 작업 큐 · 업체 상태 지표 |
 //! | [`trace`] | 접수 요청과 작업 처리를 trace로 잇기 |
 
+pub mod admin_auth;
 pub mod api;
 pub mod auth;
+pub mod availability;
 pub mod chaos;
 pub mod config;
 pub mod metrics;

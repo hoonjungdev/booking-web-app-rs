@@ -3,12 +3,22 @@
 //! 업체 API 요청마다 아래 순서로 장애를 적용한다 (docs/04-api.md §4).
 //!
 //! 1. `outage`면 바로 503
-//! 2. rate limit 초과면 429 + `Retry-After`
+//! 2. rate limit 초과면 429(alpha) · 503(beta) + `Retry-After`
 //! 3. 지연 (`latency_ms` 범위에서 무작위, 일정 확률로 `slow` 지연)
 //! 4. 일정 확률로 5xx (예약을 **만들지 않음**)
 //! 5. 일정 확률로 응답하지 않고 대기 (`hang`, 클라이언트 타임아웃 유발)
 //! 6. 정상 처리
 //! 7. 쓰기 요청이면 일정 확률로 **처리는 하고** 응답하지 않음 (`drop_after_commit`, 결과 불명 상황 재현)
+//!
+//! 미들웨어가 업체 대신 돌려주는 실패 응답은 그 업체의 형식을 따른다:
+//!
+//! | 경우 | alpha | beta |
+//! |---|---|---|
+//! | outage | 503 `{"error":{"code":"service_unavailable"}}` | 503 `{"ok":false,"code":"MAINTENANCE"}`, `Retry-After` 없음 |
+//! | 호출 한도 초과 | 429 `rate_limited` + `Retry-After` | 503 `BUSY` + `Retry-After` |
+//! | 주입한 5xx | 그 상태 코드 + `internal_error` | 그 상태 코드 + `SYSTEM_ERROR` |
+//! | hang 뒤 응답 (클라이언트는 보통 이미 끊었다) | 504 `timeout` | 504 `TIMEOUT` |
+//! | `X-RateLimit-*` 헤더 | outage를 뺀 모든 응답에 | 붙이지 않음 |
 
 use std::{
     collections::BTreeMap,
@@ -223,9 +233,10 @@ impl Preset {
     }
 }
 
-/// 업체별 장애 설정과 rate limiter를 보관한다.
+/// 업체별 장애 설정과 rate limiter를 보관한다. 업체마다 칸이 따로 있어 서로 영향을 주지 않는다.
 pub struct Registry {
     alpha: Mutex<ProviderChaos>,
+    beta: Mutex<ProviderChaos>,
 }
 
 struct ProviderChaos {
@@ -267,9 +278,11 @@ pub enum Admission {
 }
 
 impl Registry {
+    /// 모든 업체가 같은 설정으로 시작한다.
     pub fn new(initial: &ChaosConfig) -> Self {
         Self {
             alpha: Mutex::new(ProviderChaos::new(initial.clone())),
+            beta: Mutex::new(ProviderChaos::new(initial.clone())),
         }
     }
 
@@ -277,6 +290,7 @@ impl Registry {
     fn slot(&self, provider: Provider) -> &Mutex<ProviderChaos> {
         match provider {
             Provider::Alpha => &self.alpha,
+            Provider::Beta => &self.beta,
         }
     }
 
@@ -398,28 +412,15 @@ pub async fn middleware(State(ctx): State<ChaosContext>, request: Request, next:
     let (config, headers) = match ctx.registry.admit(ctx.provider, Instant::now()) {
         Admission::Outage => {
             tracing::debug!(provider = ?ctx.provider, "chaos: outage");
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                "업체 서비스 점검 중",
-            );
+            return failure_response(ctx.provider, Failure::Outage);
         }
         Admission::RateLimited {
             retry_after,
             headers,
         } => {
             tracing::debug!(provider = ?ctx.provider, ?retry_after, "chaos: rate limited");
-            let mut response = error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "호출 한도를 초과했습니다",
-            );
-            // Retry-After는 초 단위 정수. 1초 미만이어도 최소 1로 올린다.
-            let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
-            add_rate_limit_headers(&mut response, headers);
+            let mut response = failure_response(ctx.provider, Failure::RateLimited { retry_after });
+            add_rate_limit_headers(ctx.provider, &mut response, headers);
             return response;
         }
         Admission::Allowed { config, headers } => (config, headers),
@@ -443,38 +444,106 @@ pub async fn middleware(State(ctx): State<ChaosContext>, request: Request, next:
     }
 
     let mut response = match plan.fault {
-        Some(Fault::Error(status)) => error_response(status, "internal_error", "업체 내부 오류"),
-        Some(Fault::Hang) => hang().await,
+        Some(Fault::Error(status)) => failure_response(ctx.provider, Failure::Injected(status)),
+        Some(Fault::Hang) => hang(ctx.provider).await,
         None => {
             let response = next.run(request).await;
             if plan.drop_after_commit {
                 // 처리는 끝났지만(예약 생성됨) 응답을 보내지 않는다.
-                hang().await
+                hang(ctx.provider).await
             } else {
                 response
             }
         }
     };
-    add_rate_limit_headers(&mut response, headers);
+    add_rate_limit_headers(ctx.provider, &mut response, headers);
     response
 }
 
 /// 응답을 오래 붙잡아 클라이언트 타임아웃을 일으킨다.
 /// 클라이언트가 먼저 연결을 끊으면 axum이 이 Future를 버리므로 대기도 함께 끝난다.
-async fn hang() -> Response {
+async fn hang(provider: Provider) -> Response {
     tokio::time::sleep(HANG_DURATION)
         .instrument(tracing::info_span!("chaos.hang"))
         .await;
-    error_response(StatusCode::GATEWAY_TIMEOUT, "timeout", "응답 시간 초과")
+    failure_response(provider, Failure::Timeout)
 }
 
-/// alpha 형식의 에러 응답. beta를 추가할 때(Phase 6) 업체별 형식으로 나눈다.
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = json!({ "error": { "code": code, "message": message } });
-    (status, Json(body)).into_response()
+/// 미들웨어가 업체 대신 돌려주는 실패의 종류
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    /// 점검 중 (`outage`)
+    Outage,
+    /// 호출 한도 초과. `retry_after` 뒤에 다시 시도하면 된다
+    RateLimited { retry_after: Duration },
+    /// 일부러 주입한 5xx
+    Injected(StatusCode),
+    /// `hang` · `drop_after_commit`으로 붙잡아 두었다가 늦게 보내는 응답
+    Timeout,
 }
 
-fn add_rate_limit_headers(response: &mut Response, headers: RateLimitHeaders) {
+/// 실패 응답을 업체 형식으로 만든다 (모듈 문서의 표)
+fn failure_response(provider: Provider, failure: Failure) -> Response {
+    let (status, body) = match provider {
+        Provider::Alpha => {
+            let (status, code, message) = match failure {
+                Failure::Outage => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "업체 서비스 점검 중",
+                ),
+                Failure::RateLimited { .. } => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "호출 한도를 초과했습니다",
+                ),
+                Failure::Injected(status) => (status, "internal_error", "업체 내부 오류"),
+                Failure::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout", "응답 시간 초과"),
+            };
+            let body = json!({ "error": { "code": code, "message": message } });
+            (status, body)
+        }
+        // 레거시 업체 beta는 한도 초과도 429가 아니라 503으로 알린다.
+        // 그래서 점검(outage)과는 본문의 code와 `Retry-After` 헤더로만 구분된다.
+        Provider::Beta => {
+            let (status, code, message) = match failure {
+                Failure::Outage => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MAINTENANCE",
+                    "시스템 점검 중입니다",
+                ),
+                Failure::RateLimited { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "BUSY",
+                    "요청이 많습니다. 잠시 후 다시 시도해 주세요",
+                ),
+                Failure::Injected(status) => (status, "SYSTEM_ERROR", "시스템 오류입니다"),
+                Failure::Timeout => (StatusCode::GATEWAY_TIMEOUT, "TIMEOUT", "응답 시간 초과"),
+            };
+            let body = json!({ "ok": false, "code": code, "message": message });
+            (status, body)
+        }
+    };
+
+    let mut response = (status, Json(body)).into_response();
+    // `if let 패턴 = 값`: 값이 그 모양일 때만 안쪽을 실행하고, 안의 필드를 꺼내 쓴다
+    if let Failure::RateLimited { retry_after } = failure {
+        // Retry-After는 초 단위 정수. 1초 미만이어도 최소 1로 올린다.
+        let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
+    response
+}
+
+/// 남은 호출 한도를 응답 헤더로 알린다. alpha만 보내고, 레거시 업체 beta는 알려 주지 않는다.
+fn add_rate_limit_headers(provider: Provider, response: &mut Response, headers: RateLimitHeaders) {
+    // `if provider == ...` 대신 match로 쓰면, 업체가 늘어났을 때 여기서도 정하라고 컴파일러가 알려 준다.
+    match provider {
+        Provider::Alpha => {}
+        Provider::Beta => return,
+    }
     let map = response.headers_mut();
     map.insert(
         HeaderName::from_static("x-ratelimit-limit"),
@@ -563,6 +632,39 @@ mod tests {
         assert_eq!(
             registry.admit(Provider::Alpha, Instant::now()),
             Admission::Outage
+        );
+    }
+
+    #[test]
+    fn 업체마다_설정과_호출_한도를_따로_가진다() {
+        let mut one_per_second = ChaosConfig::passthrough();
+        one_per_second.rate_limit = RateLimitConfig {
+            per_second: 1,
+            burst: 1,
+        };
+        let registry = Registry::new(&one_per_second);
+        registry.set(Provider::Beta, Preset::Outage.config());
+        let now = Instant::now();
+
+        assert_eq!(registry.admit(Provider::Beta, now), Admission::Outage);
+        assert!(matches!(
+            registry.admit(Provider::Alpha, now),
+            Admission::Allowed { .. }
+        ));
+        assert!(matches!(
+            registry.admit(Provider::Alpha, now),
+            Admission::RateLimited { .. }
+        ));
+
+        // beta가 다시 정상이 되어도 alpha가 이미 쓴 토큰과는 상관없다
+        registry.set(Provider::Beta, one_per_second);
+        assert!(matches!(
+            registry.admit(Provider::Beta, now),
+            Admission::Allowed { .. }
+        ));
+        assert_eq!(
+            registry.all().keys().copied().collect::<Vec<_>>(),
+            vec![Provider::Alpha, Provider::Beta]
         );
     }
 }

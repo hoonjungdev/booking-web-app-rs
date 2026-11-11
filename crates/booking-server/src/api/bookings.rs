@@ -1,4 +1,4 @@
-//! `POST /v1/bookings`, `GET /v1/bookings/{id}`
+//! `POST /v1/bookings`, `GET /v1/bookings/{id}`, `POST /v1/bookings/{id}/cancel`
 
 use axum::{
     Json,
@@ -10,9 +10,13 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
-use db::bookings::{AcceptOutcome, NewBooking};
+use db::{
+    bookings::{AcceptOutcome, NewBooking, Transitioned},
+    jobs::{self, JobKind},
+};
 use domain::{
-    Booking, BookingId, BookingRequest, BookingStatus, Customer, ProviderId, confirmation_deadline,
+    Booking, BookingEvent, BookingId, BookingRequest, BookingStatus, Customer, ProviderId,
+    confirmation_deadline,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -215,6 +219,98 @@ pub async fn get(
         .await?
         .ok_or(ApiError::BookingNotFound)?;
     Ok(Json(BookingResponse::from(&booking)))
+}
+
+/// 확정된 예약의 취소를 요청한다. 업체 취소는 워커가 하므로 바로 `202 Accepted`를 돌려준다.
+///
+/// 취소는 원래 멱등이다: 이미 취소를 받은 예약(`cancel_requested` · `cancelled` · `cancel_failed`)이면 아무것도 바꾸지 않고
+/// 지금 상태로 202를 돌려준다. 확정되지 않은 예약은 409다 (처리 중인 예약을 취소하면 경쟁 상태가 복잡해져 받지 않는다).
+///
+/// 예약 행을 잠그고 상태를 확인한 뒤, 상태 전이(`confirmed → cancel_requested`)와 `cancel_booking` 작업 등록을
+/// 한 트랜잭션으로 저장한다. 두 취소 요청이 동시에 와도 작업은 하나만 생긴다.
+#[utoipa::path(
+    post,
+    path = "/v1/bookings/{id}/cancel",
+    operation_id = "cancel_booking",
+    tag = tags::BOOKINGS,
+    security(("api_key" = [])),
+    params(("id" = Uuid, Path, description = "예약 ID")),
+    responses(
+        (status = 202, description = "취소를 접수함 (업체 취소는 워커가 한다). 이미 취소를 받은 예약이면 지금 상태", body = BookingResponse),
+        (status = 401, description = "API 키가 없거나 틀림", body = Problem, content_type = "application/problem+json"),
+        (status = 404, description = "없거나 다른 클라이언트의 예약", body = Problem, content_type = "application/problem+json"),
+        (status = 409, description = "확정되지 않은 예약 (처리 중 · 거절 · 실패)", body = Problem, content_type = "application/problem+json"),
+    ),
+)]
+#[tracing::instrument(name = "booking.cancel", skip_all, fields(booking_id = Empty))]
+pub async fn cancel(
+    State(state): State<ApiState>,
+    client: AuthenticatedClient,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> Result<(StatusCode, Json<BookingResponse>), ApiError> {
+    let Path(id) = id.map_err(|_| ApiError::BookingNotFound)?;
+    Span::current().record("booking_id", tracing::field::display(id));
+    let id = BookingId::from_uuid(id);
+    let trace = trace::current();
+
+    let mut tx = state.pool.begin().await?;
+    // 행을 잠그고 읽는다: 확인과 변경 사이에 다른 요청이 끼어들지 못한다
+    let booking = db::bookings::get_for_update(&mut tx, id)
+        .await?
+        .filter(|booking| booking.client_id == client.id)
+        .ok_or(ApiError::BookingNotFound)?;
+    let requested = match booking.status {
+        BookingStatus::Confirmed => {
+            let transitioned = db::bookings::transition(
+                &mut tx,
+                id,
+                BookingStatus::Confirmed,
+                &BookingEvent::CancelRequested,
+                "api",
+                trace.trace_id.as_deref(),
+            )
+            .await?;
+            if transitioned == Transitioned::Conflict {
+                // 행을 잠갔으므로 일어나지 않는다
+                return Err(ApiError::Conflict("그사이 예약 상태가 바뀌었습니다".into()));
+            }
+            jobs::enqueue(
+                &mut tx,
+                JobKind::CancelBooking,
+                Some(id),
+                jobs::DEFAULT_MAX_ATTEMPTS,
+                trace.context.as_ref(),
+            )
+            .await?;
+            true
+        }
+        // 이미 받은 취소: 그대로 돌려준다
+        BookingStatus::CancelRequested | BookingStatus::Cancelled | BookingStatus::CancelFailed => {
+            false
+        }
+        BookingStatus::Pending | BookingStatus::Unknown => {
+            return Err(ApiError::Conflict(
+                "아직 처리 중인 예약은 취소할 수 없습니다. 확정된 뒤에 다시 요청하세요".into(),
+            ));
+        }
+        BookingStatus::Rejected | BookingStatus::Failed => {
+            return Err(ApiError::Conflict(format!(
+                "확정되지 않은 예약은 취소할 수 없습니다 (지금: {})",
+                booking.status
+            )));
+        }
+    };
+    tx.commit().await?;
+
+    if requested {
+        // 지표는 커밋한 뒤에 센다
+        metrics::booking_transitioned(&booking, BookingStatus::CancelRequested);
+        tracing::info!(booking_id = %id, client = %client.name, "booking cancel requested");
+    }
+    let booking = db::bookings::get(&state.pool, id)
+        .await?
+        .ok_or(ApiError::BookingNotFound)?;
+    Ok((StatusCode::ACCEPTED, Json(BookingResponse::from(&booking))))
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {

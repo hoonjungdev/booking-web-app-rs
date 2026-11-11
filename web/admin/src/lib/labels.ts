@@ -8,6 +8,8 @@ export type BookingStatus = Schemas['BookingStatus']
 export type JobStatus = Schemas['JobStatus']
 export type CircuitState = Schemas['CircuitStateView']
 export type ChaosPreset = Schemas['ChaosPreset']
+export type IssueKind = Schemas['IssueKindView']
+export type AdminRole = Schemas['AdminRole']
 
 type Label = { label: string; color: MantineColor }
 
@@ -69,3 +71,35 @@ export const CHAOS_PRESET: Record<ChaosPreset, { label: string; description: str
 }
 
 export const CHAOS_PRESETS = Object.keys(CHAOS_PRESET) as ChaosPreset[]
+
+/** 대사 이슈 종류 (docs/03-resilience.md §9) */
+export const ISSUE_KIND: Record<IssueKind, Label & { description: string }> = {
+  duplicate_suspected: {
+    label: '이중 예약 의심',
+    color: 'red',
+    description: '같은 참조값으로 확정된 예약이 업체에 2건 이상 있다. 업체에서 하나를 취소해야 한다',
+  },
+  missing_at_provider: {
+    label: '업체에 없음',
+    color: 'orange',
+    description: '우리는 확정인데 업체에는 그 예약이 없다',
+  },
+  missing_locally: {
+    label: '우리에게 없음',
+    color: 'grape',
+    description: '업체에 우리 참조값을 단 예약이 있는데 우리에게는 없다',
+  },
+  status_mismatch: {
+    label: '상태 불일치',
+    color: 'yellow',
+    description: '양쪽 상태가 다르다 (업체측 취소 등은 대사가 자동으로 바로잡고 처리 완료로 남긴다)',
+  },
+}
+
+export const ISSUE_KINDS = Object.keys(ISSUE_KIND) as IssueKind[]
+
+export const ADMIN_ROLE: Record<AdminRole, Label & { description: string }> = {
+  viewer: { label: '조회', color: 'gray', description: '조회만' },
+  operator: { label: '운영', color: 'blue', description: '재처리 · 서킷 조작 · 장애 주입 · 대사' },
+  admin: { label: '관리', color: 'grape', description: '정책 변경까지' },
+}

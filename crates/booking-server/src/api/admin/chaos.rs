@@ -11,7 +11,9 @@ use axum::{
 };
 use domain::ProviderId;
 
+use super::record_audit;
 use crate::{
+    admin_auth::{AdminSession, RequireOperator},
     api::{ApiError, ApiState, Problem, docs::tags},
     chaos::{ChaosClient, ChaosError, ChaosPreset, ChaosSettings},
 };
@@ -22,9 +24,11 @@ use crate::{
     path = "/chaos/{provider}",
     operation_id = "admin_get_chaos",
     tag = tags::ADMIN_CHAOS,
+    security(("admin_session" = [])),
     params(("provider" = String, Path, description = "업체 ID (mock 업체 이름과 같다)")),
     responses(
         (status = 200, description = "장애 설정", body = ChaosSettings),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "mock 업체에 없는 업체", body = Problem, content_type = "application/problem+json"),
         (status = 502, description = "mock 업체를 부를 수 없음", body = Problem, content_type = "application/problem+json"),
         (status = 503, description = "장애 주입이 꺼져 있음 (BOOKING_CHAOS_URL)", body = Problem, content_type = "application/problem+json"),
@@ -33,6 +37,7 @@ use crate::{
 #[tracing::instrument(name = "admin.chaos.get", skip_all, fields(provider = %provider))]
 pub async fn get_chaos(
     State(state): State<ApiState>,
+    _session: AdminSession,
     Path(provider): Path<String>,
 ) -> Result<Json<ChaosSettings>, ApiError> {
     let (client, provider) = target(&state, &provider)?;
@@ -45,10 +50,13 @@ pub async fn get_chaos(
     path = "/chaos/{provider}",
     operation_id = "admin_put_chaos",
     tag = tags::ADMIN_CHAOS,
+    security(("admin_session" = [])),
     params(("provider" = String, Path, description = "업체 ID")),
     request_body = ChaosSettings,
     responses(
         (status = 200, description = "바뀐 장애 설정", body = ChaosSettings),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "operator 권한 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "설정 값 오류 (확률이 0~1 밖 등)", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "mock 업체에 없는 업체", body = Problem, content_type = "application/problem+json"),
         (status = 502, description = "mock 업체를 부를 수 없음", body = Problem, content_type = "application/problem+json"),
@@ -58,6 +66,7 @@ pub async fn get_chaos(
 #[tracing::instrument(name = "admin.chaos.put", skip_all, fields(provider = %provider))]
 pub async fn put_chaos(
     State(state): State<ApiState>,
+    RequireOperator(session): RequireOperator,
     Path(provider): Path<String>,
     body: Result<Json<ChaosSettings>, JsonRejection>,
 ) -> Result<Json<ChaosSettings>, ApiError> {
@@ -66,6 +75,16 @@ pub async fn put_chaos(
     // 보내기 전에 우리가 검사한다. 어느 값이 틀렸는지 우리 말로 알려 줄 수 있다.
     settings.validate().map_err(ApiError::InvalidRequest)?;
     let applied = client.put(&provider, &settings).await.map_err(api_error)?;
+    let detail = serde_json::to_value(&applied).unwrap_or_default();
+    let mut conn = state.pool.acquire().await?;
+    record_audit(
+        &mut conn,
+        &session.actor(),
+        "chaos.update",
+        Some(provider.as_str()),
+        detail,
+    )
+    .await?;
     tracing::info!(%provider, "관리자가 mock 업체의 장애 설정을 바꿨다");
     Ok(Json(applied))
 }
@@ -76,12 +95,15 @@ pub async fn put_chaos(
     path = "/chaos/{provider}/preset/{name}",
     operation_id = "admin_apply_chaos_preset",
     tag = tags::ADMIN_CHAOS,
+    security(("admin_session" = [])),
     params(
         ("provider" = String, Path, description = "업체 ID"),
         ("name" = ChaosPreset, Path, description = "시나리오 이름"),
     ),
     responses(
         (status = 200, description = "적용한 장애 설정", body = ChaosSettings),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "operator 권한 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "없는 시나리오", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "mock 업체에 없는 업체", body = Problem, content_type = "application/problem+json"),
         (status = 502, description = "mock 업체를 부를 수 없음", body = Problem, content_type = "application/problem+json"),
@@ -91,6 +113,7 @@ pub async fn put_chaos(
 #[tracing::instrument(name = "admin.chaos.preset", skip_all)]
 pub async fn apply_chaos_preset(
     State(state): State<ApiState>,
+    RequireOperator(session): RequireOperator,
     path: Result<Path<(String, ChaosPreset)>, PathRejection>,
 ) -> Result<Json<ChaosSettings>, ApiError> {
     let Path((provider, preset)) = path?;
@@ -99,6 +122,15 @@ pub async fn apply_chaos_preset(
         .apply_preset(&provider, preset)
         .await
         .map_err(api_error)?;
+    let mut conn = state.pool.acquire().await?;
+    record_audit(
+        &mut conn,
+        &session.actor(),
+        "chaos.preset",
+        Some(provider.as_str()),
+        serde_json::json!({ "preset": preset }),
+    )
+    .await?;
     tracing::info!(%provider, ?preset, "관리자가 mock 업체에 장애 시나리오를 적용했다");
     Ok(Json(applied))
 }

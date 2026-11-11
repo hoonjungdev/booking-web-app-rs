@@ -2,6 +2,9 @@
 //!
 //! 슬롯과 정원은 DB 없이 "자원 ID + 날짜 + 시각"으로 정해지는 고정 규칙으로 만든다.
 //! 그래서 서버를 재시작해도 같은 날짜에는 항상 같은 슬롯과 정원이 나온다.
+//!
+//! 매장 목록은 업체마다 따로 있다: alpha는 [`RESOURCES`], beta는 [`BETA_SHOPS`].
+//! 슬롯 규칙([`slots_for`], [`slot_at`])은 두 업체가 함께 쓰고, 매장 ID(코드)가 다르므로 정원도 다르게 나온다.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
 
@@ -12,7 +15,7 @@ pub struct Resource {
     pub name: &'static str,
 }
 
-/// 업체가 가진 자원 목록.
+/// alpha 업체가 가진 자원 목록.
 /// `&'static str`은 프로그램이 끝날 때까지 살아 있는 문자열(리터럴)을 가리키는 참조다.
 pub const RESOURCES: &[Resource] = &[
     Resource {
@@ -25,6 +28,22 @@ pub const RESOURCES: &[Resource] = &[
     },
     Resource {
         id: "store-003",
+        name: "판교점",
+    },
+];
+
+/// beta 업체의 매장 목록. 같은 매장이라도 레거시 시스템이라 `GN01` 같은 매장 코드를 쓴다.
+pub const BETA_SHOPS: &[Resource] = &[
+    Resource {
+        id: "GN01",
+        name: "강남점",
+    },
+    Resource {
+        id: "HD02",
+        name: "홍대점",
+    },
+    Resource {
+        id: "PG03",
         name: "판교점",
     },
 ];
@@ -51,9 +70,14 @@ pub fn kst() -> FixedOffset {
     FixedOffset::east_opt(9 * 3600).expect("UTC+9는 항상 올바른 오프셋이다")
 }
 
-/// ID로 자원을 찾는다. 없으면 `None` (≈ C#의 null 대신 쓰는 Option 타입)
+/// ID로 alpha 자원을 찾는다. 없으면 `None` (≈ C#의 null 대신 쓰는 Option 타입)
 pub fn find_resource(id: &str) -> Option<&'static Resource> {
     RESOURCES.iter().find(|r| r.id == id)
+}
+
+/// 매장 코드로 beta 매장을 찾는다. 없으면 `None`
+pub fn find_beta_shop(code: &str) -> Option<&'static Resource> {
+    BETA_SHOPS.iter().find(|r| r.id == code)
 }
 
 /// 자원의 특정 날짜(한국 날짜) 슬롯 목록
@@ -128,6 +152,17 @@ mod tests {
                 .iter()
                 .all(|s| s.capacity <= MAX_CAPACITY)
         );
+    }
+
+    #[test]
+    fn beta_매장은_코드로_찾고_alpha_자원과_섞이지_않는다() {
+        assert_eq!(find_beta_shop("GN01").map(|r| r.name), Some("강남점"));
+        assert_eq!(find_beta_shop("store-001"), None);
+        assert_eq!(find_resource("GN01"), None);
+        // 같은 규칙이라도 매장 코드가 다르면 정원이 따로 정해진다. 슬롯 시각은 같다.
+        let beta = slots_for("GN01", date());
+        assert_eq!(beta.len(), 11);
+        assert_eq!(beta[0].start, slots_for("store-001", date())[0].start);
     }
 
     #[test]

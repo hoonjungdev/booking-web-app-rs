@@ -1104,6 +1104,151 @@
       }
     },
     {
+      "id": 23,
+      "type": "row",
+      "title": "적응형 rate limit (AIMD)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "우리 limiter가 허용하는 초당 호출 수",
+      "description": "업체가 호출 한도 초과를 알리면(429 · 503 + Retry-After) 허용 속도를 절반으로 줄이고, 5초 동안 한도 초과가 없으면 정책 상한의 10%씩 되돌린다 (docs/03-resilience.md §6 ④). 상한은 업체 정책의 rate_limit.per_second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "provider_rate_limit_allowed{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}} 허용 속도",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 24,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "업체가 알린 한도 초과 (429 · 503)",
+      "description": "허용 속도가 줄어든 까닭. 업체가 한도 초과를 알린 횟수(초당).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (provider) (rate(provider_throttled_total{provider=~\"$provider\", source=\"remote\"}[1m]))",
+          "legendFormat": "{{provider}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "id": 25,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      }
+    },
+    {
       "id": 20,
       "type": "row",
       "title": "trace로 들어가기",
@@ -1112,7 +1257,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "panels": []
     },
@@ -1156,7 +1301,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 49
       }
     },
     {
@@ -1199,7 +1344,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 49
       }
     }
   ],

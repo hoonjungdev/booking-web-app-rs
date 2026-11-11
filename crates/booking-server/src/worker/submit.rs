@@ -9,18 +9,32 @@
 //!               ├─ 업체에 없음 ─────▶ 제출 (아래 decide)
 //!               └─ 조회 실패 ───────▶ 작업 재예약 (표시는 그대로라 다음에도 조회부터 한다)
 //! ```
+//!
+//! **멱등키 없는 업체에는 보내기 직전에 "보냄" 표시를 커밋한다** (Phase 6, docs/decisions.md D-31).
+//! 보낸 뒤 결과를 기록하기 전에 워커가 죽으면(또는 그 기록이 DB 오류로 실패하면) lease가 끝난 뒤 다른 워커가 같은 작업을
+//! 다시 가져간다. 그 워커는 표시를 보고 **다시 보내지 않고** 결과 불명(`unknown`)으로 넘겨 업체에서 조회부터 한다.
+//!
+//! ```text
+//! 워커 A: [보냄 표시 커밋] ─▶ 업체에 POST ─▶ (죽음) ✗ 결과 기록 못 함
+//! 워커 B: 다시 가져감 ─▶ 보냄 표시가 있다 ─▶ unknown + resolve_unknown (업체에서 참조값으로 조회)
+//! ```
 
 use std::time::Instant;
 
 use chrono::Utc;
-use db::jobs::Job;
+use db::jobs::{self, Job};
 use domain::{BookingEvent, BookingStatus};
 use providers::{CallContext, Capabilities, CreateBooking, ProviderBooking, ProviderError};
 use serde::{Deserialize, Serialize};
 
 use super::{
     Decision, WorkerContext, WorkerError, apply, complete_only, defer_if_blocked, give_up,
+    warn_lease_lost,
 };
+
+/// 앞선 실행이 업체에 보낸 뒤 결과를 기록하지 못하고 멈췄을 때 남기는 결과 불명 사유
+pub const UNRECORDED_SEND: &str =
+    "unrecorded_send: 앞선 처리가 업체에 요청을 보낸 뒤 결과를 기록하지 못했다";
 
 /// `submit_booking` 작업의 진행 상황 (`jobs.payload`)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +128,17 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
         tracing::info!(status = %booking.status, "이미 처리된 예약이라 작업만 끝낸다");
         return complete_only(ctx, lease).await;
     }
+    if job.sent_at.is_some() {
+        // 앞선 실행이 멱등키 없는 업체에 보낸 뒤 결과를 남기지 못했다. 업체에 예약이 생겼을 수 있으므로 다시 보내지 않는다.
+        // 기한이 지났어도 먼저 결과 불명으로 보내 업체에서 확인한다 (그냥 포기하면 업체에만 예약이 남을 수 있다).
+        tracing::warn!(
+            "앞선 처리가 보낸 요청의 결과를 모른다. 다시 보내지 않고 결과 불명으로 넘긴다"
+        );
+        let unknown = BookingEvent::OutcomeUnknown {
+            detail: UNRECORDED_SEND.to_owned(),
+        };
+        return apply(ctx, job, &booking, Decision::Transition(unknown)).await;
+    }
     if Utc::now() >= booking.deadline_at {
         return give_up(ctx, lease, &booking, "deadline_exceeded".to_owned()).await;
     }
@@ -143,6 +168,16 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
         } else {
             // 확인할 방법이 없다. 관리자가 업체에 직접 확인하고 재시도했다고 보고 보낸다.
             tracing::warn!("업체가 참조값 조회를 지원하지 않아 확인 없이 다시 보낸다");
+        }
+    }
+    if !provider.capabilities().idempotency_key {
+        // 멱등키가 없어 두 번 보내면 예약이 둘 생긴다. 보내기 직전에 "보냄" 표시를 커밋해 둔다 (모듈 설명).
+        // 이때 lease도 새로 잡는다: 앞의 조회(lookup_first)에 lease를 거의 다 썼어도 제출 한 번이 끝날 시간이 남는다.
+        // lease를 잃었으면 이미 다른 워커가 이 작업을 가져간 것이라 보내지 않는다.
+        let mut conn = ctx.pool.acquire().await?;
+        if !jobs::mark_sent(&mut conn, lease, ctx.config.lease).await? {
+            warn_lease_lost();
+            return Ok(());
         }
     }
     let result = provider

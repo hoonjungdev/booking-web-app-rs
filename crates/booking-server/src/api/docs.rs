@@ -7,10 +7,12 @@ use utoipa::{
     openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
 };
 
-use crate::chaos::ChaosPreset;
+use crate::{admin_auth::SESSION_COOKIE, chaos::ChaosPreset};
 
 /// 예약 API의 인증 방식 이름. 핸들러의 `security(("api_key" = []))`가 이 이름을 가리킨다.
 pub const API_KEY_SCHEME: &str = "api_key";
+/// 관리자 API의 인증 방식 이름 (로그인 세션 쿠키). 핸들러의 `security(("admin_session" = []))`가 가리킨다.
+pub const ADMIN_SESSION_SCHEME: &str = "admin_session";
 
 /// 태그: Swagger UI에서 경로를 묶어 보여 주는 단위
 pub mod tags {
@@ -20,6 +22,8 @@ pub mod tags {
     pub const ADMIN_PROVIDERS: &str = "admin: providers";
     pub const ADMIN_STATS: &str = "admin: stats";
     pub const ADMIN_CHAOS: &str = "admin: chaos";
+    pub const ADMIN_RECONCILIATION: &str = "admin: reconciliation";
+    pub const ADMIN_AUTH: &str = "admin: auth";
     pub const ADMIN: &str = "admin";
 }
 
@@ -31,7 +35,8 @@ pub mod tags {
         title = "Booking Gateway API",
         description = "외부 예약 업체 연동 게이트웨이.\n\n\
             - `/v1`: 예약 API (클라이언트용, `X-Api-Key` 인증)\n\
-            - `/admin/api`: 관리자 API (Phase 6 전까지는 로컬 전용, 인증 없음)\n\n\
+            - `/admin/api`: 관리자 API (`POST /admin/api/login`으로 받은 세션 쿠키. 조회는 viewer, \
+            재처리 · 서킷 조작 · 장애 주입 · 대사는 operator, 정책 변경은 admin 역할)\n\n\
             오류는 RFC 9457 Problem Details(`application/problem+json`)로 돌려준다. \
             응답 헤더 `X-Trace-Id`로 Grafana에서 요청의 처리 과정을 찾을 수 있다.",
     ),
@@ -42,18 +47,20 @@ pub mod tags {
         (name = "admin: providers", description = "관리자: 업체 설정 · 런타임 상태 · 서킷 조작"),
         (name = "admin: stats", description = "관리자: 업체 호출 통계 (provider_calls)"),
         (name = "admin: chaos", description = "관리자: mock 업체 장애 주입 중계 (개발 환경 전용)"),
+        (name = "admin: reconciliation", description = "관리자: 대사 이슈 · 지금 대사"),
+        (name = "admin: auth", description = "관리자: 로그인 · 로그아웃 · 감사 로그"),
         (name = "admin", description = "관리자 화면 설정"),
     ),
     // 경로 매개변수로만 쓰는 타입은 저절로 등록되지 않아 직접 적는다 (`/admin/api/chaos/{provider}/preset/{name}`)
     components(schemas(ChaosPreset)),
-    modifiers(&ApiKeySecurity),
+    modifiers(&Security),
 )]
 pub struct ApiDoc;
 
-/// 예약 API의 `X-Api-Key` 헤더 인증을 문서에 등록한다
-struct ApiKeySecurity;
+/// 인증 방식을 문서에 등록한다: 예약 API의 `X-Api-Key` 헤더, 관리자 API의 세션 쿠키
+struct Security;
 
-impl Modify for ApiKeySecurity {
+impl Modify for Security {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
@@ -61,6 +68,13 @@ impl Modify for ApiKeySecurity {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Api-Key",
                 "`booking-server create-client`로 발급한 API 키",
+            ))),
+        );
+        components.add_security_scheme(
+            ADMIN_SESSION_SCHEME,
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                SESSION_COOKIE,
+                "`POST /admin/api/login`이 주는 세션 쿠키 (`booking-server create-admin`으로 만든 계정)",
             ))),
         );
     }

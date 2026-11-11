@@ -1,22 +1,30 @@
 //! 관리자 API (`/admin/api`, docs/04-api.md §3)
 //!
-//! 관리자 웹(web/admin)이 쓴다. Phase 6 전까지는 로컬 전용이라 인증이 없다.
+//! 관리자 웹(web/admin)이 쓴다. 로그인한 관리자만 쓸 수 있고(세션 쿠키), 조작은 역할에 따라 막는다 (Phase 6):
+//! 조회는 viewer 이상, 재처리 · 서킷 조작 · 장애 주입 · 대사는 operator 이상, 정책 변경은 admin (`crate::admin_auth`).
+//! 조작은 모두 감사 로그(`admin_audit_log`)에 남고, 예약 상태를 바꾼 조작은 상태 이력에도 `admin:<이름>`으로 남는다.
 //!
 //! | 모듈 | 경로 |
 //! |---|---|
-//! | `bookings` | 예약 목록 · 상세(상태 이력 · 호출 기록 · 작업), 실패한 예약 재시도 |
+//! | `auth` | 로그인 · 로그아웃 · 지금 세션 |
+//! | `bookings` | 예약 목록 · 상세(상태 이력 · 호출 기록 · 작업), 실패한 예약 · 취소 실패 재시도 |
 //! | `jobs` | 작업 목록 · 종류별 개수, dead 작업 재큐잉 |
-//! | `providers` | 업체 목록 · 상세(정책 · 런타임 상태), 서킷 강제 조작 |
+//! | `providers` | 업체 목록 · 상세(정책 · 런타임 상태), 정책 변경, 서킷 강제 조작, 지금 대사 |
+//! | `reconciliation` | 대사 이슈 목록 · 개수 · 처리 완료 표시 |
 //! | `stats` | 업체 호출 통계: 구간별 시계열, 업체별 요약 (provider_calls) |
 //! | `chaos` | mock 업체 장애 주입 중계 (개발 환경 전용) |
-//! | `info` | 관리자 화면이 알아야 할 서버 설정 (Grafana 주소, 쓸 수 있는 기능) |
+//! | `audit` | 감사 로그 |
+//! | `info` | 관리자 화면이 알아야 할 서버 설정 (Grafana 주소, 쓸 수 있는 기능). 로그인 없이 읽는다 |
 //! | `retry` | 재시도 · 재큐잉의 DB 처리 (한 트랜잭션) |
 
+mod audit;
+mod auth;
 mod bookings;
 mod chaos;
 mod info;
 mod jobs;
 mod providers;
+mod reconciliation;
 mod retry;
 mod stats;
 
@@ -27,6 +35,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use db::jobs::JobRecord;
 use domain::BookingId;
 use serde::{Deserialize, Serialize};
+use sqlx::PgConnection;
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -41,6 +50,9 @@ const MAX_PAGE_SIZE: u32 = 200;
 pub(super) fn routes() -> OpenApiRouter<ApiState> {
     // 같은 경로에 메서드가 여러 개면(GET · PUT) 한 `routes!`에 함께 넣는다
     OpenApiRouter::new()
+        .routes(routes!(auth::login))
+        .routes(routes!(auth::logout))
+        .routes(routes!(auth::session))
         .routes(routes!(bookings::list_bookings))
         .routes(routes!(bookings::get_booking))
         .routes(routes!(bookings::retry_booking))
@@ -49,12 +61,46 @@ pub(super) fn routes() -> OpenApiRouter<ApiState> {
         .routes(routes!(jobs::requeue_job))
         .routes(routes!(providers::list_providers))
         .routes(routes!(providers::get_provider))
+        .routes(routes!(providers::update_policy))
         .routes(routes!(providers::control_circuit))
+        .routes(routes!(providers::run_reconcile))
+        .routes(routes!(reconciliation::list_issues))
+        .routes(routes!(reconciliation::issue_counts))
+        .routes(routes!(reconciliation::resolve_issue))
         .routes(routes!(stats::providers_summary))
         .routes(routes!(stats::provider_timeseries))
         .routes(routes!(chaos::get_chaos, chaos::put_chaos))
         .routes(routes!(chaos::apply_chaos_preset))
+        .routes(routes!(audit::audit_log))
         .routes(routes!(info::admin_info))
+        // 위의 모든 관리자 API에 건다: 상태를 바꾸는 요청은 관리자 화면과 같은 출처에서 온 것만 받는다 (CSRF 방어)
+        .layer(axum::middleware::from_fn(
+            crate::admin_auth::reject_cross_origin,
+        ))
+}
+
+/// 관리자 조작을 감사 로그에 남긴다. 조작과 같은 트랜잭션(`conn`)에서 부르면 "조작은 됐는데 기록은 없는" 경우가 생기지 않는다.
+/// 지금 요청의 trace ID를 함께 남긴다 (Grafana에서 그 조작의 처리 과정을 찾을 수 있다).
+pub(super) async fn record_audit(
+    conn: &mut PgConnection,
+    actor: &str,
+    action: &str,
+    target: Option<&str>,
+    detail: serde_json::Value,
+) -> Result<(), ApiError> {
+    let trace_id = telemetry::current_trace_id();
+    db::admin::audit(
+        conn,
+        &db::admin::NewAuditEntry {
+            actor,
+            action,
+            target,
+            detail,
+            trace_id: trace_id.as_deref(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// 관리자 API에 없는 경로 (`/admin/api/...`)
@@ -140,9 +186,11 @@ impl JobStatus {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct JobView {
     pub id: i64,
-    /// `submit_booking`, `resolve_unknown` … (이 서버 버전이 모르는 종류일 수도 있다)
+    /// `submit_booking`, `resolve_unknown`, `cancel_booking`, `reconcile_provider` (이 서버 버전이 모르는 종류일 수도 있다)
     pub kind: String,
     pub booking_id: Option<BookingId>,
+    /// 부를 업체 (대사 작업처럼 예약이 없는 작업도 업체는 있다)
+    pub provider: Option<String>,
     pub status: JobStatus,
     /// 지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다).
     /// lease 증표이기도 해서 되돌리지 않는다
@@ -158,6 +206,9 @@ pub struct JobView {
     /// 작업별 진행 상황 (예: `{"lookup_first": true}`, `{"not_found_checks": 1}`)
     #[schema(value_type = Object)]
     pub payload: serde_json::Value,
+    /// 멱등키 없는 업체에 생성 요청을 보내고 아직 결과를 기록하지 못했으면 그 시각. 이 표시가 남은 작업을 다시 가져가면
+    /// 워커는 다시 보내지 않고 결과 불명으로 넘긴다
+    pub sent_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -170,6 +221,7 @@ impl TryFrom<JobRecord> for JobView {
             id: job.id,
             kind: job.kind,
             booking_id: job.booking_id,
+            provider: job.provider_id,
             status: JobStatus::parse(&job.status)?,
             attempts: job.attempts,
             max_attempts: job.max_attempts,
@@ -177,6 +229,7 @@ impl TryFrom<JobRecord> for JobView {
             locked_until: job.locked_until,
             last_error: job.last_error,
             payload: job.payload,
+            sent_at: job.sent_at,
             created_at: job.created_at,
             updated_at: job.updated_at,
         })

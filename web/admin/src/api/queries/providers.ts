@@ -53,3 +53,32 @@ export function useCircuitControl(id: string) {
     },
   })
 }
+
+/**
+ * 업체 정책 변경 (admin 역할). 서버가 DB에 저장하고 실행 중인 파이프라인에 바로 반영한다.
+ * 응답은 바뀐 업체 상세라서 다시 묻지 않고 그대로 넣어 둔다.
+ */
+export function useUpdatePolicy(id: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (policy: Schemas['PolicyView']) =>
+      unwrap(
+        api.PUT('/admin/api/providers/{id}/policy', {
+          params: { path: { id } },
+          body: policy,
+        }),
+      ),
+    onSuccess: (detail) => {
+      queryClient.setQueryData(['providers', id], detail)
+      notifications.show({
+        color: 'green',
+        title: `${id}: 정책`,
+        message: '정책을 바꿨습니다. 다음 호출부터 적용됩니다 (진행 중인 호출은 시작할 때의 정책으로 끝납니다).',
+      })
+      return queryClient.invalidateQueries({ queryKey: ['providers'] })
+    },
+    onError: (error) => {
+      notifications.show({ color: 'red', title: '정책 변경 실패', message: errorMessage(error) })
+    },
+  })
+}

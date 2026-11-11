@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use domain::ProviderId;
+use sqlx::PgConnection;
 
 use crate::{DbError, PgPool};
 
@@ -86,4 +87,22 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<ProviderRecord>, DbError> {
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(ProviderRecord::try_from).collect()
+}
+
+/// 업체 정책을 바꾼다 (관리자 정책 편집). 바뀐 시각(`updated_at`)을 돌려준다. 없는 업체면 `None`.
+/// 정책 값의 검사는 부르는 쪽(providers 크레이트의 `ProviderPolicy::validate`)이 먼저 한다.
+#[tracing::instrument(name = "db.providers.update_policy", skip_all)]
+pub async fn update_policy(
+    conn: &mut PgConnection,
+    id: &ProviderId,
+    policy: &serde_json::Value,
+) -> Result<Option<DateTime<Utc>>, DbError> {
+    let updated_at = sqlx::query_scalar!(
+        "UPDATE providers SET policy = $2, updated_at = now() WHERE id = $1 RETURNING updated_at",
+        id.as_str(),
+        policy,
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(updated_at)
 }

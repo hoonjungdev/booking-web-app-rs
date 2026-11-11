@@ -16,6 +16,7 @@ use utoipa::ToSchema;
 
 use super::{JobStatus, JobView, bookings::RetryResult, page_size, paginate};
 use crate::{
+    admin_auth::{AdminSession, RequireOperator},
     api::{ApiError, ApiState, Problem, docs::tags},
     trace,
 };
@@ -26,7 +27,7 @@ use crate::{
 pub struct JobListQuery {
     /// 작업 상태
     status: Option<JobStatus>,
-    /// 작업 종류 (`submit_booking`, `resolve_unknown`)
+    /// 작업 종류 (`submit_booking`, `resolve_unknown`, `cancel_booking`, `reconcile_provider`)
     kind: Option<String>,
     /// 다음 페이지: 앞 페이지 응답의 `next_cursor`
     cursor: Option<String>,
@@ -77,15 +78,18 @@ pub struct JobCounts {
     path = "/jobs",
     operation_id = "admin_list_jobs",
     tag = tags::ADMIN_JOBS,
+    security(("admin_session" = [])),
     params(JobListQuery),
     responses(
         (status = 200, description = "작업 목록 한 페이지", body = JobPage),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "조건 값 오류", body = Problem, content_type = "application/problem+json"),
     ),
 )]
 #[tracing::instrument(name = "admin.jobs.list", skip_all)]
 pub async fn list_jobs(
     State(state): State<ApiState>,
+    _session: AdminSession,
     query: Result<Query<JobListQuery>, QueryRejection>,
 ) -> Result<Json<JobPage>, ApiError> {
     let Query(query) = query?;
@@ -119,27 +123,39 @@ pub async fn list_jobs(
     path = "/jobs/counts",
     operation_id = "admin_job_counts",
     tag = tags::ADMIN_JOBS,
-    responses((status = 200, description = "종류별 · 전체 작업 수", body = JobCounts)),
+    security(("admin_session" = [])),
+    responses(
+        (status = 200, description = "종류별 · 전체 작업 수", body = JobCounts),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
+    ),
 )]
 #[tracing::instrument(name = "admin.jobs.counts", skip_all)]
-pub async fn job_counts(State(state): State<ApiState>) -> Result<Json<JobCounts>, ApiError> {
+pub async fn job_counts(
+    State(state): State<ApiState>,
+    _session: AdminSession,
+) -> Result<Json<JobCounts>, ApiError> {
     let counts = db::jobs::counts(&state.pool).await?;
     Ok(Json(summarize(counts)))
 }
 
 /// dead 작업을 다시 대기열에 넣는다
 ///
-/// 작업의 예약이 `failed`면 예약 재시도(`POST /bookings/{id}/retry`)와 같다: 예약을 `pending`으로 되돌리고
-/// 이 작업을 "업체에서 먼저 찾아본 뒤 제출하는" `submit_booking`으로 되살린다.
-/// 그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다. 시도 횟수는 처음부터 다시 센다.
+/// 작업의 예약이 `failed` · `cancel_failed`면 예약 재시도(`POST /bookings/{id}/retry`)와 같다: 예약을 되돌리고
+/// 이 작업을 "업체에서 먼저 찾아본 뒤 제출하는" `submit_booking`(또는 다시 취소하는 `cancel_booking`)으로 되살린다.
+/// 그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다. 시도 횟수는 그대로 두고 한도를 늘린다.
+/// 포기한 대사 작업(`reconcile_provider`)은 업체마다 하나뿐인 대사 자리가 이미 차 있어 되살리지 않는다:
+/// 그 행은 끝난 것으로 정리하고, 그 업체의 대사 작업을 지금으로 당겨 그 작업을 돌려준다.
 #[utoipa::path(
     post,
     path = "/jobs/{id}/requeue",
     operation_id = "admin_requeue_job",
     tag = tags::ADMIN_JOBS,
+    security(("admin_session" = [])),
     params(("id" = i64, Path, description = "작업 ID")),
     responses(
         (status = 202, description = "대기열에 다시 넣음", body = RetryResult),
+        (status = 401, description = "로그인 필요", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "operator 권한 필요", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "없는 작업", body = Problem, content_type = "application/problem+json"),
         (status = 409, description = "dead가 아니거나, 같은 예약에 처리 중인 작업이 있음", body = Problem, content_type = "application/problem+json"),
     ),
@@ -147,11 +163,12 @@ pub async fn job_counts(State(state): State<ApiState>) -> Result<Json<JobCounts>
 #[tracing::instrument(name = "admin.jobs.requeue", skip_all, fields(job_id))]
 pub async fn requeue_job(
     State(state): State<ApiState>,
+    RequireOperator(session): RequireOperator,
     id: Result<Path<i64>, PathRejection>,
 ) -> Result<(StatusCode, Json<RetryResult>), ApiError> {
     let Path(id) = id?;
     tracing::Span::current().record("job_id", id);
-    let outcome = super::requeue_job(&state.pool, id, &trace::current()).await?;
+    let outcome = super::requeue_job(&state.pool, id, &trace::current(), &session.actor()).await?;
     Ok((StatusCode::ACCEPTED, Json(outcome.try_into()?)))
 }
 
@@ -217,7 +234,13 @@ mod tests {
         let kinds: Vec<_> = counts.kinds.iter().map(|k| k.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["resolve_unknown", "something_new", "submit_booking"]
+            vec![
+                "cancel_booking",
+                "reconcile_provider",
+                "resolve_unknown",
+                "something_new",
+                "submit_booking"
+            ]
         );
         assert_eq!(counts.total.dead, 4);
         assert_eq!(counts.total.ready, 2);

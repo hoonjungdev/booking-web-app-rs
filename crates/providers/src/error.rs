@@ -18,10 +18,12 @@ pub enum ProviderError {
     #[error("응답 시간 초과")]
     Timeout,
     /// 연결 실패. 요청이 업체에 닿지 않았다
-    #[error("연결 실패: {detail}")]
+    // HTTP 클라이언트의 오류 문구(`detail`)에는 업체 주소 같은 내부 정보가 들어 있다. 메시지는 로그 · 예약의 실패 사유로
+    // 퍼져 나가 클라이언트에게까지 보일 수 있으므로 문구는 넣지 않고, `detail()`로 호출 기록에만 남긴다.
+    #[error("연결 실패")]
     Connect { detail: String },
     /// 요청을 보내는 중이나 응답을 받는 중에 연결이 끊김. 업체가 처리했는지 알 수 없다
-    #[error("전송 중 연결 오류: {detail}")]
+    #[error("전송 중 연결 오류")]
     Transport { detail: String },
     /// 업체가 호출 한도 초과를 알림
     #[error("호출 한도 초과")]
@@ -81,7 +83,9 @@ impl ProviderError {
     pub fn detail(&self) -> String {
         match self {
             Self::Client { body, .. } => format!("{self}: {body}"),
-            Self::Decode { detail } => format!("{self}: {detail}"),
+            Self::Decode { detail } | Self::Connect { detail } | Self::Transport { detail } => {
+                format!("{self}: {detail}")
+            }
             other => other.to_string(),
         }
     }
@@ -215,11 +219,26 @@ mod tests {
         assert_eq!(decode.to_string(), "응답 형식 오류");
         assert!(decode.detail().contains("홍길동"));
 
-        // 업체가 보낸 글자가 없는 분류는 메시지와 같다
+        // HTTP 클라이언트의 오류 문구에는 업체 주소가 들어 있다. 메시지(예약의 실패 사유로 클라이언트에게도 보임)에는 넣지 않는다.
+        let connect = ProviderError::Connect {
+            detail: "error sending request for url (http://10.1.2.3/alpha/v1/reservations)".into(),
+        };
+        assert_eq!(connect.to_string(), "연결 실패");
+        assert!(connect.detail().contains("10.1.2.3"));
+        let transport = ProviderError::Transport {
+            detail: "connection closed before message completed".into(),
+        };
+        assert_eq!(transport.to_string(), "전송 중 연결 오류");
+        assert!(transport.detail().contains("connection closed"));
+
+        // 따로 남길 내용이 없는 분류는 메시지와 같다
         for error in all_errors() {
             if !matches!(
                 error,
-                ProviderError::Client { .. } | ProviderError::Decode { .. }
+                ProviderError::Client { .. }
+                    | ProviderError::Decode { .. }
+                    | ProviderError::Connect { .. }
+                    | ProviderError::Transport { .. }
             ) {
                 assert_eq!(error.detail(), error.to_string());
             }

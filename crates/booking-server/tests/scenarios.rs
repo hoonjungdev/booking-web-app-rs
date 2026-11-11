@@ -30,8 +30,9 @@ use chrono::{DateTime, Days, Utc};
 use db::PgPool;
 use domain::{Booking, BookingId, BookingStatus, ProviderId};
 use mock_provider::{
+    Provider,
     alpha::model::ReservationQuery,
-    catalog,
+    catalog::{self, Resource},
     chaos::{ChaosConfig, LatencyRange},
 };
 use providers::{
@@ -60,6 +61,7 @@ async fn 정상_업체에서는_모두_확정되고_429를_받지_않는다(pool
             per_second: 10,
             burst: 5,
             max_wait_ms: 1_000,
+            ..RateLimitPolicy::default()
         },
         ..test_policy()
     };
@@ -145,6 +147,7 @@ async fn 업체_한도보다_낮게_호출하면_429_없이_모두_처리된다(
             per_second: 4,
             burst: 2,
             max_wait_ms: 2_000,
+            ..RateLimitPolicy::default()
         },
         ..test_policy()
     };
@@ -289,6 +292,241 @@ async fn 멱등키가_없는_업체는_결과_불명을_조회로_확인해_이�
     );
 }
 
+// ───────────────────────── Phase 6 시나리오 ─────────────────────────
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 한_업체가_느려져도_다른_업체의_예약은_밀리지_않는다(pool: PgPool) {
+    // alpha는 모든 요청에 응답하지 않는다. 서킷도 열리지 않게 해서 가장 나쁜 경우를 만든다:
+    // alpha 작업 하나가 시도 3번 × 600ms 동안 워커 루프를 붙잡는다.
+    let policy = ProviderPolicy {
+        attempt_timeout_ms: 600,
+        call_budget_ms: 3_000,
+        circuit_breaker: CircuitBreakerPolicy {
+            window: 1_000,
+            min_calls: 1_000,
+            ..test_policy().circuit_breaker
+        },
+        ..test_policy()
+    };
+    let harness = Harness::with_mock(pool, quiet(), policy).await;
+    harness.set_chaos(ChaosConfig {
+        hang_probability: 1.0,
+        ..quiet()
+    });
+    let alpha_ids = harness.submit_for("alpha", 8).await;
+    // alpha 전용 루프(4개)가 모두 업체 응답을 기다리는 중이다
+    let started = Instant::now();
+    while harness.alpha().in_flight() < worker_config().concurrency {
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "alpha 루프가 바빠지지 않았다"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 그동안 들어온 beta 예약은 기다리지 않고 처리된다 (워커 루프가 업체마다 따로다)
+    let started = Instant::now();
+    let beta_ids = harness.submit_for("beta", 8).await;
+    let beta = harness.wait_settled(&beta_ids).await;
+    let elapsed = started.elapsed();
+    assert_all(&beta, BookingStatus::Confirmed);
+    harness.assert_matches_beta(&beta);
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "beta 예약이 alpha 장애에 밀렸다: {elapsed:?} (alpha 작업 하나가 루프를 약 1.8초 붙잡는다)"
+    );
+    for booking in harness.bookings(&alpha_ids).await {
+        assert_eq!(
+            booking.status,
+            BookingStatus::Pending,
+            "alpha는 아직 처리 중"
+        );
+    }
+
+    // alpha가 회복되면 밀린 예약도 처리된다
+    harness.set_chaos(quiet());
+    let alpha = harness.wait_settled(&alpha_ids).await;
+    assert_all(&alpha, BookingStatus::Confirmed);
+    harness.assert_matches_mock(&alpha);
+    harness.finish().await;
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 업체에서_취소한_예약을_대사가_찾아_취소로_바꾸고_이중_예약을_알린다(
+    pool: PgPool,
+) {
+    let harness = Harness::with_mock(pool, quiet(), test_policy()).await;
+    let ids = harness.submit_for("beta", 3).await;
+    let bookings = harness.wait_settled(&ids).await;
+    assert_all(&bookings, BookingStatus::Confirmed);
+
+    // 업체 쪽에서 첫 예약을 취소했다 (고객이 매장에 직접 전화하는 등)
+    let cancelled_there = &bookings[0];
+    let booking_no = cancelled_there
+        .provider_booking_id
+        .clone()
+        .expect("확정된 예약에는 업체 예약 번호가 있다");
+    harness
+        .mock()
+        .beta
+        .lock()
+        .unwrap()
+        .cancel(&booking_no, Utc::now())
+        .expect("업체 쪽에서 취소할 수 있어야 한다");
+    // 둘째 예약은 업체에 같은 참조값으로 한 건 더 생겼다 (이중 예약. 다른 경로로 생겼다고 친다).
+    // 정원이 찬 슬롯일 수 있어, 아직 아무도 쓰지 않은 슬롯에 만든다 (참조값이 같으면 이중 예약 의심이다).
+    let doubled = &bookings[1];
+    let (spare_shop, spare_slot) = open_seats(catalog::BETA_SHOPS, 10)[9];
+    harness
+        .mock()
+        .beta
+        .lock()
+        .unwrap()
+        .create(
+            mock_provider::beta::model::BookRequest {
+                shop_code: spare_shop.to_owned(),
+                start_at: mock_provider::beta::time::format_minute(spare_slot),
+                people: 2,
+                guest_name: "홍길동".into(),
+                guest_phone: "010-0000-0000".into(),
+                external_ref: Some(doubled.id.to_string()),
+            },
+            Utc::now(),
+        )
+        .expect("아무도 쓰지 않은 슬롯이다");
+
+    // 정기 대사(10분 간격)를 기다리지 않고 지금 돌린다
+    let mut conn = harness.pool.acquire().await.unwrap();
+    db::jobs::run_reconcile_now(&mut conn, &beta_id(), None)
+        .await
+        .unwrap();
+    let cancelled = harness
+        .wait_until(cancelled_there.id, |b| b.status != BookingStatus::Confirmed)
+        .await;
+    assert_eq!(cancelled.status, BookingStatus::Cancelled);
+    let last = db::bookings::events(&harness.pool, cancelled.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (last.from_status, last.actor.as_str()),
+        (Some(BookingStatus::Confirmed), "reconciler")
+    );
+
+    let issues = wait_for_issues(&harness.pool, 2).await;
+    let fixed = issues
+        .iter()
+        .find(|i| i.booking_id == Some(cancelled.id))
+        .expect("업체측 취소 이슈");
+    assert_eq!(fixed.kind, db::reconciliation::IssueKind::StatusMismatch);
+    assert_eq!(
+        fixed.resolved_by.as_deref(),
+        Some("reconciler"),
+        "자동으로 바로잡았다"
+    );
+    let duplicate = issues
+        .iter()
+        .find(|i| i.booking_id == Some(doubled.id))
+        .expect("이중 예약 의심 이슈");
+    assert_eq!(
+        duplicate.kind,
+        db::reconciliation::IssueKind::DuplicateSuspected
+    );
+    assert!(duplicate.resolved_at.is_none(), "관리자가 확인해야 한다");
+    assert_eq!(
+        db::bookings::get(&harness.pool, bookings[2].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        BookingStatus::Confirmed,
+        "어긋나지 않은 예약은 그대로"
+    );
+
+    // 대사 작업은 끝나고 다음 정기 실행이 등록되어 있다
+    let reconciles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT status, provider_id FROM jobs WHERE kind = 'reconcile_provider' AND provider_id = 'beta' ORDER BY id",
+    )
+    .fetch_all(&harness.pool)
+    .await
+    .unwrap();
+    let statuses: Vec<_> = reconciles
+        .iter()
+        .map(|(status, _)| status.as_str())
+        .collect();
+    assert_eq!(statuses, vec!["done", "queued"]);
+    let calls = harness.finish().await;
+    assert!(
+        calls
+            .by_operation
+            .get("list_bookings")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "{calls:?}"
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 멱등키가_없는_beta는_응답이_유실되어도_조회로_확인해_이중_예약이_없다(
+    pool: PgPool,
+) {
+    // beta의 쓰기 요청 40%가 처리된 뒤 응답 없이 끊긴다. 멱등키가 없어 다시 보내면 예약이 둘 생긴다.
+    let harness = Harness::with_mock(pool, quiet(), test_policy()).await;
+    harness.set_chaos_for(
+        Provider::Beta,
+        ChaosConfig {
+            drop_after_commit_probability: 0.4,
+            ..quiet()
+        },
+    );
+    let ids = harness.submit_for("beta", 15).await;
+    let bookings = harness.wait_settled(&ids).await;
+
+    assert_all(&bookings, BookingStatus::Confirmed);
+    harness.assert_matches_beta(&bookings);
+    assert_eq!(
+        harness.beta_bookings().len(),
+        15,
+        "업체 예약이 하나도 늘지 않았다"
+    );
+    let mut went_unknown = 0;
+    for id in &ids {
+        let path = db::bookings::events(&harness.pool, *id).await.unwrap();
+        if path.iter().any(|e| e.to_status == BookingStatus::Unknown) {
+            went_unknown += 1;
+        }
+    }
+    // 응답 유실이 한 번도 없을 확률: 0.6^15 ≈ 0.05%
+    assert!(went_unknown > 0, "결과 불명을 거친 예약이 있어야 한다");
+    let calls = harness.finish().await;
+    assert!(calls.count("timeout") > 0, "{calls:?}");
+    assert!(
+        calls.by_operation.get("find_booking").copied().unwrap_or(0) > 0,
+        "결과 불명은 조회로 확인한다: {calls:?}"
+    );
+}
+
+/// 대사 이슈가 `count`건 이상 쌓일 때까지 기다린다
+async fn wait_for_issues(pool: &PgPool, count: usize) -> Vec<db::reconciliation::Issue> {
+    let started = Instant::now();
+    loop {
+        let issues =
+            db::reconciliation::list(pool, &db::reconciliation::IssueFilter::default(), 50)
+                .await
+                .expect("대사 이슈를 읽을 수 있어야 한다");
+        if issues.len() >= count {
+            return issues;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "대사 이슈가 {count}건 쌓이지 않았다: {issues:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ───────────────────────── 준비 코드 ─────────────────────────
 
 /// 테스트용 정책: 실제 기본값(docs/03-resilience.md §3)의 시간을 10분의 1쯤으로 줄였다
@@ -305,6 +543,7 @@ fn test_policy() -> ProviderPolicy {
             per_second: 1_000,
             burst: 100,
             max_wait_ms: 500,
+            ..RateLimitPolicy::default()
         },
         bulkhead: BulkheadPolicy {
             max_concurrency: 8,
@@ -317,6 +556,7 @@ fn test_policy() -> ProviderPolicy {
             open_ms: 500,
             half_open_probes: 3,
         },
+        ..ProviderPolicy::default()
     }
 }
 
@@ -338,6 +578,7 @@ fn worker_config() -> WorkerConfig {
             max: Duration::from_secs(1),
         },
         unknown_recheck_interval: Duration::from_millis(100),
+        ..WorkerConfig::default()
     }
 }
 
@@ -348,6 +589,8 @@ struct Harness {
     api_key: String,
     mock: Option<mock_provider::AppState>,
     alpha: Arc<ResilientProvider>,
+    /// mock 업체로 시작했을 때만 있다
+    beta: Option<Arc<ResilientProvider>>,
     shutdown: CancellationToken,
     worker: JoinHandle<()>,
     recorder: JoinHandle<()>,
@@ -369,7 +612,8 @@ impl CallStats {
 }
 
 impl Harness {
-    /// mock 업체를 띄우고, DB의 alpha 설정(주소 · 정책)을 바꾼 뒤 실제 설정 경로(`ProviderRegistry::load`)로 시작한다
+    /// mock 업체를 띄우고, DB의 alpha · beta 설정(주소 · 정책)을 바꾼 뒤 실제 설정 경로(`ProviderRegistry::load`)로 시작한다.
+    /// 장애 설정(`chaos`)은 두 업체에 똑같이 걸린다 (업체마다 바꾸려면 `set_chaos_for`).
     async fn with_mock(pool: PgPool, chaos: ChaosConfig, policy: ProviderPolicy) -> Self {
         let mock = mock_provider::AppState::new(&chaos);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -379,12 +623,15 @@ impl Harness {
         let app = mock_provider::app(mock.clone());
         tokio::spawn(async move { axum::serve(listener, app).await });
 
-        sqlx::query("UPDATE providers SET base_url = $1, policy = $2 WHERE id = 'alpha'")
-            .bind(format!("http://{addr}/alpha/v1"))
-            .bind(serde_json::to_value(&policy).expect("정책은 JSON으로 바뀐다"))
-            .execute(&pool)
-            .await
-            .expect("업체 설정을 바꿀 수 있어야 한다");
+        for (id, path) in [("alpha", "alpha/v1"), ("beta", "beta/api")] {
+            sqlx::query("UPDATE providers SET base_url = $1, policy = $2 WHERE id = $3")
+                .bind(format!("http://{addr}/{path}"))
+                .bind(serde_json::to_value(&policy).expect("정책은 JSON으로 바뀐다"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("업체 설정을 바꿀 수 있어야 한다");
+        }
 
         let (call_recorder, calls) = call_recorder(recorder::CHANNEL_CAPACITY);
         let registry = ProviderRegistry::load(&pool, call_recorder)
@@ -419,6 +666,7 @@ impl Harness {
         let alpha = registry
             .get(&alpha_id())
             .expect("alpha가 등록되어 있어야 한다");
+        let beta = mock.as_ref().and_then(|_| registry.get(&beta_id()));
         let ctx = WorkerContext {
             pool: pool.clone(),
             providers: Arc::new(registry),
@@ -434,6 +682,7 @@ impl Harness {
             pool,
             mock,
             alpha,
+            beta,
             shutdown,
             worker,
             recorder,
@@ -444,12 +693,26 @@ impl Harness {
         &self.alpha
     }
 
+    fn mock(&self) -> &mock_provider::AppState {
+        self.mock.as_ref().expect("mock 업체로 시작한 시나리오다")
+    }
+
+    /// alpha의 장애 설정을 바꾼다
     fn set_chaos(&self, chaos: ChaosConfig) {
-        self.mock
-            .as_ref()
-            .expect("mock 업체로 시작한 시나리오다")
-            .chaos
-            .set(mock_provider::Provider::Alpha, chaos);
+        self.set_chaos_for(Provider::Alpha, chaos);
+    }
+
+    fn set_chaos_for(&self, provider: Provider, chaos: ChaosConfig) {
+        self.mock().chaos.set(provider, chaos);
+    }
+
+    /// mock beta에 저장된 예약 (취소된 것 포함)
+    fn beta_bookings(&self) -> Vec<mock_provider::beta::model::Booking> {
+        self.mock()
+            .beta
+            .lock()
+            .expect("잠금이 오염되지 않는다")
+            .all()
     }
 
     fn mock_reservations(&self) -> Vec<mock_provider::alpha::model::Reservation> {
@@ -462,18 +725,28 @@ impl Harness {
             .search(&ReservationQuery::default())
     }
 
-    /// 예약 `n`건을 서로 다른 멱등키로 접수한다. 정원이 차서 거절되지 않도록 슬롯마다 정원만큼만 담는다.
+    /// alpha에 예약 `n`건을 접수한다
     async fn submit(&self, n: usize) -> Vec<BookingId> {
+        self.submit_for("alpha", n).await
+    }
+
+    /// 업체에 예약 `n`건을 서로 다른 멱등키로 접수한다. 정원이 차서 거절되지 않도록 슬롯마다 정원만큼만 담는다.
+    async fn submit_for(&self, provider: &str, n: usize) -> Vec<BookingId> {
+        let resources = match provider {
+            "alpha" => catalog::RESOURCES,
+            "beta" => catalog::BETA_SHOPS,
+            other => panic!("모르는 업체: {other}"),
+        };
         let mut ids = Vec::with_capacity(n);
-        for (index, (resource, slot)) in open_seats(n).into_iter().enumerate() {
+        for (index, (resource, slot)) in open_seats(resources, n).into_iter().enumerate() {
             let body = json!({
-                "provider": "alpha",
+                "provider": provider,
                 "resource_id": resource,
                 "slot_start": slot.to_rfc3339(),
                 "party_size": 2,
                 "customer": { "name": "홍길동", "phone": "010-0000-0000" }
             });
-            let key = format!("scenario-{index}");
+            let key = format!("scenario-{provider}-{index}");
             let reply = send(
                 &self.app,
                 Method::POST,
@@ -574,11 +847,42 @@ impl Harness {
         }
     }
 
+    /// 확정된 beta 예약마다 mock beta에 그 예약이 정확히 하나(취소되지 않은 것) 있고, 업체 예약 번호가 일치하는지 확인한다
+    fn assert_matches_beta(&self, bookings: &[Booking]) {
+        let stored = self.beta_bookings();
+        let booked = || {
+            stored
+                .iter()
+                .filter(|b| b.status == mock_provider::beta::model::BookingStatus::Booked)
+        };
+        assert_no_double_booking(booked().filter_map(|b| {
+            b.external_ref
+                .as_deref()
+                .and_then(|reference| reference.parse().ok())
+                .map(BookingId::from_uuid)
+        }));
+        for booking in bookings
+            .iter()
+            .filter(|b| b.status == BookingStatus::Confirmed)
+        {
+            let reference = booking.id.to_string();
+            let at_provider = booked()
+                .find(|b| b.external_ref.as_deref() == Some(reference.as_str()))
+                .map(|b| b.booking_no.as_str());
+            assert_eq!(
+                booking.provider_booking_id.as_deref(),
+                at_provider,
+                "확정된 예약 {reference}는 beta 예약과 연결되어야 한다"
+            );
+        }
+    }
+
     /// 워커를 멈추고 남은 호출 기록이 저장될 때까지 기다린 뒤, 호출 수를 센다
     async fn finish(self) -> CallStats {
         let Self {
             pool,
             alpha,
+            beta,
             shutdown,
             worker,
             recorder,
@@ -587,7 +891,7 @@ impl Harness {
         shutdown.cancel();
         worker.await.expect("워커가 정상 종료되어야 한다");
         // 업체 파이프라인(기록을 보내는 쪽)이 모두 사라져야 기록 태스크가 남은 것을 저장하고 끝난다
-        drop(alpha);
+        drop((alpha, beta));
         recorder.await.expect("기록 태스크가 정상 종료되어야 한다");
 
         let rows: Vec<(String, String, i32)> =
@@ -615,6 +919,10 @@ fn alpha_id() -> ProviderId {
     ProviderId::parse("alpha").expect("올바른 업체 ID")
 }
 
+fn beta_id() -> ProviderId {
+    ProviderId::parse("beta").expect("올바른 업체 ID")
+}
+
 fn assert_all(bookings: &[Booking], expected: BookingStatus) {
     for booking in bookings {
         assert_eq!(
@@ -635,15 +943,15 @@ fn assert_no_double_booking(references: impl Iterator<Item = BookingId>) {
     assert!(doubled.is_empty(), "이중 예약 발견: {doubled:?}");
 }
 
-/// mock 업체에서 정원이 남은 자리 `n`개 (내일부터, 세 매장의 슬롯을 정원만큼 반복)
-fn open_seats(n: usize) -> Vec<(&'static str, DateTime<Utc>)> {
+/// mock 업체에서 정원이 남은 자리 `n`개 (내일부터, 매장들의 슬롯을 정원만큼 반복)
+fn open_seats(resources: &[Resource], n: usize) -> Vec<(&'static str, DateTime<Utc>)> {
     let today = Utc::now().with_timezone(&catalog::kst()).date_naive();
     let mut seats = Vec::new();
     for days in 1..=3 {
         let date = today
             .checked_add_days(Days::new(days))
             .expect("날짜를 계산할 수 있어야 한다");
-        for resource in catalog::RESOURCES {
+        for resource in resources {
             for slot in catalog::slots_for(resource.id, date) {
                 for _ in 0..slot.capacity {
                     seats.push((resource.id, slot.start));

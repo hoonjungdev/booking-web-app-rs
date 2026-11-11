@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n               last_error, payload, created_at, updated_at\n        FROM jobs\n        WHERE ($1::text IS NULL OR status = $1)\n          AND ($2::text IS NULL OR kind = $2)\n          AND ($3::int8 IS NULL OR id < $3)\n        ORDER BY id DESC\n        LIMIT $4\n        ",
+  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n                last_error, payload, provider_id, sent_at, created_at, updated_at\n         FROM jobs WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -115,6 +115,28 @@
       },
       {
         "ordinal": 10,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "sent_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "sent_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +147,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -138,9 +160,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Int8",
         "Int8"
       ]
     },
@@ -155,9 +174,11 @@
       true,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "8d7333c5e1bf07ef060b6f6c1f288ef54b68c4d1f2e79c2098e8c28659099ba3"
+  "hash": "8f2f7cb50e44aa06c3fde393db2f1cffbfcfa7361f46d16b58df0e92386c8e88"
 }
