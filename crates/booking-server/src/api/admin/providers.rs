@@ -16,7 +16,7 @@ use providers::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::to_utc;
+use super::{find_provider, to_utc};
 use crate::api::{ApiError, ApiState, Problem, docs::tags};
 
 /// 업체 한 곳 (목록의 한 줄)
@@ -39,8 +39,11 @@ pub struct ProviderView {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProviderDetail {
     pub provider: ProviderView,
-    /// 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 서버가 시작할 때 읽어 적용한다
+    /// 지금 적용 중인 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 업체 파이프라인이 있으면 그 정책
+    /// (서버가 시작할 때 DB에서 읽은 값), 없으면 DB의 정책이다
     pub policy: PolicyView,
+    /// DB의 정책이 지금 적용 중인 정책과 다르다. 서버를 다시 시작해야 반영된다 (실시간 반영은 Phase 6)
+    pub restart_required: bool,
 }
 
 /// 업체 파이프라인의 지금 상태 (이 프로세스 메모리의 값)
@@ -200,12 +203,21 @@ pub async fn get_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<ProviderDetail>, ApiError> {
-    let record = find(&state, &id).await?;
-    let policy = ProviderPolicy::from_json(record.policy.clone()).map_err(|error| {
+    let record = find_provider(&state, &id).await?;
+    let stored = ProviderPolicy::from_json(record.policy.clone()).map_err(|error| {
         ApiError::Internal(format!("업체 {id}의 정책을 읽을 수 없습니다: {error}"))
     })?;
+    // 화면에는 지금 실제로 적용 중인 정책을 보여 준다. 서버가 시작한 뒤 DB를 고쳤다면 둘이 다르다.
+    let running = state
+        .providers
+        .as_ref()
+        .and_then(|registry| registry.get(&record.id))
+        .map(|provider| provider.policy().clone());
+    let restart_required = running.as_ref().is_some_and(|running| *running != stored);
+    let policy = running.unwrap_or(stored);
     Ok(Json(ProviderDetail {
         policy: PolicyView::from(&policy),
+        restart_required,
         provider: provider_view(&state, record),
     }))
 }
@@ -244,18 +256,9 @@ pub async fn control_circuit(
     Ok(Json(RuntimeView::from(provider.runtime_status())))
 }
 
-/// DB의 업체 설정. 없으면 404.
-async fn find(state: &ApiState, id: &str) -> Result<ProviderRecord, ApiError> {
-    let not_found = || ApiError::ProviderNotFound(id.to_owned());
-    let provider_id = ProviderId::parse(id).map_err(|_| not_found())?;
-    db::providers::find(&state.pool, &provider_id)
-        .await?
-        .ok_or_else(not_found)
-}
-
 /// 이 프로세스의 업체 파이프라인. 없는 이유에 따라 다른 오류를 돌려준다.
 async fn pipeline(state: &ApiState, id: &str) -> Result<Arc<ResilientProvider>, ApiError> {
-    let record = find(state, id).await?;
+    let record = find_provider(state, id).await?;
     let registry = state
         .providers
         .as_ref()

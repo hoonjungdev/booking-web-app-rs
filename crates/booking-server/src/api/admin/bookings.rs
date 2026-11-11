@@ -181,9 +181,12 @@ pub async fn get_booking(
     let booking = db::bookings::get(&state.pool, id)
         .await?
         .ok_or(ApiError::BookingNotFound)?;
-    let events = db::bookings::events(&state.pool, id).await?;
-    let calls = db::provider_calls::for_booking(&state.pool, id).await?;
-    let jobs = db::jobs::for_booking(&state.pool, id).await?;
+    // 세 조회는 서로 기다릴 필요가 없어 동시에 보낸다 (화면이 처리 중인 예약을 2초마다 다시 읽는다)
+    let (events, calls, jobs) = tokio::try_join!(
+        db::bookings::events(&state.pool, id),
+        db::provider_calls::for_booking(&state.pool, id),
+        db::jobs::for_booking(&state.pool, id),
+    )?;
 
     Ok(Json(BookingDetail {
         booking: AdminBooking::from(&booking),

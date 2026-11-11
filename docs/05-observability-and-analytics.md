@@ -95,6 +95,7 @@ job.submit_booking  job_id=… booking_id=…          [새 trace, 위 trace를 
 - **작업 큐 전파**: 작업은 몇 분 뒤에 실행될 수도 있으므로 같은 trace에 이어 붙이지 않고 **span link**로 연결한다 (OpenTelemetry가 비동기 메시징에 권장하는 방식).
 - 모든 span에 `booking_id`를 속성으로 넣어서 예약 ID로 검색할 수 있게 한다.
 - 관리자 웹 예약 상세에서 `trace_id`를 누르면 Grafana(Tempo) 화면으로 이동한다. (Phase 5: 상태 이력 · 업체 호출 기록의 trace ID가 Grafana Explore 링크다. Grafana 주소는 `BOOKING_GRAFANA_URL`, 기본 `http://localhost:3000`)
+- 관리자 API 요청도 추적한다 (Phase 5). 재시도 · 서킷 조작 · 장애 주입 같은 조작 요청의 trace는 상태 이력(`actor=admin`)과 되살린 작업의 link로 이어진다. 화면이 몇 초마다 부르는 조회 요청도 trace가 되어 Tempo의 최근 trace 목록을 채우므로, 업체 호출 · 작업을 볼 때는 span 이름으로 거른다 (`{ name =~ "job.*" }`, `{ name = "provider.attempt" }`). 줄여야 하면 조회 요청만 샘플링에서 빼는 방법을 검토한다 (Phase 7).
 
 **구현 (Phase 4)**: 실제로 만들어지는 span (들여쓰기 = 부모 · 자식)
 

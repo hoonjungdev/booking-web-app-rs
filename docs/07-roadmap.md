@@ -105,6 +105,7 @@
 - [x] GitHub Actions CI: fmt, clippy, nextest, cargo-deny, cargo-shear (Phase 1에서 먼저 구축)
 - [x] CI 확장: sqlx 오프라인 검사 (Phase 2에서 구축)
 - [x] CI 확장: 프론트 빌드 · 타입 생성 검사 (Phase 5에서 구축: `api` · `web` job)
+- [ ] 관리자 화면의 조회 요청(폴링)이 Tempo의 trace 목록을 채우지 않게 하기 (조회 요청만 샘플링에서 빼기 등, [05 §3](05-observability-and-analytics.md#3-추적-traces))
 - [ ] Dockerfile (다단계 빌드), docker-compose로 전체 실행
 - [ ] 운영 문서 (장애 대응 런북)
 

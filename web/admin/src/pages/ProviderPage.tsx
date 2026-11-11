@@ -39,7 +39,7 @@ export default function ProviderPage() {
   if (detail.isPending) return <Loading />
   if (detail.isError) return <ErrorAlert error={detail.error} />
 
-  const { provider, policy } = detail.data
+  const { provider, policy, restart_required } = detail.data
   return (
     <Stack gap="lg">
       <Group justify="space-between">
@@ -67,7 +67,7 @@ export default function ProviderPage() {
       )}
 
       <StatsCharts id={provider.id} />
-      <PolicyCard policy={policy} />
+      <PolicyCard policy={policy} restartRequired={restart_required} />
     </Stack>
   )
 }
@@ -269,8 +269,14 @@ function StatsCharts({ id }: { id: string }) {
   )
 }
 
-/** 장애 대응 정책 (읽기 전용) */
-function PolicyCard({ policy }: { policy: Schemas['PolicyView'] }) {
+/** 장애 대응 정책 (읽기 전용). 지금 실제로 적용 중인 값이다. */
+function PolicyCard({
+  policy,
+  restartRequired,
+}: {
+  policy: Schemas['PolicyView']
+  restartRequired: boolean
+}) {
   const rows: [string, string, string][] = [
     ['시도 타임아웃', formatMs(policy.attempt_timeout_ms), '시도 한 번의 최대 시간'],
     ['호출 예산', formatMs(policy.call_budget_ms), '호출 한 번(재시도 포함)의 최대 시간'],
@@ -301,9 +307,14 @@ function PolicyCard({ policy }: { policy: Schemas['PolicyView'] }) {
         장애 대응 정책
       </Title>
       <Text size="sm" c="dimmed" mb="sm">
-        서버가 시작할 때 DB(<Code>providers.policy</Code>)에서 읽어 적용한다. 화면에서 바꾸고 바로 반영하는 기능은
+        서버가 시작할 때 DB(<Code>providers.policy</Code>)에서 읽어 적용한 값이다. 화면에서 바꾸고 바로 반영하는 기능은
         Phase 6(정책 실시간 변경)에서 추가한다.
       </Text>
+      {restartRequired && (
+        <Alert color="yellow" mb="sm" title="DB의 정책이 바뀌었습니다">
+          서버가 시작한 뒤 DB의 정책이 바뀌어 지금 적용 중인 값(아래)과 다릅니다. 서버를 다시 시작하면 반영됩니다.
+        </Alert>
+      )}
       <Table>
         <Table.Tbody>
           {rows.map(([name, value, note]) => (

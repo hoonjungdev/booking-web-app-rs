@@ -15,7 +15,7 @@ use domain::ProviderId;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::Latency;
+use super::{Latency, find_provider};
 use crate::api::{ApiError, ApiState, Problem, docs::tags};
 
 /// 시계열 한 번에 돌려줄 최대 구간 수 (화면에 그릴 점 수). 넘으면 간격을 넓혀 달라고 한다.
@@ -170,7 +170,7 @@ pub async fn provider_timeseries(
     query: Result<Query<TimeseriesQuery>, QueryRejection>,
 ) -> Result<Json<Timeseries>, ApiError> {
     let Query(query) = query?;
-    let provider = existing_provider(&state, &id).await?;
+    let provider = find_provider(&state, &id).await?.id;
     let interval = query.interval.unwrap_or(StatsInterval::OneMinute);
     let to = query.to.unwrap_or_else(Utc::now);
     let from = query.from.unwrap_or(to - TimeDelta::hours(1));
@@ -181,21 +181,24 @@ pub async fn provider_timeseries(
     }
     let step = interval.seconds();
     let first = align(from, step);
-    // 올림 나눗셈: 마지막 구간이 `to`를 넘어가더라도 그 구간까지 센다 (`to > first`라서 양수다)
-    let points = ((to - first).num_seconds() + step - 1) / step;
+    // 올림 나눗셈: 마지막 구간이 `to`를 넘어가더라도 그 구간까지 센다 (`to > first`라서 양수다).
+    // 밀리초로 센다. 초로 세면 `to`의 초 미만이 잘려, `to`가 구간 경계 바로 뒤(예: 0.5초)일 때 마지막 구간이 빠진다.
+    let step_ms = step * 1_000;
+    let points = ((to - first).num_milliseconds() + step_ms - 1) / step_ms;
     if points > MAX_POINTS {
         return Err(ApiError::InvalidRequest(format!(
             "구간이 너무 많습니다 ({points}개, 최대 {MAX_POINTS}개). 기간을 줄이거나 간격을 넓히세요"
         )));
     }
 
-    // 구간 경계에 맞춘 시각부터 조회해야 첫 구간이 온전히 담긴다
+    // 구간 경계에 맞춘 시각부터 조회해야 첫 구간이 온전히 담긴다.
+    // 두 조회는 서로 기다릴 필요가 없어 동시에 보낸다 (`try_join!`: 둘 다 끝나면 결과를, 하나라도 실패하면 그 에러를.
+    // ≈ C#의 `await Task.WhenAll(..)`)
     let bucket = Duration::from_secs(step.unsigned_abs());
-    let rows =
-        db::provider_calls::timeseries(&state.pool, provider.as_str(), first, to, bucket).await?;
-    let outcomes =
-        db::provider_calls::outcome_counts(&state.pool, provider.as_str(), first, to, bucket)
-            .await?;
+    let (rows, outcomes) = tokio::try_join!(
+        db::provider_calls::timeseries(&state.pool, provider.as_str(), first, to, bucket),
+        db::provider_calls::outcome_counts(&state.pool, provider.as_str(), first, to, bucket),
+    )?;
 
     // 호출이 없는 구간은 DB 결과에 없다. 차트가 끊기지 않도록 모든 구간을 0으로 만들어 두고 채운다.
     let mut points: BTreeMap<DateTime<Utc>, TimeseriesPoint> = (0..points)
@@ -301,15 +304,6 @@ pub async fn providers_summary(
         to,
         providers,
     }))
-}
-
-async fn existing_provider(state: &ApiState, id: &str) -> Result<ProviderId, ApiError> {
-    let not_found = || ApiError::ProviderNotFound(id.to_owned());
-    let provider = ProviderId::parse(id).map_err(|_| not_found())?;
-    db::providers::find(&state.pool, &provider)
-        .await?
-        .map(|record| record.id)
-        .ok_or_else(not_found)
 }
 
 /// `time`이 속한 구간의 시작 시각. DB의 `date_bin(간격, 시각, '2000-01-01Z')`과 같은 경계다

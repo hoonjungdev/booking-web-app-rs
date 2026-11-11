@@ -561,7 +561,8 @@ export interface components {
         JobView: {
             /**
              * Format: int32
-             * @description 지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다)
+             * @description 지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다).
+             *     lease 증표이기도 해서 되돌리지 않는다
              */
             attempts: number;
             booking_id?: components["schemas"]["BookingId"] | null;
@@ -578,7 +579,10 @@ export interface components {
              * @description 실행 중이면 이 시각까지 이 작업을 쥐고 있다 (lease)
              */
             locked_until?: string | null;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description `attempts`가 이 값에 이르면 포기한다. dead 작업을 되살리면 그 시점부터 기본 횟수(8)만큼 늘어난다
+             */
             max_attempts: number;
             /** @description 작업별 진행 상황 (예: `{"lookup_first": true}`, `{"not_found_checks": 1}`) */
             payload: Record<string, never>;
@@ -686,9 +690,14 @@ export interface components {
         };
         /** @description 업체 상세: 목록 정보 + 정책 */
         ProviderDetail: {
-            /** @description 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 서버가 시작할 때 읽어 적용한다 */
+            /**
+             * @description 지금 적용 중인 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 업체 파이프라인이 있으면 그 정책
+             *     (서버가 시작할 때 DB에서 읽은 값), 없으면 DB의 정책이다
+             */
             policy: components["schemas"]["PolicyView"];
             provider: components["schemas"]["ProviderView"];
+            /** @description DB의 정책이 지금 적용 중인 정책과 다르다. 서버를 다시 시작해야 반영된다 (실시간 반영은 Phase 6) */
+            restart_required: boolean;
         };
         /**
          * @description 업체 ID (영문 소문자로 시작하는 1~32자의 소문자 · 숫자 · `_` · `-`)

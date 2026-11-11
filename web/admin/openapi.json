@@ -1673,7 +1673,7 @@
           "attempts": {
             "type": "integer",
             "format": "int32",
-            "description": "지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다)"
+            "description": "지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다).\nlease 증표이기도 해서 되돌리지 않는다"
           },
           "booking_id": {
             "oneOf": [
@@ -1714,7 +1714,8 @@
           },
           "max_attempts": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "description": "`attempts`가 이 값에 이르면 포기한다. dead 작업을 되살리면 그 시점부터 기본 횟수(8)만큼 늘어난다"
           },
           "payload": {
             "type": "object",
@@ -1959,15 +1960,20 @@
         "description": "업체 상세: 목록 정보 + 정책",
         "required": [
           "provider",
-          "policy"
+          "policy",
+          "restart_required"
         ],
         "properties": {
           "policy": {
             "$ref": "#/components/schemas/PolicyView",
-            "description": "장애 대응 정책 (빠진 값은 기본값으로 채운 것). 서버가 시작할 때 읽어 적용한다"
+            "description": "지금 적용 중인 장애 대응 정책 (빠진 값은 기본값으로 채운 것). 업체 파이프라인이 있으면 그 정책\n(서버가 시작할 때 DB에서 읽은 값), 없으면 DB의 정책이다"
           },
           "provider": {
             "$ref": "#/components/schemas/ProviderView"
+          },
+          "restart_required": {
+            "type": "boolean",
+            "description": "DB의 정책이 지금 적용 중인 정책과 다르다. 서버를 다시 시작해야 반영된다 (실시간 반영은 Phase 6)"
           }
         }
       },

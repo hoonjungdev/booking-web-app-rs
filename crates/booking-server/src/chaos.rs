@@ -5,6 +5,9 @@
 //!
 //! 장애 설정의 모양은 mock-provider의 `ChaosConfig`와 같다. mock-provider는 진짜 외부 업체처럼 우리 코드와 독립이어야
 //! 하므로(의존하지 않음) 여기에 같은 모양의 타입을 따로 둔다. mock 쪽이 바뀌면 이 파일도 함께 고친다.
+//!
+//! 설정 값은 보내기 전에 여기서 검사한다 ([`ChaosSettings::validate`]). 상대가 보낸 글자(오류 본문)는 오류 메시지에
+//! 넣지 않는다는 규칙(CLAUDE.md)을 지키면서도, 관리자에게 어느 값이 틀렸는지 알려 주기 위해서다.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -60,6 +63,46 @@ pub struct RateLimitSettings {
     pub burst: u32,
 }
 
+impl ChaosSettings {
+    /// 값이 말이 되는지 검사한다 (mock-provider의 검사와 같은 규칙). 문제가 있으면 이유를 담은 `Err`.
+    pub fn validate(&self) -> Result<(), String> {
+        let probabilities = [
+            ("slow.probability", self.slow.probability),
+            ("error.probability", self.error.probability),
+            ("hang_probability", self.hang_probability),
+            (
+                "drop_after_commit_probability",
+                self.drop_after_commit_probability,
+            ),
+        ];
+        for (name, p) in probabilities {
+            if !(0.0..=1.0).contains(&p) {
+                return Err(format!("{name}는 0.0 ~ 1.0 사이여야 합니다 (입력: {p})"));
+            }
+        }
+        if self.latency_ms.min > self.latency_ms.max {
+            return Err("latency_ms.min은 latency_ms.max보다 클 수 없습니다".into());
+        }
+        if self.error.statuses.is_empty() {
+            return Err("error.statuses에는 상태 코드가 하나 이상 있어야 합니다".into());
+        }
+        if let Some(bad) = self
+            .error
+            .statuses
+            .iter()
+            .find(|status| !(500..=599).contains(*status))
+        {
+            return Err(format!(
+                "error.statuses에는 5xx만 쓸 수 있습니다 (입력: {bad})"
+            ));
+        }
+        if self.rate_limit.per_second == 0 || self.rate_limit.burst == 0 {
+            return Err("rate_limit.per_second와 burst는 1 이상이어야 합니다".into());
+        }
+        Ok(())
+    }
+}
+
 /// 미리 정해 둔 장애 시나리오 (docs/03-resilience.md §10)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -95,9 +138,9 @@ impl ChaosPreset {
 pub enum ChaosError {
     #[error("mock 업체에 {0} 업체가 없습니다")]
     UnknownProvider(ProviderId),
-    /// mock 업체가 설정 값을 거절했다 (확률이 0~1 밖 등). 사유는 mock이 보낸 검증 메시지다.
-    #[error("{0}")]
-    Rejected(String),
+    /// mock 업체가 설정 값을 거절했다 (우리 검사를 통과했는데도). mock이 보낸 본문은 메시지에 넣지 않는다.
+    #[error("mock 업체가 장애 설정을 거절했습니다 (HTTP 400). 설정 값을 확인하세요")]
+    Rejected,
     #[error("mock 업체의 장애 주입 API를 부를 수 없습니다: {0}")]
     Unreachable(String),
     #[error("mock 업체의 장애 주입 API가 HTTP {0}으로 응답했습니다")]
@@ -177,9 +220,8 @@ impl ChaosClient {
             .map_err(|error| ChaosError::Unreachable(error.to_string()))?;
         let status = response.status();
         if status == reqwest::StatusCode::BAD_REQUEST {
-            // mock이 보낸 검증 메시지 (예: "slow.probability는 0.0 ~ 1.0 사이여야 합니다"). 우리 개발 도구의 글이라 그대로 전한다.
-            let reason = response.text().await.unwrap_or_default();
-            return Err(ChaosError::Rejected(reason));
+            // 상대가 보낸 글자는 오류 메시지 · 로그에 넣지 않는다 (CLAUDE.md). 값은 보내기 전에 우리가 검사한다.
+            return Err(ChaosError::Rejected);
         }
         if !status.is_success() {
             return Err(ChaosError::Status(status.as_u16()));
@@ -188,5 +230,79 @@ impl ChaosClient {
             .json()
             .await
             .map_err(|error| ChaosError::Unreachable(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy() -> ChaosSettings {
+        ChaosSettings {
+            latency_ms: LatencyRange { min: 20, max: 120 },
+            slow: SlowSettings {
+                probability: 0.0,
+                latency_ms: 3000,
+            },
+            error: ErrorSettings {
+                probability: 0.0,
+                statuses: vec![500, 502, 503],
+            },
+            hang_probability: 0.0,
+            drop_after_commit_probability: 0.0,
+            rate_limit: RateLimitSettings {
+                per_second: 20,
+                burst: 10,
+            },
+            outage: false,
+        }
+    }
+
+    #[test]
+    fn 말이_안_되는_장애_설정은_보내기_전에_거절한다() {
+        assert_eq!(healthy().validate(), Ok(()));
+        let cases: Vec<(ChaosSettings, &str)> = vec![
+            (
+                ChaosSettings {
+                    slow: SlowSettings {
+                        probability: 1.5,
+                        latency_ms: 3000,
+                    },
+                    ..healthy()
+                },
+                "slow.probability",
+            ),
+            (
+                ChaosSettings {
+                    latency_ms: LatencyRange { min: 200, max: 100 },
+                    ..healthy()
+                },
+                "latency_ms.min",
+            ),
+            (
+                ChaosSettings {
+                    error: ErrorSettings {
+                        probability: 0.1,
+                        statuses: vec![404],
+                    },
+                    ..healthy()
+                },
+                "5xx",
+            ),
+            (
+                ChaosSettings {
+                    rate_limit: RateLimitSettings {
+                        per_second: 0,
+                        burst: 10,
+                    },
+                    ..healthy()
+                },
+                "rate_limit",
+            ),
+        ];
+        for (settings, field) in cases {
+            let reason = settings.validate().unwrap_err();
+            assert!(reason.contains(field), "{reason}");
+        }
     }
 }

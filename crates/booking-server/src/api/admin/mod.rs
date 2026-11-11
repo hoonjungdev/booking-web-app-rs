@@ -144,8 +144,10 @@ pub struct JobView {
     pub kind: String,
     pub booking_id: Option<BookingId>,
     pub status: JobStatus,
-    /// 지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다)
+    /// 지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다).
+    /// lease 증표이기도 해서 되돌리지 않는다
     pub attempts: i32,
+    /// `attempts`가 이 값에 이르면 포기한다. dead 작업을 되살리면 그 시점부터 기본 횟수(8)만큼 늘어난다
     pub max_attempts: i32,
     /// 실행하기로 한 시각
     pub run_at: DateTime<Utc>,
@@ -190,6 +192,18 @@ pub struct Latency {
 }
 
 // ───────────────────────── 요청 해석 도우미 ─────────────────────────
+
+/// DB의 업체 설정. 업체 ID 형식이 틀렸거나 없는 업체면 404.
+async fn find_provider(
+    state: &ApiState,
+    id: &str,
+) -> Result<db::providers::ProviderRecord, ApiError> {
+    let not_found = || ApiError::ProviderNotFound(id.to_owned());
+    let provider_id = domain::ProviderId::parse(id).map_err(|_| not_found())?;
+    db::providers::find(&state.pool, &provider_id)
+        .await?
+        .ok_or_else(not_found)
+}
 
 /// 페이지 크기: 없으면 기본값, 너무 크면 최대값으로 맞춘다
 fn page_size(limit: Option<u32>) -> Result<i64, ApiError> {

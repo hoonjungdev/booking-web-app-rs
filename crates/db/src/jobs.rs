@@ -424,13 +424,18 @@ pub async fn get(conn: &mut PgConnection, id: i64) -> Result<Option<JobRecord>, 
 
 /// 작업 목록 (최근에 등록한 것부터, 최대 `limit`건). 관리자 화면용.
 ///
-/// dead 작업만 보는 조회는 부분 인덱스 `jobs_dead_idx (kind, id) WHERE status = 'dead'`를 쓴다.
+/// 관리자가 가장 자주 보는 dead 작업 목록은 따로 쿼리한다 ([`list_dead`]). 아래의 "조건이 NULL이면 건너뛰는" 쿼리는
+/// 매개변수 값을 모르는 상태로 세운 실행 계획(prepared statement의 일반 계획)에서 `status = 'dead'`를 확신할 수 없어
+/// 부분 인덱스(`jobs_dead_idx ... WHERE status = 'dead'`)를 쓰지 못하고, 끝난 작업이 쌓일수록 느려진다.
 #[tracing::instrument(name = "db.jobs.list", skip_all)]
 pub async fn list(
     pool: &PgPool,
     filter: &JobFilter,
     limit: i64,
 ) -> Result<Vec<JobRecord>, DbError> {
+    if filter.status.as_deref() == Some("dead") {
+        return list_dead(pool, filter, limit).await;
+    }
     let rows = sqlx::query_as!(
         JobRow,
         r#"
@@ -444,6 +449,34 @@ pub async fn list(
         LIMIT $4
         "#,
         filter.status.as_deref(),
+        filter.kind.as_deref(),
+        filter.before,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(JobRecord::from).collect())
+}
+
+/// dead 작업 목록. `status = 'dead'`를 상수로 적어 두어, 실행 계획이 언제나 부분 인덱스 `jobs_dead_idx`를 쓸 수 있다
+/// (dead 작업은 관리자가 처리하므로 적게 유지되고, 끝난 작업이 아무리 쌓여도 이 조회는 가볍다).
+async fn list_dead(
+    pool: &PgPool,
+    filter: &JobFilter,
+    limit: i64,
+) -> Result<Vec<JobRecord>, DbError> {
+    let rows = sqlx::query_as!(
+        JobRow,
+        r#"
+        SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
+               last_error, payload, created_at, updated_at
+        FROM jobs
+        WHERE status = 'dead'
+          AND ($1::text IS NULL OR kind = $1)
+          AND ($2::int8 IS NULL OR id < $2)
+        ORDER BY id DESC
+        LIMIT $3
+        "#,
         filter.kind.as_deref(),
         filter.before,
         limit,
@@ -480,7 +513,12 @@ pub async fn counts(pool: &PgPool) -> Result<Vec<KindCounts>, DbError> {
 /// dead 작업을 다시 실행 대기열에 넣는다. dead가 아니면(그사이 누가 먼저 되살림) 아무것도 하지 않고 `false`.
 ///
 /// 같은 행을 되살린다 (새 작업을 만들지 않는다). 그래야 한 예약에 처리 중인 작업이 둘이 되지 않고,
-/// dead 작업 수(`jobs.dead` 지표 · 알림)도 바로 줄어든다. 시도 횟수는 처음부터 다시 센다.
+/// dead 작업 수(`jobs.dead` 지표 · 알림)도 바로 줄어든다.
+///
+/// **시도 횟수(`attempts`)는 되돌리지 않고, 한도(`max_attempts`)를 지금부터 `DEFAULT_MAX_ATTEMPTS`번 더 준다.**
+/// `attempts`는 lease 증표(fencing token)다. 0으로 되돌리면 예전에 쓰인 번호가 다시 나와서, lease를 잃고 멈춰 있던
+/// 옛 워커가 깨어나 같은 번호로 쓰는 결과가 새 워커의 작업에 반영될 수 있다 (번호는 늘어나기만 해야 한다).
+///
 /// `kind`와 `payload`는 바꿀 수 있다: 실패한 예약을 되살릴 때는 예약 상태에 맞는 작업(`submit_booking`)으로 바꾼다.
 /// `trace_context`에는 되살린 요청의 trace를 넣어, 워커가 그 요청으로 link를 걸게 한다.
 #[tracing::instrument(name = "db.jobs.requeue", skip_all)]
@@ -494,12 +532,13 @@ pub async fn requeue(
     let result = sqlx::query!(
         "UPDATE jobs
          SET status = 'queued', kind = $2, payload = $3, trace_context = $4,
-             attempts = 0, run_at = now(), locked_until = NULL, updated_at = now()
+             max_attempts = attempts + $5, run_at = now(), locked_until = NULL, updated_at = now()
          WHERE id = $1 AND status = 'dead'",
         id,
         kind,
         payload,
         trace_context,
+        DEFAULT_MAX_ATTEMPTS,
     )
     .execute(conn)
     .await?;

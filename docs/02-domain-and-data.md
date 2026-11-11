@@ -258,9 +258,11 @@ CREATE TABLE reconciliation_issues (
   1. `bookings::get_for_update`: 예약 행을 잠그고 읽는다 (`SELECT … FOR UPDATE`). 같은 예약에 대한 동시 조작이 차례로 처리된다.
   2. `jobs::has_active_for_booking`: 대기 · 실행 중인 작업이 있으면 거절 (한 예약에 처리 중인 작업은 하나).
   3. `bookings::transition(failed → pending, AdminRetry, actor "admin")`, `bookings::set_deadline`(지금부터 다시 계산한 확정 기한).
-  4. `jobs::requeue`: 그 예약의 dead 작업을 같은 행으로 되살린다 (`status = 'queued'`, `attempts = 0`, `run_at = now()`, 종류 · payload · trace 문맥 교체. `WHERE status = 'dead'`라서 두 번 되살리지 않는다). dead 작업이 없으면 `jobs::enqueue_with_payload`로 새로 등록한다.
+  4. `jobs::requeue`: 그 예약의 dead 작업을 같은 행으로 되살린다 (`status = 'queued'`, `run_at = now()`, 종류 · payload · trace 문맥 교체. `WHERE status = 'dead'`라서 두 번 되살리지 않는다). dead 작업이 없으면 `jobs::enqueue_with_payload`로 새로 등록한다.
+  - `attempts`는 되돌리지 않고 `max_attempts = attempts + 8`로 한도를 늘린다. `attempts`가 lease 증표라 같은 번호가 다시 나오면 lease를 잃은 옛 워커의 늦은 쓰기를 막지 못한다 (위 "lease와 fencing").
 - `submit_booking` 작업의 `payload`에 `{"lookup_first": true}`가 있으면 워커가 보내기 전에 업체에서 먼저 찾는다 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)). payload 형식이 깨졌으면 더 조심하는 쪽(조회부터)으로 읽는다.
 - `JobRecord`에 `locked_until` · `created_at` · `updated_at`을 더했다 (관리자 화면의 작업 목록).
+- dead 작업 목록은 전용 쿼리(`status = 'dead'`를 상수로 적은 것)로 읽는다. "조건이 NULL이면 건너뛰는" 쿼리는 prepared statement의 일반 실행 계획에서 부분 인덱스 `jobs_dead_idx`를 쓰지 못해, 끝난 작업이 쌓일수록 느려진다.
 
 ## 5. 작업 큐 동작
 

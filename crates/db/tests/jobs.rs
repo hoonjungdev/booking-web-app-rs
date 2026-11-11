@@ -378,9 +378,7 @@ async fn 종류별로_대기_미룸_실행_dead를_센다(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn dead_작업은_같은_행으로_되살리고_시도_횟수를_처음부터_센다(
-    pool: PgPool,
-) {
+async fn dead_작업은_같은_행으로_되살리고_시도_한도를_늘린다(pool: PgPool) {
     let booking_id = one_job(&pool).await;
     let job = jobs::claim_next(&pool, Duration::from_secs(60))
         .await
@@ -436,10 +434,23 @@ async fn dead_작업은_같은_행으로_되살리고_시도_횟수를_처음부
         .unwrap()
         .expect("되살린 작업은 바로 실행할 수 있다");
     assert_eq!(again.id, job.id);
-    assert_eq!(again.attempts, 1, "시도 횟수를 처음부터 센다");
+    assert_eq!(
+        again.attempts,
+        job.attempts + 1,
+        "시도 횟수는 lease 증표라 되돌리지 않고 이어서 센다"
+    );
+    assert_eq!(
+        again.max_attempts,
+        job.attempts + jobs::DEFAULT_MAX_ATTEMPTS,
+        "되살린 시점부터 시도 한도를 다시 준다"
+    );
     assert_eq!(again.payload, payload);
     assert_eq!(again.trace_context, Some(trace));
     assert_eq!(jobs::for_booking(&pool, booking_id).await.unwrap().len(), 1);
+
+    // 되살리기 전의 lease를 쥔 채 멈춰 있던 워커가 깨어나도 새로 가져간 작업에 손대지 못한다 (fencing)
+    assert!(!jobs::complete(&mut conn, job.lease()).await.unwrap());
+    assert!(jobs::complete(&mut conn, again.lease()).await.unwrap());
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

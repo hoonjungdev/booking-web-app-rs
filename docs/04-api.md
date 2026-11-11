@@ -147,12 +147,13 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
 
 - **목록과 커서**: 최근 것부터 `limit`건(기본 50, 최대 200). 다음 페이지가 있으면 `next_cursor`를 주고, 그 값을 그대로 `cursor`에 넣어 이어 읽는다 (마지막 항목의 ID다. 예약 ID는 UUID v7이라 ID 순서가 곧 접수 순서다). OFFSET 대신 커서라서 목록을 보는 동안 새 예약이 들어와도 같은 항목이 두 페이지에 나오지 않는다.
 - **예약 상세**는 고객 정보(이름 · 전화번호)를 관리자 화면에도 내보내지 않는다. 호출 기록의 `error_detail`(업체가 보낸 오류 본문 등)은 원인을 찾는 용도라 그대로 준다 ([05 §5](05-observability-and-analytics.md#5-로그)의 "호출 기록에만 남긴다").
-- **재시도 · 재큐잉** ([D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다)): 예약 행을 잠그고 `failed → pending`, 확정 기한을 지금부터 다시 잡고, 그 예약의 dead 작업을 같은 행으로 되살린다 (`submit_booking` + `{"lookup_first": true}`). 워커는 보내기 전에 업체에서 먼저 찾아, 이미 있으면 다시 보내지 않고 확정한다. 응답은 `202`와 바뀐 예약 · 작업.
+- **재시도 · 재큐잉** ([D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다)): 예약 행을 잠그고 `failed → pending`, 확정 기한을 지금부터 다시 잡고, 그 예약의 dead 작업을 같은 행으로 되살린다 (`submit_booking` + `{"lookup_first": true}`. 시도 횟수는 lease 증표라 되돌리지 않고 한도를 8회 늘린다). 워커는 보내기 전에 업체에서 먼저 찾아, 이미 있으면 다시 보내지 않고 확정한다. 응답은 `202`와 바뀐 예약 · 작업.
   | 상황 | 응답 |
   |---|---|
   | `failed`가 아닌 예약, 처리 중인 작업이 있는 예약, 슬롯이 이미 시작한 예약 | 409 |
   | dead가 아닌 작업 | 409 |
-  | 예약과 상관없이 묻힌 작업 (예약이 없음, 서버가 모르는 종류) | 예약은 그대로 두고 작업만 되살린다 |
+  | 예약이 `failed`가 아닌데 묻힌 작업 (예약이 없음, 서버가 모르는 종류, 예약은 `pending`으로 남음 등) | 예약 상태는 그대로 두고 작업만 되살린다. `submit_booking`이면 `lookup_first`를 붙이고, 예약이 `pending`이면 기한을 다시 잡는다 |
+- **업체 상세의 정책**은 지금 실제로 적용 중인 값이다 (파이프라인이 서버를 시작할 때 읽은 정책). 그 뒤 DB의 정책이 바뀌었으면 `restart_required: true`다 (실시간 반영은 Phase 6, [D-28](decisions.md#d-28-업체-정책-편집은-정책-실시간-반영phase-6과-함께-만든다)).
 - **업체 런타임 상태**는 업체를 부르는 프로세스의 메모리에 있다 ([D-10](decisions.md#d-10-서킷rate-limit-상태는-프로세스-메모리에-단일-인스턴스-전제)). 워커와 같은 프로세스(`--role all`, 기본값)일 때만 보이고 조작할 수 있다. `--role api`로 띄우면 `runtime`은 `null`, 서킷 조작은 503이다.
   - `limiter_available`: 우리 rate limiter 버킷에 남은 토큰 수. governor는 토큰을 쓰지 않고 엿보는 기능이 없어서, 마지막으로 토큰을 받을 때 남은 수에 그 뒤로 다시 채워졌을 수를 더한 **추정값**이다.
   - `rate_limit_remaining`: 업체가 마지막 응답에서 알려 준 남은 호출 수 (`X-RateLimit-Remaining`).
@@ -160,7 +161,7 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
 - **통계** ([05 §7](05-observability-and-analytics.md#7-분석-쿼리-관리자-통계-api의-기반)): `interval`은 `10s` · `1m` · `5m` · `15m` · `1h`, `window`는 `5m` · `15m` · `1h` · `6h` · `24h`. 시계열은 호출이 없는 구간도 0으로 채워 돌려준다 (최대 1,000구간, 넘으면 400). 지연 분위수와 성공률은 관문에서 막혀 부르지 않은 시도(`circuit_open`, `throttled`)를 빼고 계산한다. 성공률 = (`success` + `rejected`) ÷ 실제로 부른 시도 (Grafana 대시보드와 같은 정의).
 - **장애 주입 중계**는 `BOOKING_CHAOS_URL`(mock 업체 주소)을 설정할 때만 켜진다 ([D-27](decisions.md#d-27-장애-주입-중계는-booking_chaos_url을-설정할-때만-켠다)). 꺼져 있으면 503(`chaos-disabled`). mock이 거절한 설정(확률이 0~1 밖 등)은 그 사유와 함께 400, mock에 없는 업체는 404, mock을 부를 수 없으면 502.
 - 관리자 API에 없는 경로는 Problem Details 형식의 404다 (관리자 웹 화면 경로 `/admin/*`보다 먼저 맞는다).
-- 관리자 API 요청도 예약 API처럼 추적 · 지표(`http.server.request.duration`, 라우트 틀 `/admin/api/bookings/{id}` 등)에 남는다. Service 대시보드의 "예약 API 가용성"(SLO)은 `/v1` 라우트만 센다.
+- 관리자 API 요청도 예약 API처럼 추적 · 지표(`http.server.request.duration`, 라우트 틀 `/admin/api/bookings/{id}` 등)에 남는다. 재시도 · 서킷 조작 같은 조작 요청의 trace는 상태 이력과 되살린 작업에서 이어지므로 남기는 편이 낫다. 대신 화면이 몇 초마다 부르는 조회 요청도 trace가 되므로, Tempo에서는 span 이름 · 서비스로 걸러 본다 ([05 §3](05-observability-and-analytics.md#3-추적-traces)). Service 대시보드의 "예약 API 가용성"(SLO)은 `/v1` 라우트만 센다.
 
 ## 4. Mock Provider API (포트 9090)
 

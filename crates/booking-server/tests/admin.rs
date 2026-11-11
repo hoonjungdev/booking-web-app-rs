@@ -152,7 +152,12 @@ async fn 실패한_예약을_재시도하면_dead_작업을_되살리고_업체�
         "새 작업을 만들지 않고 dead 작업을 되살린다"
     );
     assert_eq!(reply.body["job"]["status"], "queued");
-    assert_eq!(reply.body["job"]["attempts"], 0);
+    // 시도 횟수는 lease 증표라 되돌리지 않고, 한도를 지금부터 다시 준다
+    assert_eq!(reply.body["job"]["attempts"], dead_job.attempts);
+    assert_eq!(
+        reply.body["job"]["max_attempts"],
+        dead_job.attempts + db::jobs::DEFAULT_MAX_ATTEMPTS
+    );
     assert_eq!(
         reply.body["job"]["payload"],
         json!({ "lookup_first": true })
@@ -333,6 +338,52 @@ async fn dead_작업을_다시_넣으면_실패한_예약도_다시_처리된다
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 예약이_처리_중인_채로_묻힌_제출_작업은_업체에서_먼저_찾고_기한을_다시_잡는다(
+    pool: PgPool,
+) {
+    let id = accept_booking(&pool, "k1").await;
+    let job = only_job(&pool, id).await;
+    // 테스트 준비: 작업만 dead가 되고 예약은 pending으로 남은 경우 (포기하는 중에 예약 상태가 먼저 바뀌어 전이가 충돌하는 등).
+    // 확정 기한도 이미 지났다.
+    sqlx::query("UPDATE jobs SET status = 'dead' WHERE id = $1")
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE bookings SET deadline_at = now() - interval '1 second' WHERE id = $1")
+        .bind(id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let adapter =
+        Arc::new(FakeAdapter::new(IDEMPOTENT, vec![confirmed("rsv_5")]).with_finds(vec![Ok(None)]));
+    let (registry, ctx) = pipeline(&pool, &adapter);
+
+    let app = admin_app(state_with(&pool, &registry));
+    let reply = post(&app, &format!("/admin/api/jobs/{}/requeue", job.id), None).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{:?}", reply.body);
+    assert_eq!(
+        reply.body["booking"],
+        Value::Null,
+        "예약 상태는 바꾸지 않는다"
+    );
+    assert_eq!(
+        reply.body["job"]["payload"],
+        json!({ "lookup_first": true })
+    );
+    let booking = db::bookings::get(&pool, id).await.unwrap().unwrap();
+    assert!(booking.deadline_at > Utc::now(), "지난 기한을 다시 잡는다");
+
+    worker::process_next(&ctx).await.unwrap();
+    assert_eq!(status(&pool, id).await, BookingStatus::Confirmed);
+    assert_eq!(
+        (adapter.find_calls(), adapter.create_calls()),
+        (1, 1),
+        "먼저 찾아보고 없으니 보냈다"
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn 예약과_상관없이_묻힌_작업은_작업만_되살린다(pool: PgPool) {
     let id = accept_booking(&pool, "k1").await;
     let job = only_job(&pool, id).await;
@@ -364,13 +415,22 @@ async fn 업체_목록과_상세는_정책과_런타임_상태를_보여준다(p
         "업체 파이프라인이 없는 프로세스"
     );
 
+    // 파이프라인이 없으면 DB의 정책을 보여 준다
+    let stored = get(&without_runtime, "/admin/api/providers/alpha").await;
+    assert_eq!(stored.body["policy"]["circuit_breaker"]["window"], 20);
+    assert_eq!(stored.body["restart_required"], false);
+
+    // 파이프라인이 있으면 실제로 적용 중인 정책을 보여 준다. 테스트의 파이프라인은 DB와 다른 정책
+    // (호출 내 재시도 없음, 잘 열리지 않는 서킷)으로 만들었으므로, 서버를 다시 시작해야 DB 값이 반영되는 상황과 같다.
     let adapter = Arc::new(FakeAdapter::new(IDEMPOTENT, vec![]));
     let (registry, _ctx) = pipeline(&pool, &adapter);
     let app = admin_app(state_with(&pool, &registry));
     let detail = get(&app, "/admin/api/providers/alpha").await;
     assert_eq!(detail.status, StatusCode::OK);
     assert_eq!(detail.body["policy"]["attempt_timeout_ms"], 3000);
-    assert_eq!(detail.body["policy"]["circuit_breaker"]["window"], 20);
+    assert_eq!(detail.body["policy"]["retry"]["max_attempts"], 1);
+    assert_eq!(detail.body["policy"]["circuit_breaker"]["window"], 1000);
+    assert_eq!(detail.body["restart_required"], true);
     let runtime = &detail.body["provider"]["runtime"];
     assert_eq!(runtime["circuit"]["state"], "closed");
     assert_eq!(runtime["circuit"]["forced"], Value::Null);
@@ -519,6 +579,34 @@ async fn 통계는_구간을_빠짐없이_채우고_막힌_시도를_지연에�
     }
     let missing = get(&app, "/admin/api/stats/providers/nope/timeseries").await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 끝_시각이_구간_경계_바로_뒤여도_마지막_구간을_빠뜨리지_않는다(
+    pool: PgPool,
+) {
+    // 화면은 "지금"을 밀리초까지 보낸다. 끝 시각이 구간 경계보다 0.5초 늦으면 그 0.5초의 호출이 마지막 구간에 들어가야 한다.
+    let boundary: chrono::DateTime<Utc> = "2026-11-10T03:05:00Z".parse().unwrap();
+    let call = NewProviderCall {
+        started_at: boundary + TimeDelta::milliseconds(200),
+        ..call_record(None, "success", 40)
+    };
+    db::provider_calls::insert_batch(&pool, &[call])
+        .await
+        .unwrap();
+
+    let app = admin_app(ApiState::new(pool.clone()));
+    let reply = get(
+        &app,
+        "/admin/api/stats/providers/alpha/timeseries?from=2026-11-10T03:00:00Z&to=2026-11-10T03:05:00.500Z&interval=1m",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let points = reply.body["points"].as_array().unwrap();
+    assert_eq!(points.len(), 6, "03:00 ~ 03:05 구간 6개");
+    let last = points.last().unwrap();
+    assert_eq!(last["bucket"], "2026-11-10T03:05:00Z");
+    assert_eq!(last["calls"], 1);
 }
 
 // ───────────────────────── 장애 주입 중계 ─────────────────────────

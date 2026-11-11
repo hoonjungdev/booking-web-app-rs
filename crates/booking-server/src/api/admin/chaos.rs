@@ -63,6 +63,8 @@ pub async fn put_chaos(
 ) -> Result<Json<ChaosSettings>, ApiError> {
     let Json(settings) = body?;
     let (client, provider) = target(&state, &provider)?;
+    // 보내기 전에 우리가 검사한다. 어느 값이 틀렸는지 우리 말로 알려 줄 수 있다.
+    settings.validate().map_err(ApiError::InvalidRequest)?;
     let applied = client.put(&provider, &settings).await.map_err(api_error)?;
     tracing::info!(%provider, "관리자가 mock 업체의 장애 설정을 바꿨다");
     Ok(Json(applied))
@@ -115,7 +117,7 @@ fn target<'a>(
 fn api_error(error: ChaosError) -> ApiError {
     match error {
         ChaosError::UnknownProvider(provider) => ApiError::ProviderNotFound(provider.to_string()),
-        ChaosError::Rejected(reason) => ApiError::InvalidRequest(reason),
+        error @ ChaosError::Rejected => ApiError::InvalidRequest(error.to_string()),
         error @ (ChaosError::Unreachable(_) | ChaosError::Status(_)) => {
             tracing::warn!(%error, "장애 주입 API 중계 실패");
             ApiError::Upstream(error.to_string())

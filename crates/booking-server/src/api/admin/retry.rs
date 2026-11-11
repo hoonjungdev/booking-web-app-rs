@@ -15,6 +15,7 @@
 //! - **확정 기한을 다시 잡는다**: 장애로 실패한 예약은 대개 기한(`deadline_at`)이 지나 포기한 것이다. 기한을 그대로 두면
 //!   워커가 바로 다시 포기하므로, 재시도한 시각부터 새로 계산한다 (접수할 때와 같은 규칙: 30분 뒤 또는 슬롯 시작 중 이른 쪽).
 //!   슬롯이 이미 시작했으면 재시도할 수 없다 (409).
+//! - **시도 횟수는 되돌리지 않는다**: `attempts`는 lease 증표라 늘어나기만 해야 한다. 대신 한도를 다시 준다 (`jobs::requeue`).
 //! - 상태 전이 · 작업 정리를 한 트랜잭션으로 저장한다 ("상태는 pending인데 처리할 작업이 없는" 유실을 막는다).
 
 use chrono::Utc;
@@ -60,8 +61,10 @@ pub async fn retry_booking(
 /// dead 작업을 다시 대기열에 넣는다.
 ///
 /// 작업의 예약이 `failed`면(작업이 포기하면서 예약도 실패시킨 경우) 예약 재시도와 같다: 예약을 `pending`으로 되돌리고
-/// 이 작업을 `submit_booking` + `lookup_first`로 되살린다. 그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다
-/// (예약이 없어서 묻힌 작업, 이 서버가 모르는 종류라서 묻힌 작업 등).
+/// 이 작업을 `submit_booking` + `lookup_first`로 되살린다. 그 밖에는 예약 상태는 그대로 두고 작업만 되살린다
+/// (예약이 없어서 묻힌 작업, 이 서버가 모르는 종류라서 묻힌 작업 등). 이때도 `submit_booking`이면 다시 보내기 전에
+/// 업체에서 먼저 찾게 하고, 예약이 아직 `pending`이면 확정 기한을 다시 잡는다 (앞선 시도가 업체까지 갔을 수 있고,
+/// 지난 기한 그대로면 워커가 바로 다시 포기한다).
 pub async fn requeue_job(
     pool: &PgPool,
     job_id: i64,
@@ -82,36 +85,47 @@ pub async fn requeue_job(
         Some(booking_id) => bookings::get_for_update(&mut tx, booking_id).await?,
         None => None,
     };
+    // 실패한 예약이면 예약 재시도. 준비한 작업의 ID를 받는다 (보통 이 작업이다)
     let retried = match &booking {
         Some(booking) if booking.status == BookingStatus::Failed => {
-            retry_locked(&mut tx, booking, Some(job.id), trace).await?;
-            true
+            Some(retry_locked(&mut tx, booking, Some(job.id), trace).await?)
         }
-        Some(booking) => {
-            ensure_no_active_job(&mut tx, booking.id).await?;
-            false
-        }
-        None => false,
+        _ => None,
     };
-    if !retried {
-        // 예약 상태와 상관없이 작업만 같은 내용으로 되살린다
-        let requeued = jobs::requeue(
-            &mut tx,
-            job.id,
-            &job.kind,
-            &job.payload,
-            trace.context.as_ref(),
-        )
-        .await?;
-        if !requeued {
-            return Err(ApiError::Conflict(
-                "그사이 다른 곳에서 이 작업을 되살렸습니다".into(),
-            ));
+    let job_id = match retried {
+        Some(id) => id,
+        None => {
+            if let Some(booking) = &booking {
+                ensure_no_active_job(&mut tx, booking.id).await?;
+            }
+            let mut payload = job.payload.clone();
+            if job.kind == JobKind::SubmitBooking.as_str() {
+                payload = lookup_first_payload()?;
+                if let Some(booking) = &booking
+                    && booking.status == BookingStatus::Pending
+                {
+                    renew_deadline(&mut tx, booking).await?;
+                }
+            }
+            let requeued =
+                jobs::requeue(&mut tx, job.id, &job.kind, &payload, trace.context.as_ref()).await?;
+            if !requeued {
+                return Err(ApiError::Conflict(
+                    "그사이 다른 곳에서 이 작업을 되살렸습니다".into(),
+                ));
+            }
+            job.id
         }
-    }
+    };
     tx.commit().await?;
-    tracing::info!(job_id, kind = %job.kind, retried, "관리자가 dead 작업을 다시 넣었다");
-    finished(pool, booking.as_ref().filter(|_| retried), job.id).await
+    let retried_booking = booking.as_ref().filter(|_| retried.is_some());
+    tracing::info!(
+        job_id,
+        kind = %job.kind,
+        retried = retried.is_some(),
+        "관리자가 dead 작업을 다시 넣었다"
+    );
+    finished(pool, retried_booking, job_id).await
 }
 
 /// 잠근 예약을 `failed` → `pending`으로 되돌리고 처리할 작업을 준비한다. 준비한 작업의 ID를 돌려준다.
@@ -137,12 +151,8 @@ async fn retry_locked(
         }
     }
     ensure_no_active_job(tx, booking.id).await?;
-    let now = db::normalize_timestamp(Utc::now());
-    if booking.request.slot_start <= now {
-        return Err(ApiError::Conflict(
-            "슬롯이 이미 시작해서 다시 시도할 수 없습니다".into(),
-        ));
-    }
+    // 기한을 지금부터 다시 잡는다 (지난 기한 그대로면 워커가 바로 다시 포기한다). 슬롯이 이미 시작했으면 409.
+    renew_deadline(tx, booking).await?;
 
     let transitioned = bookings::transition(
         tx,
@@ -154,20 +164,11 @@ async fn retry_locked(
     )
     .await?;
     if transitioned == Transitioned::Conflict {
-        // 예약을 잠갔으므로 일어나지 않는다. 그래도 일어나면 아무것도 바꾸지 않고 알린다.
+        // 예약을 잠갔으므로 일어나지 않는다. 그래도 일어나면 아무것도 바꾸지 않고 알린다 (트랜잭션은 커밋되지 않는다).
         return Err(ApiError::Conflict("그사이 예약 상태가 바뀌었습니다".into()));
     }
-    // 기한도 지금부터 다시 잡는다 (지난 기한 그대로면 워커가 바로 다시 포기한다)
-    bookings::set_deadline(
-        tx,
-        booking.id,
-        confirmation_deadline(now, booking.request.slot_start),
-    )
-    .await?;
 
-    // 다시 보내기 전에 업체에서 먼저 찾아보라는 표시
-    let payload = serde_json::to_value(SubmitPayload { lookup_first: true })
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    let payload = lookup_first_payload()?;
     let kind = JobKind::SubmitBooking;
     let dead = match job {
         Some(id) => Some(id),
@@ -188,6 +189,26 @@ async fn retry_locked(
     )
     .await?;
     Ok(id)
+}
+
+/// 다시 처리할 예약의 확정 기한을 지금부터 다시 잡는다 (접수와 같은 규칙: 30분 뒤 또는 슬롯 시작 중 이른 쪽).
+/// 슬롯이 이미 시작했으면 다시 처리할 수 없다 (409).
+async fn renew_deadline(tx: &mut PgConnection, booking: &Booking) -> Result<(), ApiError> {
+    let now = db::normalize_timestamp(Utc::now());
+    if booking.request.slot_start <= now {
+        return Err(ApiError::Conflict(
+            "슬롯이 이미 시작해서 다시 처리할 수 없습니다".into(),
+        ));
+    }
+    let deadline = confirmation_deadline(now, booking.request.slot_start);
+    bookings::set_deadline(tx, booking.id, deadline).await?;
+    Ok(())
+}
+
+/// "다시 보내기 전에 업체에서 먼저 찾아보라"는 `submit_booking` 작업의 진행 상황
+fn lookup_first_payload() -> Result<serde_json::Value, ApiError> {
+    serde_json::to_value(SubmitPayload { lookup_first: true })
+        .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
 /// 예약에 대기 · 실행 중인 작업이 있으면 거절한다 (한 예약에 처리 중인 작업은 하나뿐)
