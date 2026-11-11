@@ -271,3 +271,193 @@ async fn 종류별로_대기_작업과_dead_작업을_센다(pool: PgPool) {
         "나중에 실행할 작업(재예약)과 처리 중인 작업은 대기 수에 넣지 않는다"
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 작업_목록은_상태와_종류로_거르고_커서로_나눠_읽는다(pool: PgPool) {
+    let first = one_job(&pool).await;
+    let client = common::create_client(&pool, "other").await;
+    let second = common::new_booking(client, "key-2", b"hash-2");
+    bookings::accept(&pool, &second).await.unwrap();
+
+    // 첫 예약의 작업을 dead로 만든다
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.booking_id, Some(first));
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        jobs::mark_dead(&mut conn, job.lease(), "boom")
+            .await
+            .unwrap()
+    );
+
+    let all = jobs::list(&pool, &jobs::JobFilter::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].id > all[1].id, "최근에 등록한 것부터");
+
+    let dead = jobs::JobFilter {
+        status: Some("dead".into()),
+        ..Default::default()
+    };
+    let dead = jobs::list(&pool, &dead, 10).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].id, job.id);
+    assert_eq!(dead[0].last_error.as_deref(), Some("boom"));
+
+    let other_kind = jobs::JobFilter {
+        kind: Some("resolve_unknown".into()),
+        ..Default::default()
+    };
+    assert!(jobs::list(&pool, &other_kind, 10).await.unwrap().is_empty());
+
+    let after_newest = jobs::JobFilter {
+        before: Some(all[0].id),
+        ..Default::default()
+    };
+    let rest = jobs::list(&pool, &after_newest, 10).await.unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, all[1].id);
+
+    let fetched = jobs::get(&mut conn, job.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, "dead");
+    assert!(jobs::get(&mut conn, -1).await.unwrap().is_none());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 종류별로_대기_미룸_실행_dead를_센다(pool: PgPool) {
+    for n in 0..4 {
+        let client = common::create_client(&pool, &format!("app-{n}")).await;
+        let new = common::new_booking(client, "key", b"hash");
+        bookings::accept(&pool, &new).await.unwrap();
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    // 작업 4개: 실행 중 1, 미룸 1, dead 1, 대기 1
+    let running = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let delayed = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        jobs::retry_later(
+            &mut conn,
+            delayed.lease(),
+            Duration::from_secs(300),
+            "later"
+        )
+        .await
+        .unwrap()
+    );
+    let dead = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        jobs::mark_dead(&mut conn, dead.lease(), "boom")
+            .await
+            .unwrap()
+    );
+    assert_ne!(running.id, dead.id);
+
+    let counts = jobs::counts(&pool).await.unwrap();
+    assert_eq!(
+        counts,
+        vec![jobs::KindCounts {
+            kind: "submit_booking".into(),
+            ready: 1,
+            scheduled: 1,
+            running: 1,
+            dead: 1,
+        }]
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn dead_작업은_같은_행으로_되살리고_시도_횟수를_처음부터_센다(
+    pool: PgPool,
+) {
+    let booking_id = one_job(&pool).await;
+    let job = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+
+    // dead가 아닌 작업은 되살리지 않는다
+    let payload = serde_json::json!({ "lookup_first": true });
+    assert!(
+        !jobs::requeue(&mut conn, job.id, "submit_booking", &payload, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        jobs::has_active_for_booking(&mut conn, booking_id)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        jobs::mark_dead(&mut conn, job.lease(), "boom")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !jobs::has_active_for_booking(&mut conn, booking_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        jobs::latest_dead_for_booking(&mut conn, booking_id)
+            .await
+            .unwrap(),
+        Some(job.id)
+    );
+
+    let trace = serde_json::json!({ "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" });
+    assert!(
+        jobs::requeue(&mut conn, job.id, "submit_booking", &payload, Some(&trace))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !jobs::requeue(&mut conn, job.id, "submit_booking", &payload, None)
+            .await
+            .unwrap(),
+        "이미 되살린 작업을 다시 되살리지 않는다"
+    );
+
+    let again = jobs::claim_next(&pool, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("되살린 작업은 바로 실행할 수 있다");
+    assert_eq!(again.id, job.id);
+    assert_eq!(again.attempts, 1, "시도 횟수를 처음부터 센다");
+    assert_eq!(again.payload, payload);
+    assert_eq!(again.trace_context, Some(trace));
+    assert_eq!(jobs::for_booking(&pool, booking_id).await.unwrap().len(), 1);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 처음부터_진행_상황을_정해_작업을_등록할_수_있다(pool: PgPool) {
+    let booking_id = one_job(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let payload = serde_json::json!({ "lookup_first": true });
+    let id = jobs::enqueue_with_payload(
+        &mut conn,
+        jobs::JobKind::SubmitBooking,
+        Some(booking_id),
+        jobs::DEFAULT_MAX_ATTEMPTS,
+        &payload,
+        None,
+    )
+    .await
+    .unwrap();
+    let saved = jobs::get(&mut conn, id).await.unwrap().unwrap();
+    assert_eq!(saved.payload, payload);
+    assert_eq!(saved.status, "queued");
+}

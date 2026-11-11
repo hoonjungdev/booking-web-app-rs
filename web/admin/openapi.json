@@ -1,0 +1,2466 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Booking Gateway API",
+    "description": "외부 예약 업체 연동 게이트웨이.\n\n- `/v1`: 예약 API (클라이언트용, `X-Api-Key` 인증)\n- `/admin/api`: 관리자 API (Phase 6 전까지는 로컬 전용, 인증 없음)\n\n오류는 RFC 9457 Problem Details(`application/problem+json`)로 돌려준다. 응답 헤더 `X-Trace-Id`로 Grafana에서 요청의 처리 과정을 찾을 수 있다.",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/admin/api/bookings": {
+      "get": {
+        "tags": [
+          "admin: bookings"
+        ],
+        "summary": "예약 목록",
+        "operationId": "admin_list_bookings",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "예약 상태",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BookingStatus"
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "업체 ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "접수 시각이 이 시각 이후 (포함, RFC 3339)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "접수 시각이 이 시각 전 (미포함, RFC 3339)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "다음 페이지: 앞 페이지 응답의 `next_cursor`를 그대로 넣는다",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "한 페이지 크기 (기본 50, 최대 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "예약 목록 한 페이지",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "조건 값 오류",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/bookings/{id}": {
+      "get": {
+        "tags": [
+          "admin: bookings"
+        ],
+        "summary": "예약 상세",
+        "operationId": "admin_get_booking",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "예약 ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "예약과 상태 이력 · 업체 호출 기록 · 작업",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 예약",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/bookings/{id}/retry": {
+      "post": {
+        "tags": [
+          "admin: bookings"
+        ],
+        "summary": "실패한 예약을 다시 처리한다",
+        "description": "예약을 `failed` → `pending`으로 되돌리고, 그 예약의 dead 작업을 되살린다 (없으면 새로 등록).\n워커는 다시 보내기 전에 업체에서 이 예약을 먼저 찾아본다 (이미 만들어졌으면 확정으로 끝낸다).",
+        "operationId": "admin_retry_booking",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "예약 ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "다시 처리하도록 작업을 넣음",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 예약",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "failed가 아니거나 처리 중인 작업이 있음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/chaos/{provider}": {
+      "get": {
+        "tags": [
+          "admin: chaos"
+        ],
+        "summary": "업체의 지금 장애 설정",
+        "operationId": "admin_get_chaos",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "업체 ID (mock 업체 이름과 같다)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "장애 설정",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosSettings"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "mock 업체에 없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "mock 업체를 부를 수 없음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "장애 주입이 꺼져 있음 (BOOKING_CHAOS_URL)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "admin: chaos"
+        ],
+        "summary": "장애 설정을 바꾼다 (전체 교체)",
+        "operationId": "admin_put_chaos",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "업체 ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChaosSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "바뀐 장애 설정",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "설정 값 오류 (확률이 0~1 밖 등)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "mock 업체에 없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "mock 업체를 부를 수 없음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "장애 주입이 꺼져 있음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/chaos/{provider}/preset/{name}": {
+      "post": {
+        "tags": [
+          "admin: chaos"
+        ],
+        "summary": "미리 정해 둔 장애 시나리오를 적용한다",
+        "operationId": "admin_apply_chaos_preset",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "업체 ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "시나리오 이름",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChaosPreset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "적용한 장애 설정",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChaosSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "없는 시나리오",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "mock 업체에 없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "mock 업체를 부를 수 없음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "장애 주입이 꺼져 있음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/info": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "관리자 화면 설정",
+        "operationId": "admin_info",
+        "responses": {
+          "200": {
+            "description": "관리자 화면 설정",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/jobs": {
+      "get": {
+        "tags": [
+          "admin: jobs"
+        ],
+        "summary": "작업 목록",
+        "operationId": "admin_list_jobs",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "작업 상태",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/JobStatus"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "작업 종류 (`submit_booking`, `resolve_unknown`)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "다음 페이지: 앞 페이지 응답의 `next_cursor`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "한 페이지 크기 (기본 50, 최대 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "작업 목록 한 페이지",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "조건 값 오류",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/jobs/counts": {
+      "get": {
+        "tags": [
+          "admin: jobs"
+        ],
+        "summary": "작업 종류 · 상태별 개수",
+        "operationId": "admin_job_counts",
+        "responses": {
+          "200": {
+            "description": "종류별 · 전체 작업 수",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCounts"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/jobs/{id}/requeue": {
+      "post": {
+        "tags": [
+          "admin: jobs"
+        ],
+        "summary": "dead 작업을 다시 대기열에 넣는다",
+        "description": "작업의 예약이 `failed`면 예약 재시도(`POST /bookings/{id}/retry`)와 같다: 예약을 `pending`으로 되돌리고\n이 작업을 \"업체에서 먼저 찾아본 뒤 제출하는\" `submit_booking`으로 되살린다.\n그 밖에는 예약은 그대로 두고 작업만 같은 내용으로 되살린다. 시도 횟수는 처음부터 다시 센다.",
+        "operationId": "admin_requeue_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "작업 ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "대기열에 다시 넣음",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 작업",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "dead가 아니거나, 같은 예약에 처리 중인 작업이 있음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/providers": {
+      "get": {
+        "tags": [
+          "admin: providers"
+        ],
+        "summary": "업체 목록",
+        "operationId": "admin_list_providers",
+        "responses": {
+          "200": {
+            "description": "모든 업체 (사용하지 않는 업체 포함)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/providers/{id}": {
+      "get": {
+        "tags": [
+          "admin: providers"
+        ],
+        "summary": "업체 상세",
+        "operationId": "admin_get_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "업체 ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "업체 설정 · 정책 · 런타임 상태",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/providers/{id}/circuit": {
+      "post": {
+        "tags": [
+          "admin: providers"
+        ],
+        "summary": "서킷을 강제로 열거나 닫거나, 강제 상태를 푼다",
+        "description": "서킷 상태는 업체를 부르는 프로세스의 메모리에 있다. 워커와 같은 프로세스(`--role all`)에서만 조작할 수 있다.",
+        "operationId": "admin_control_circuit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "업체 ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CircuitCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "조작한 뒤의 런타임 상태",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "요청 본문 오류",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "사용하지 않는 업체 (파이프라인이 없음)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "이 프로세스에 업체 파이프라인이 없음 (--role api)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/stats/providers/summary": {
+      "get": {
+        "tags": [
+          "admin: stats"
+        ],
+        "summary": "업체별 요약 (대시보드 카드용)",
+        "operationId": "admin_providers_summary",
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "description": "지금부터 거슬러 올라갈 기간 (기본 `1h`)",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SummaryWindow"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "업체별 호출 수 · 성공률 · 지연",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "기간 값 오류",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/api/stats/providers/{id}/timeseries": {
+      "get": {
+        "tags": [
+          "admin: stats"
+        ],
+        "summary": "업체 하나의 구간별 호출 수 · 결과 분포 · p50/p95/p99",
+        "operationId": "admin_provider_timeseries",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "업체 ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "시작 시각 (포함, RFC 3339). 기본: 끝 시각 1시간 전",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "끝 시각 (미포함, RFC 3339). 기본: 지금",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "description": "구간 간격 (기본 `1m`)",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/StatsInterval"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "구간별 통계",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Timeseries"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "기간 · 간격 오류 (구간이 너무 많음 등)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bookings": {
+      "post": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "예약을 접수한다. 업체 호출은 워커가 하므로 바로 `202 Accepted`를 돌려준다 (docs/decisions.md D-03).",
+        "description": "`body`를 `Result<Json<_>, JsonRejection>`으로 받으면 본문 해석 실패를 직접 처리할 수 있다.\n그냥 `Json<_>`으로 받으면 axum이 일반 텍스트로 거절해 버려 Problem Details 형식을 지킬 수 없다.\n\n`skip_all`이 중요하다: 인자(`body`)에는 고객 이름 · 전화번호가 들어 있어서 span에 기록하면 안 된다.\n예약 ID는 접수한 뒤에야 알 수 있으므로 `Empty`로 자리만 잡아 두고 나중에 채운다.\n\n`#[utoipa::path]`: 이 핸들러의 경로 · 매개변수 · 응답을 API 문서에 적는다. `api::documented_routes`의\n`routes!(bookings::create)`가 이 정보로 axum 라우트와 문서 경로를 함께 등록한다.",
+        "operationId": "create_booking",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "멱등키 (출력 가능한 ASCII 1~255자). 같은 키로 다시 보내면 같은 예약을 돌려준다",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBookingBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "접수함 (업체 제출은 워커가 한다). 같은 키 + 같은 본문이면 기존 예약",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "예약 조회 경로"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "입력 오류 · 지난 슬롯 · 멱등키 없음",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API 키가 없거나 틀림",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "예약을 받지 않는 업체",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "같은 멱등키 + 다른 본문",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/v1/bookings/{id}": {
+      "get": {
+        "tags": [
+          "bookings"
+        ],
+        "summary": "자기 클라이언트의 예약을 조회한다. 다른 클라이언트의 예약이나 잘못된 ID는 모두 404.",
+        "operationId": "get_booking",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "예약 ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "예약",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "API 키가 없거나 틀림",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "없거나 다른 클라이언트의 예약",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AdminBooking": {
+        "type": "object",
+        "description": "관리자 화면의 예약. 고객 정보(이름 · 전화번호)는 관리자 화면에도 내보내지 않는다.",
+        "required": [
+          "id",
+          "client_id",
+          "status",
+          "provider",
+          "resource_id",
+          "slot_start",
+          "party_size",
+          "deadline_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "client_id": {
+            "$ref": "#/components/schemas/ClientId",
+            "description": "예약을 만든 API 클라이언트"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "deadline_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "이 시각까지 확정하지 못하면 포기한다"
+          },
+          "id": {
+            "$ref": "#/components/schemas/BookingId"
+          },
+          "party_size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "provider_booking_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "업체가 확정한 뒤 알려 준 업체 쪽 예약 ID"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "slot_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BookingStatus"
+          },
+          "status_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "마지막 상태 전이의 사유 (거절 코드, 포기 사유 등)"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AdminInfo": {
+        "type": "object",
+        "description": "관리자 화면 설정. 화면이 처음 열릴 때 읽어, 쓸 수 없는 기능은 숨기거나 이유를 보여 준다.",
+        "required": [
+          "version",
+          "chaos_enabled",
+          "provider_runtime"
+        ],
+        "properties": {
+          "chaos_enabled": {
+            "type": "boolean",
+            "description": "장애 주입을 쓸 수 있는가 (`BOOKING_CHAOS_URL`을 설정했는가)"
+          },
+          "grafana_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "trace ID를 Grafana(Tempo) 링크로 보여 줄 때 쓸 주소. 없으면 링크를 만들지 않는다"
+          },
+          "provider_runtime": {
+            "type": "boolean",
+            "description": "업체 런타임 상태(서킷 등)를 보고 조작할 수 있는가 (워커와 같은 프로세스인가)"
+          },
+          "version": {
+            "type": "string",
+            "description": "서버 버전"
+          }
+        }
+      },
+      "BookingDetail": {
+        "type": "object",
+        "description": "예약 상세: 예약, 상태 이력, 업체 호출 기록, 작업",
+        "required": [
+          "booking",
+          "events",
+          "calls",
+          "jobs"
+        ],
+        "properties": {
+          "booking": {
+            "$ref": "#/components/schemas/AdminBooking"
+          },
+          "calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderCallView"
+            },
+            "description": "업체 호출 기록 (시도 1번 = 1행, 오래된 것부터)"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BookingEventView"
+            },
+            "description": "상태 변경 이력 (오래된 것부터)"
+          },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobView"
+            },
+            "description": "이 예약을 처리한 작업 (등록 순서대로)"
+          }
+        }
+      },
+      "BookingEventView": {
+        "type": "object",
+        "description": "상태 이력 한 줄",
+        "required": [
+          "to_status",
+          "actor",
+          "at"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "description": "바꾼 주체: `api`, `worker`, `admin` …"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "from_status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BookingStatus",
+                "description": "바뀌기 전 상태 (접수는 `null`)"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_status": {
+            "$ref": "#/components/schemas/BookingStatus"
+          },
+          "trace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "이 변경이 일어난 trace (접수는 요청의 trace, 확정 · 실패는 작업의 trace)"
+          }
+        }
+      },
+      "BookingId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "예약 ID (UUID v7)"
+      },
+      "BookingPage": {
+        "type": "object",
+        "description": "예약 목록 한 페이지",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminBooking"
+            },
+            "description": "최근에 접수한 것부터"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "다음 페이지를 읽을 커서. 마지막 페이지면 `null`. 내용을 해석하지 말고 그대로 돌려보낸다."
+          }
+        }
+      },
+      "BookingResponse": {
+        "type": "object",
+        "description": "예약 응답. 고객 정보는 돌려주지 않는다 (개인정보 최소화).",
+        "required": [
+          "id",
+          "status",
+          "provider",
+          "resource_id",
+          "slot_start",
+          "party_size",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "$ref": "#/components/schemas/BookingId"
+          },
+          "party_size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "provider_booking_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "slot_start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BookingStatus"
+          },
+          "status_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BookingStatus": {
+        "type": "string",
+        "description": "예약 상태 (docs/02-domain-and-data.md §2)",
+        "enum": [
+          "pending",
+          "confirmed",
+          "rejected",
+          "unknown",
+          "failed",
+          "cancel_requested",
+          "cancelled",
+          "cancel_failed"
+        ]
+      },
+      "BulkheadPolicyView": {
+        "type": "object",
+        "required": [
+          "max_concurrency",
+          "max_wait_ms"
+        ],
+        "properties": {
+          "max_concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ChaosPreset": {
+        "type": "string",
+        "description": "미리 정해 둔 장애 시나리오 (docs/03-resilience.md §10)",
+        "enum": [
+          "healthy",
+          "flaky",
+          "slow",
+          "throttled",
+          "lossy",
+          "outage"
+        ]
+      },
+      "ChaosSettings": {
+        "type": "object",
+        "description": "업체 하나의 장애 설정 (mock-provider `ChaosConfig`와 같은 모양)",
+        "required": [
+          "latency_ms",
+          "slow",
+          "error",
+          "hang_probability",
+          "drop_after_commit_probability",
+          "rate_limit",
+          "outage"
+        ],
+        "properties": {
+          "drop_after_commit_probability": {
+            "type": "number",
+            "format": "double",
+            "description": "쓰기 요청만: 처리는 하고 30초 동안 응답하지 않을 확률 (0~1). 결과 불명 상황을 만든다"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorSettings",
+            "description": "일정 확률로 5xx (예약을 만들지 않음)"
+          },
+          "hang_probability": {
+            "type": "number",
+            "format": "double",
+            "description": "처리하지 않고 30초 동안 응답하지 않을 확률 (0~1)"
+          },
+          "latency_ms": {
+            "$ref": "#/components/schemas/LatencyRange",
+            "description": "모든 요청에 이 범위의 무작위 지연 (밀리초)"
+          },
+          "outage": {
+            "type": "boolean",
+            "description": "모든 요청에 503"
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimitSettings",
+            "description": "업체 쪽 호출 한도 (토큰 버킷)"
+          },
+          "slow": {
+            "$ref": "#/components/schemas/SlowSettings",
+            "description": "일정 확률로 지연을 더한다"
+          }
+        }
+      },
+      "CircuitActionView": {
+        "type": "string",
+        "enum": [
+          "force_open",
+          "force_close",
+          "reset"
+        ]
+      },
+      "CircuitBreakerPolicyView": {
+        "type": "object",
+        "required": [
+          "window",
+          "min_calls",
+          "failure_rate",
+          "open_ms",
+          "half_open_probes"
+        ],
+        "properties": {
+          "failure_rate": {
+            "type": "number",
+            "format": "double",
+            "description": "이 비율 이상 실패하면 연다 (0~1)"
+          },
+          "half_open_probes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "반만 열린 상태의 시험 호출 수",
+            "minimum": 0
+          },
+          "min_calls": {
+            "type": "integer",
+            "format": "int32",
+            "description": "이만큼은 호출해 봐야 판단한다",
+            "minimum": 0
+          },
+          "open_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "열린 뒤 시험 호출을 허용하기까지 기다리는 시간",
+            "minimum": 0
+          },
+          "window": {
+            "type": "integer",
+            "format": "int32",
+            "description": "최근 몇 번의 결과로 실패율을 계산하는가",
+            "minimum": 0
+          }
+        }
+      },
+      "CircuitCommand": {
+        "type": "object",
+        "description": "서킷 조작 요청",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/CircuitActionView"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CircuitStateView": {
+        "type": "string",
+        "enum": [
+          "closed",
+          "open",
+          "half_open"
+        ]
+      },
+      "CircuitView": {
+        "type": "object",
+        "description": "서킷 브레이커 상태 (docs/03-resilience.md §7)",
+        "required": [
+          "state",
+          "recent_calls",
+          "recent_failures",
+          "probes_succeeded",
+          "probes_in_flight"
+        ],
+        "properties": {
+          "forced": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ForcedStateView",
+                "description": "관리자가 강제로 정한 상태면 그 값. 강제된 동안에는 호출 결과로 상태가 바뀌지 않는다"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "open_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "열린 상태: 시험 호출(half-open)을 시작할 수 있게 되는 시각. 강제로 열었으면 `null`"
+          },
+          "probes_in_flight": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "probes_succeeded": {
+            "type": "integer",
+            "format": "int32",
+            "description": "반만 열린 상태: 성공한 시험 호출 수와 결과를 기다리는 시험 호출 수",
+            "minimum": 0
+          },
+          "recent_calls": {
+            "type": "integer",
+            "format": "int32",
+            "description": "닫힌 상태: 실패율 계산에 쓰는 최근 결과 수와 그중 실패 수",
+            "minimum": 0
+          },
+          "recent_failures": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/CircuitStateView"
+          }
+        }
+      },
+      "ClientId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "API 클라이언트 ID (UUID v7)"
+      },
+      "CreateBookingBody": {
+        "type": "object",
+        "description": "예약 생성 요청 본문. 모르는 필드가 있으면 400 (오타를 조용히 무시하지 않기 위해)\n\n`#[derive(ToSchema)]`: 이 구조체의 모양을 API 문서(OpenAPI 스키마)로 만든다. 필드의 문서 주석(`///`)이 설명이 된다.",
+        "required": [
+          "provider",
+          "resource_id",
+          "slot_start",
+          "party_size",
+          "customer"
+        ],
+        "properties": {
+          "customer": {
+            "$ref": "#/components/schemas/Customer",
+            "description": "고객 정보. 저장하지만 응답 · 로그에는 내보내지 않는다"
+          },
+          "party_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "인원 (1~50)",
+            "maximum": 50,
+            "minimum": 1
+          },
+          "provider": {
+            "type": "string",
+            "description": "업체 ID",
+            "example": "alpha"
+          },
+          "resource_id": {
+            "type": "string",
+            "description": "업체 안의 예약 대상 (매장 등)",
+            "example": "store-001"
+          },
+          "slot_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "슬롯 시작 시각 (RFC 3339). 오프셋을 붙여도 된다 (`+09:00`)"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Customer": {
+        "type": "object",
+        "description": "고객 정보. 예약을 만들 때만 받고, 응답 · 로그에는 내보내지 않는다",
+        "required": [
+          "name",
+          "phone"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ErrorSettings": {
+        "type": "object",
+        "required": [
+          "probability",
+          "statuses"
+        ],
+        "properties": {
+          "probability": {
+            "type": "number",
+            "format": "double",
+            "description": "0~1"
+          },
+          "statuses": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "무작위로 고를 상태 코드 (5xx만)"
+          }
+        }
+      },
+      "ForcedStateView": {
+        "type": "string",
+        "enum": [
+          "open",
+          "closed"
+        ]
+      },
+      "JobCounts": {
+        "type": "object",
+        "description": "작업 큐 개수: 종류별과 전체",
+        "required": [
+          "kinds",
+          "total"
+        ],
+        "properties": {
+          "kinds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KindQueueCounts"
+            },
+            "description": "이 서버가 아는 종류는 작업이 없어도 0으로 나온다"
+          },
+          "total": {
+            "$ref": "#/components/schemas/QueueCounts"
+          }
+        }
+      },
+      "JobPage": {
+        "type": "object",
+        "description": "작업 목록 한 페이지",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobView"
+            },
+            "description": "최근에 등록한 것부터"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "다음 페이지를 읽을 커서. 마지막 페이지면 `null`"
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "description": "작업 상태",
+        "enum": [
+          "queued",
+          "running",
+          "done",
+          "dead"
+        ]
+      },
+      "JobView": {
+        "type": "object",
+        "description": "작업 한 건",
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "attempts",
+          "max_attempts",
+          "run_at",
+          "payload",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "지금까지 시도한 횟수 (실행할 때마다 1 늘어난다. 업체를 부르지 않고 미룬 실행은 세지 않는다)"
+          },
+          "booking_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BookingId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`submit_booking`, `resolve_unknown` … (이 서버 버전이 모르는 종류일 수도 있다)"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "마지막 실패 · 미룸 사유"
+          },
+          "locked_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "실행 중이면 이 시각까지 이 작업을 쥐고 있다 (lease)"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "payload": {
+            "type": "object",
+            "description": "작업별 진행 상황 (예: `{\"lookup_first\": true}`, `{\"not_found_checks\": 1}`)"
+          },
+          "run_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "실행하기로 한 시각"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "KindQueueCounts": {
+        "type": "object",
+        "description": "종류 하나의 작업 수",
+        "required": [
+          "kind",
+          "counts"
+        ],
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/QueueCounts"
+          },
+          "kind": {
+            "type": "string"
+          }
+        }
+      },
+      "Latency": {
+        "type": "object",
+        "description": "분위수 지연 (밀리초). 실제로 업체를 부른 시도가 없으면 `null`",
+        "properties": {
+          "p50": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "p95": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "p99": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "LatencyRange": {
+        "type": "object",
+        "required": [
+          "min",
+          "max"
+        ],
+        "properties": {
+          "max": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "min": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PolicyView": {
+        "type": "object",
+        "description": "장애 대응 정책 (docs/03-resilience.md §3)",
+        "required": [
+          "attempt_timeout_ms",
+          "call_budget_ms",
+          "retry",
+          "rate_limit",
+          "bulkhead",
+          "circuit_breaker"
+        ],
+        "properties": {
+          "attempt_timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "시도 한 번의 최대 시간",
+            "minimum": 0
+          },
+          "bulkhead": {
+            "$ref": "#/components/schemas/BulkheadPolicyView"
+          },
+          "call_budget_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "호출 한 번(재시도 포함)에 쓸 수 있는 전체 시간",
+            "minimum": 0
+          },
+          "circuit_breaker": {
+            "$ref": "#/components/schemas/CircuitBreakerPolicyView"
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimitPolicyView"
+          },
+          "retry": {
+            "$ref": "#/components/schemas/RetryPolicyView"
+          }
+        }
+      },
+      "Problem": {
+        "type": "object",
+        "description": "RFC 9457 Problem Details. 모든 오류 응답의 본문이다 (`application/problem+json`).",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "이번 요청에 대한 자세한 설명"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP 상태 코드",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "사람이 읽을 짧은 제목"
+          },
+          "trace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "이 요청의 trace ID. 문의를 받으면 이 값으로 Grafana에서 요청의 처리 과정을 찾는다.\ntrace가 없으면(OpenTelemetry를 설치하지 않은 테스트 등) 필드를 아예 넣지 않는다."
+          },
+          "type": {
+            "type": "string",
+            "description": "문제 종류를 나타내는 URI (`https://booking.local/problems/<종류>`). 클라이언트는 이 값으로 오류를 구분한다.\n`type`은 Rust 예약어라서 필드 이름을 바꾸고 JSON에서만 `type`으로 내보낸다.",
+            "example": "https://booking.local/problems/booking-not-found"
+          }
+        }
+      },
+      "ProviderCallView": {
+        "type": "object",
+        "description": "업체 호출 시도 한 번",
+        "required": [
+          "id",
+          "operation",
+          "attempt",
+          "started_at",
+          "duration_ms",
+          "outcome"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "호출 안에서 몇 번째 시도인가 (1부터)"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "error_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "원인을 찾는 데 필요한 자세한 내용 (업체가 보낸 오류 본문 등)"
+          },
+          "http_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "operation": {
+            "type": "string",
+            "description": "`create_booking`, `find_booking` …"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`success` 또는 실패 분류 (docs/03-resilience.md §1)"
+          },
+          "rate_limit_remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "업체가 알려 준 남은 호출 수"
+          },
+          "retry_after_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "trace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "이 시도가 속한 trace"
+          }
+        }
+      },
+      "ProviderDetail": {
+        "type": "object",
+        "description": "업체 상세: 목록 정보 + 정책",
+        "required": [
+          "provider",
+          "policy"
+        ],
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/PolicyView",
+            "description": "장애 대응 정책 (빠진 값은 기본값으로 채운 것). 서버가 시작할 때 읽어 적용한다"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderView"
+          }
+        }
+      },
+      "ProviderId": {
+        "type": "string",
+        "description": "업체 ID (영문 소문자로 시작하는 1~32자의 소문자 · 숫자 · `_` · `-`)",
+        "example": "alpha"
+      },
+      "ProviderStats": {
+        "type": "object",
+        "required": [
+          "provider",
+          "attempts",
+          "called",
+          "answered",
+          "rate_limited",
+          "blocked",
+          "retries",
+          "latency_ms"
+        ],
+        "properties": {
+          "answered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "업체가 정상으로 답한 시도 (`success` + 업무적 거절 `rejected`)"
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "모든 시도 (관문에서 막힌 것 포함)"
+          },
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "관문(서킷 · rate limiter · bulkhead · pause)에서 막혀 부르지 않은 시도"
+          },
+          "called": {
+            "type": "integer",
+            "format": "int64",
+            "description": "실제로 업체를 부른 시도"
+          },
+          "latency_ms": {
+            "$ref": "#/components/schemas/Latency"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "rate_limited": {
+            "type": "integer",
+            "format": "int64",
+            "description": "업체가 호출 한도 초과를 알린 시도 (429 등)"
+          },
+          "retries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "success_rate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "성공률 = 정상 응답 ÷ 실제로 부른 시도 (0~1). 부른 적이 없으면 `null`"
+          }
+        }
+      },
+      "ProviderView": {
+        "type": "object",
+        "description": "업체 한 곳 (목록의 한 줄)",
+        "required": [
+          "id",
+          "display_name",
+          "adapter_kind",
+          "base_url",
+          "enabled",
+          "updated_at"
+        ],
+        "properties": {
+          "adapter_kind": {
+            "type": "string",
+            "description": "어떤 어댑터 코드로 호출하는가 (`alpha_v1` …)"
+          },
+          "base_url": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "예약을 받는가. 끄면 서버를 다시 시작할 때 업체 파이프라인을 만들지 않는다"
+          },
+          "id": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "runtime": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeView",
+                "description": "업체 파이프라인의 지금 상태. 이 프로세스에 파이프라인이 없으면(`--role api`, 사용하지 않는 업체) `null`"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "설정을 마지막으로 바꾼 시각"
+          }
+        }
+      },
+      "QueueCounts": {
+        "type": "object",
+        "description": "상태별 작업 수 (끝난 작업은 세지 않는다)",
+        "required": [
+          "ready",
+          "scheduled",
+          "running",
+          "dead"
+        ],
+        "properties": {
+          "dead": {
+            "type": "integer",
+            "format": "int64",
+            "description": "더 시도하지 않고 묻어 둔 작업 (관리자 확인 대상)"
+          },
+          "ready": {
+            "type": "integer",
+            "format": "int64",
+            "description": "지금 실행할 수 있는데 아직 가져가지 않은 작업"
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64",
+            "description": "워커가 처리 중인 작업"
+          },
+          "scheduled": {
+            "type": "integer",
+            "format": "int64",
+            "description": "나중에 실행하기로 미뤄 둔 작업 (재시도 대기 등)"
+          }
+        }
+      },
+      "RateLimitPolicyView": {
+        "type": "object",
+        "required": [
+          "per_second",
+          "burst",
+          "max_wait_ms"
+        ],
+        "properties": {
+          "burst": {
+            "type": "integer",
+            "format": "int32",
+            "description": "한꺼번에 보낼 수 있는 호출 수 (버킷 크기)",
+            "minimum": 0
+          },
+          "max_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "토큰을 기다리는 최대 시간",
+            "minimum": 0
+          },
+          "per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "초당 허용 호출 수",
+            "minimum": 0
+          }
+        }
+      },
+      "RateLimitSettings": {
+        "type": "object",
+        "required": [
+          "per_second",
+          "burst"
+        ],
+        "properties": {
+          "burst": {
+            "type": "integer",
+            "format": "int32",
+            "description": "최대로 쌓이는 토큰 수",
+            "minimum": 0
+          },
+          "per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "초당 다시 채워지는 토큰 수",
+            "minimum": 0
+          }
+        }
+      },
+      "RetryPolicyView": {
+        "type": "object",
+        "required": [
+          "max_attempts",
+          "base_delay_ms",
+          "max_delay_ms"
+        ],
+        "properties": {
+          "base_delay_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "첫 시도를 포함한 최대 시도 횟수",
+            "minimum": 0
+          },
+          "max_delay_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RetryResult": {
+        "type": "object",
+        "description": "재시도 · 재큐잉 결과",
+        "required": [
+          "job"
+        ],
+        "properties": {
+          "booking": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AdminBooking",
+                "description": "다시 처리하게 된 예약. 예약과 상관없는 작업을 되살렸으면 `null`"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobView",
+            "description": "대기열에 들어간 작업"
+          }
+        }
+      },
+      "RuntimeView": {
+        "type": "object",
+        "description": "업체 파이프라인의 지금 상태 (이 프로세스 메모리의 값)",
+        "required": [
+          "circuit",
+          "in_flight",
+          "max_concurrency",
+          "limiter_available",
+          "limiter_burst"
+        ],
+        "properties": {
+          "circuit": {
+            "$ref": "#/components/schemas/CircuitView"
+          },
+          "in_flight": {
+            "type": "integer",
+            "format": "int32",
+            "description": "지금 업체를 부르고 있는 호출 수 / bulkhead 전체 자리 수",
+            "minimum": 0
+          },
+          "limiter_available": {
+            "type": "integer",
+            "format": "int32",
+            "description": "우리 rate limiter 버킷에 남은 토큰 수 (추정값) / 버킷 크기",
+            "minimum": 0
+          },
+          "limiter_burst": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "paused_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "업체가 쉬라고 해서(`Retry-After`) 호출을 멈춘 상태면 그 끝 시각"
+          },
+          "rate_limit_remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "업체가 마지막 응답에서 알려 준 남은 호출 수 (`X-RateLimit-Remaining`). 받은 적이 없으면 `null`",
+            "minimum": 0
+          }
+        }
+      },
+      "SlowSettings": {
+        "type": "object",
+        "required": [
+          "probability",
+          "latency_ms"
+        ],
+        "properties": {
+          "latency_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "probability": {
+            "type": "number",
+            "format": "double",
+            "description": "0~1"
+          }
+        }
+      },
+      "StatsInterval": {
+        "type": "string",
+        "description": "시계열 구간 간격",
+        "enum": [
+          "10s",
+          "1m",
+          "5m",
+          "15m",
+          "1h"
+        ]
+      },
+      "StatsSummary": {
+        "type": "object",
+        "description": "업체별 요약 (대시보드 카드)",
+        "required": [
+          "window",
+          "from",
+          "to",
+          "providers"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderStats"
+            },
+            "description": "모든 업체 (호출이 없는 업체는 0)"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window": {
+            "$ref": "#/components/schemas/SummaryWindow"
+          }
+        }
+      },
+      "SummaryWindow": {
+        "type": "string",
+        "description": "요약 기간",
+        "enum": [
+          "5m",
+          "15m",
+          "1h",
+          "6h",
+          "24h"
+        ]
+      },
+      "Timeseries": {
+        "type": "object",
+        "description": "업체 하나의 구간별 호출 통계",
+        "required": [
+          "provider",
+          "interval",
+          "from",
+          "to",
+          "points"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "interval": {
+            "$ref": "#/components/schemas/StatsInterval"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TimeseriesPoint"
+            },
+            "description": "구간마다 하나 (호출이 없는 구간도 0으로 들어 있다)"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TimeseriesPoint": {
+        "type": "object",
+        "description": "구간 하나",
+        "required": [
+          "bucket",
+          "calls",
+          "by_outcome",
+          "latency_ms",
+          "retries"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "format": "date-time",
+            "description": "구간의 시작 시각"
+          },
+          "by_outcome": {
+            "type": "object",
+            "description": "결과(`outcome`)별 시도 수",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "calls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "모든 시도 수 (관문에서 막힌 것 포함)"
+          },
+          "latency_ms": {
+            "$ref": "#/components/schemas/Latency",
+            "description": "실제로 업체를 부른 시도의 지연"
+          },
+          "min_rate_limit_remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "업체가 알려 준 남은 호출 수 중 가장 작은 값"
+          },
+          "retries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "같은 호출 안에서 다시 시도한 횟수"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": "`booking-server create-client`로 발급한 API 키"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "bookings",
+      "description": "예약 API (클라이언트용)"
+    },
+    {
+      "name": "admin: bookings",
+      "description": "관리자: 예약 조회 · 재시도"
+    },
+    {
+      "name": "admin: jobs",
+      "description": "관리자: 작업 큐"
+    },
+    {
+      "name": "admin: providers",
+      "description": "관리자: 업체 설정 · 런타임 상태 · 서킷 조작"
+    },
+    {
+      "name": "admin: stats",
+      "description": "관리자: 업체 호출 통계 (provider_calls)"
+    },
+    {
+      "name": "admin: chaos",
+      "description": "관리자: mock 업체 장애 주입 중계 (개발 환경 전용)"
+    },
+    {
+      "name": "admin",
+      "description": "관리자 화면 설정"
+    }
+  ]
+}

@@ -64,26 +64,38 @@
 
 뒤로 미룬 것:
 - "대사에서 이중 예약 의심 발견" 알림 → 대사 작업을 만드는 Phase 6
-- 관리자 웹 예약 상세의 trace 링크 → Phase 5 (DB에 trace ID는 이미 남는다)
+- 관리자 웹 예약 상세의 trace 링크 → Phase 5 (DB에 trace ID는 이미 남는다) → Phase 5에서 완료
 - 알림을 받을 곳(메일 · 메신저) 연결 → 배포 환경을 만들 때 (Phase 7 이후)
 - 프로세스를 구분하는 리소스 속성(`service.instance.id`) → API와 워커를 따로 띄우거나 여러 대로 늘릴 때 ([05 §1](05-observability-and-analytics.md#1-전체-구성))
 
 ## Phase 5. 관리자 API + 관리자 웹
-- [ ] 관리자 API ([04 §3](04-api.md#3-관리자-api-adminapi)), utoipa로 OpenAPI 문서 생성
-- [ ] 통계 API ([05 §7](05-observability-and-analytics.md#7-분석-쿼리-관리자-통계-api의-기반))
-- [ ] React 앱: 대시보드, 예약 목록 · 상세, 업체 상세(차트), 작업 큐, 장애 주입
-- [ ] 타입 자동 생성 파이프라인
-- [ ] booking-server에서 정적 파일 제공
+- [x] 관리자 API ([04 §3](04-api.md#3-관리자-api-adminapi)), utoipa로 OpenAPI 문서 생성 (`/openapi.json`, `/docs`, `booking-server openapi`)
+  - 예약 목록 · 상세(상태 이력 · 호출 기록 · 작업), 실패한 예약 재시도와 dead 작업 재큐잉 ([D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다): 다시 보내기 전에 업체에서 먼저 찾는다)
+  - 업체 런타임 상태(서킷 · limiter 여유 · pause · 동시 실행 수)와 서킷 강제 조작 (`force_open` · `force_close` · `reset`)
+  - 작업 목록 · 종류별 개수, mock 업체 장애 주입 중계 (`BOOKING_CHAOS_URL`, [D-27](decisions.md#d-27-장애-주입-중계는-booking_chaos_url을-설정할-때만-켠다))
+- [x] 통계 API ([05 §7](05-observability-and-analytics.md#7-분석-쿼리-관리자-통계-api의-기반)): 구간별 시계열(빈 구간 0으로 채움), 업체별 요약
+- [x] React 앱: 대시보드, 예약 목록 · 상세, 업체 상세(차트), 작업 큐, 장애 주입 (`web/admin`, [06 §7](06-admin-frontend.md#7-구현-메모-phase-5))
+- [x] 타입 자동 생성 파이프라인 (`pnpm gen`, `scripts/check.sh api` · `web`, CI의 `api` · `web` job)
+- [x] booking-server에서 정적 파일 제공 (`/admin`, 없는 화면 경로는 index.html)
+- [x] 관리자 API 통합 테스트 (`tests/admin.rs` 16개), db 쿼리 테스트, 서킷 강제 조작 단위 테스트
 
 **완료 기준**: 관리자 웹에서 장애 주입 → 대시보드에서 서킷 Open 확인 → 복구 → dead 작업 재처리까지 화면만으로 할 수 있다.
+→ 장애 주입 화면의 "완전 장애" → 대시보드 카드가 "열림 (차단)", 작업이 "미룸"으로 쌓임 → 확정 기한이 지나면 실패 · dead → "정상"으로 복구 → 작업 큐의 "다시 넣기"(또는 예약 상세의 "재시도") → 워커가 업체에서 먼저 찾아본 뒤(`find_booking`) 제출(`create_booking`)해 확정. 실제 서버와 mock 업체로 끝까지 돌려 확인했다.
+**배우는 것**: utoipa(속성 매크로로 문서 만들기), `#[cfg_attr(feature, derive(..))]`, `From` 변환과 `?`, 트랜잭션 안의 행 잠금(`FOR UPDATE`), 정적 파일 제공(tower-http). React: 컴포넌트와 훅, TanStack Query(조회 · 변경 · 무한 목록), React Router, `lazy`로 화면 나눠 내려받기
+
+뒤로 미룬 것:
+- 업체 정책 편집(`PUT /admin/api/providers/{id}/policy`)과 편집 폼 → 정책 실시간 변경과 함께 Phase 6 ([D-28](decisions.md#d-28-업체-정책-편집은-정책-실시간-반영phase-6과-함께-만든다)). 지금은 읽기 전용
+- 대사 이슈 API · 화면, 대시보드의 미해결 이슈 수 → 대사 작업과 함께 Phase 6
+- `cancel_failed` 예약 재시도 → 취소 흐름과 함께 Phase 6
+- 관리자 인증 · 권한, 조작한 관리자 이름을 이력에 남기기(지금은 `admin`) → Phase 6
 
 ## Phase 6. 두 번째 업체 + 운영 기능
 - [ ] 멱등키 없는 업체 호출 직전 "보냄" 표시: 보낸 뒤 결과를 저장하기 전에 워커가 죽어도 다시 보내지 않고 `unknown`으로 ([03 §5](03-resilience.md#5-결과-불명-unknown-outcome-처리)의 알려진 한계)
 - [ ] 워커의 업체별 동시 처리 제한 + "한 업체만 장애" 시나리오 테스트 ([D-19](decisions.md#d-19-워커의-업체별-동시-처리-제한은-두-번째-업체phase-6와-함께-만든다))
 - [ ] mock beta + beta 어댑터 (시간대 변환, 200으로 오는 에러, 503 rate limit)
-- [ ] 취소 흐름 (`cancel_booking`)
-- [ ] 대사 작업 + 이슈 화면
-- [ ] 정책 실시간 변경 (arc-swap)
+- [ ] 취소 흐름 (`cancel_booking`) + `cancel_failed` 관리자 재시도
+- [ ] 대사 작업 + 이슈 API · 화면 (대시보드의 미해결 이슈 수 포함)
+- [ ] 정책 실시간 변경 (arc-swap) + 관리자 정책 편집 API · 폼 ([D-28](decisions.md#d-28-업체-정책-편집은-정책-실시간-반영phase-6과-함께-만든다))
 - [ ] 빈 시간 캐시 + stale-if-error
 - [ ] 적응형 rate limit (AIMD)
 - [ ] 관리자 인증 · 권한
@@ -92,7 +104,7 @@
 - [ ] 부하 테스트 (oha / goose) + 결과 기록
 - [x] GitHub Actions CI: fmt, clippy, nextest, cargo-deny, cargo-shear (Phase 1에서 먼저 구축)
 - [x] CI 확장: sqlx 오프라인 검사 (Phase 2에서 구축)
-- [ ] CI 확장: 프론트 빌드 · 타입 생성 검사 (Phase 5)
+- [x] CI 확장: 프론트 빌드 · 타입 생성 검사 (Phase 5에서 구축: `api` · `web` job)
 - [ ] Dockerfile (다단계 빌드), docker-compose로 전체 실행
 - [ ] 운영 문서 (장애 대응 런북)
 

@@ -58,23 +58,27 @@
 - 시각은 UTC(`DateTime<Utc>`, DB는 `timestamptz`), ID는 UUID v7.
 - DB 쿼리는 `db` 크레이트에 두고 sqlx의 `query!` / `query_as!` 매크로로 컴파일 시점에 검사한다. 쿼리를 바꾸면 `cargo sqlx prepare --workspace -- --all-targets`로 `.sqlx/`를 갱신해서 함께 커밋한다 (`scripts/check.sh`는 `.sqlx/`로 오프라인 검사하므로, 갱신하지 않으면 컴파일 에러가 난다). 테스트에서 준비용으로만 쓰는 SQL은 검사 없는 `sqlx::query(...)`를 써도 된다.
 - 예약 상태는 `db::bookings::transition`(내부에서 `BookingStatus::apply` 호출)으로만 바꾼다. `bookings.status`를 직접 UPDATE하지 않는다 (테스트 준비 코드 제외).
+- HTTP 핸들러에는 `#[utoipa::path(...)]`(경로 · 매개변수 · 응답 · `operation_id`)를 붙이고 `routes!(핸들러)`로 등록한다. 경로 문자열은 이 속성 한 곳에만 둔다 (`docs/decisions.md` D-25). 쿼리 매개변수 구조체는 `#[derive(utoipa::IntoParams)]`처럼 전체 경로로 derive한다 (`use utoipa::IntoParams`로 가져오면 매크로가 만든 코드가 `unused_qualifications`에 걸린다).
+- API의 요청 · 응답 모양을 바꾸면 `cd web/admin && pnpm gen`으로 `web/admin/openapi.json`과 `src/api/schema.d.ts`를 다시 만들어 함께 커밋한다 (`scripts/check.sh api` · `web`이 검사한다).
 - 이미 적용된 마이그레이션 파일은 수정하지 않는다. 바꿀 것이 있으면 새 마이그레이션을 추가한다.
 - 통합 테스트(`tests/`)의 헬퍼 함수에서는 `unwrap()` 대신 `expect("이유")`를 쓴다. clippy의 테스트 예외는 `#[test]` 함수 안에만 적용되기 때문이다.
 - 코드를 바꾼 뒤에는 `cargo fmt`와 `cargo clippy`를 통과시킨다.
 
 ### 관리자 웹 (`web/admin`)
-- 패키지 매니저는 pnpm.
-- 서버 데이터는 TanStack Query 훅으로만 가져온다 (`useEffect` 안에서 fetch하지 않는다).
-- `src/api/schema.d.ts`는 자동 생성 파일이므로 직접 고치지 않는다. 백엔드 API가 바뀌면 OpenAPI를 다시 생성한다.
+- 패키지 매니저는 pnpm (버전은 `package.json`의 `packageManager`).
+- 서버 데이터는 TanStack Query 훅(`src/api/queries/`)으로만 가져온다 (`useEffect` 안에서 fetch하지 않는다). 바꾸는 요청은 `useMutation`으로 하고, 성공하면 관련 쿼리를 `invalidateQueries`로 다시 읽게 한다.
+- `src/api/schema.d.ts`와 `openapi.json`은 자동 생성 파일이므로 직접 고치지 않는다. 백엔드 API가 바뀌면 `pnpm gen`으로 다시 생성한다.
+- 의존성은 `package.json`에 정확한 버전(`^` 없이)으로 적고, 공개된 지 1주 이상 지난 버전을 고른다. `pnpm-lock.yaml`도 함께 커밋한다. TypeScript는 5.x를 쓴다 (D-29).
+- 코드를 바꾼 뒤에는 `pnpm typecheck`와 `pnpm lint`를 통과시킨다 (`scripts/check.sh web`이 빌드까지 확인한다).
 
 ## 품질 검사와 개발 루프
 
 검사는 `scripts/check.sh` 한 곳에 정의되어 있고, 로컬 · Claude Code 훅 · CI가 모두 이 스크립트를 쓴다. 검사 내용을 바꿀 때는 이 스크립트만 고친다.
 
 ```bash
-scripts/check.sh          # 전체: fmt → clippy → test → sqlx → deny → shear (CI와 동일)
+scripts/check.sh          # 전체: fmt → clippy → test → sqlx → deny → shear → api → web (CI와 동일)
 scripts/check.sh fast     # fmt + clippy (Stop 훅이 쓰는 빠른 검사, DB 불필요)
-scripts/check.sh test     # 단계별 실행: fmt | clippy | test | sqlx | deny | shear
+scripts/check.sh test     # 단계별 실행: fmt | clippy | test | sqlx | deny | shear | api | web
 cargo fmt --all           # 포맷 자동 수정
 ```
 
@@ -86,6 +90,8 @@ cargo fmt --all           # 포맷 자동 수정
 | sqlx | sqlx-cli | 마이그레이션 적용 후 `.sqlx/`가 스키마와 맞는지 (`cargo sqlx prepare --check`) |
 | deny | cargo-deny | 보안 권고, 허용하지 않은 라이선스, 출처 불명 의존성 (`deny.toml`) |
 | shear | cargo-shear | `Cargo.toml`에 선언했지만 쓰지 않는 의존성 |
+| api | `booking-server openapi` | 커밋된 `web/admin/openapi.json`이 서버 코드로 만든 문서와 같은지 (DB 불필요) |
+| web | pnpm (openapi-typescript · tsc · ESLint · Vite) | `src/api/schema.d.ts`가 `openapi.json`과 같은지, 타입 검사, ESLint, 빌드 |
 
 Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
 - **PostToolUse** (Edit · Write · MultiEdit): 수정한 `.rs` 파일을 즉시 rustfmt로 정리한다. 그래서 편집 직후 파일 내용이 바뀔 수 있다. 이어서 같은 부분을 고칠 때는 파일을 다시 읽는다. `mod x;`를 선언한 파일을 하위 파일보다 먼저 쓰면 그 시점의 rustfmt는 실패하고 조용히 넘어간다. 그런 포맷 누락은 Stop 훅의 fmt 검사가 잡으므로 `cargo fmt --all`로 정리한다.
@@ -96,7 +102,7 @@ Claude Code 훅 (`.claude/settings.json`, `.claude/hooks/`):
 - 린트를 끄는 `#[allow(...)]`는 꼭 필요할 때만, 가장 좁은 범위(함수 · 문장)에 붙이고 이유를 주석으로 남긴다. `[workspace.lints]`를 느슨하게 바꾸는 것은 사용자와 상의한다.
 - 의존성을 추가하면 `Cargo.lock`도 함께 커밋한다 (모든 검사가 `--locked`로 돈다).
 - 컴파일러 버전은 `rust-toolchain.toml`에 고정되어 있다. 올릴 때는 버전을 바꾸고 `scripts/check.sh` 통과를 확인한 뒤 별도 커밋으로 올린다.
-- 필요한 도구: `brew install cargo-nextest cargo-deny cargo-shear actionlint sqlx-cli` (sqlx-cli는 sqlx 크레이트와 같은 0.9.0)
+- 필요한 도구: `brew install cargo-nextest cargo-deny cargo-shear actionlint sqlx-cli` (sqlx-cli는 sqlx 크레이트와 같은 0.9.0), Node.js · pnpm (mise)
 
 ## 그 밖의 명령어
 
@@ -108,6 +114,11 @@ cargo run -p mock-provider                 # mock 업체 서버 (:9090). 장애 
 cargo run -p booking-server -- serve       # 예약 서버 (:8080, API + 워커). 시작할 때 마이그레이션 적용
 OTEL_SDK_DISABLED=true cargo run -p booking-server -- serve   # 추적 · 메트릭 · 로그를 내보내지 않고 실행 (콘솔 로그만)
 cargo run -p booking-server -- create-client --name <이름>   # API 키 발급 (stdout에 한 번만 출력)
+cargo run -p booking-server -- openapi     # API 문서(OpenAPI JSON)를 표준 출력으로 (DB 불필요)
+(cd web/admin && pnpm install)             # 관리자 웹 의존성 (처음 한 번)
+(cd web/admin && pnpm dev)                 # 관리자 웹 개발 서버 http://localhost:5173/admin/ (API는 :8080으로 프록시)
+(cd web/admin && pnpm build)               # web/admin/dist → 서버가 http://127.0.0.1:8080/admin/ 에서 제공
+(cd web/admin && pnpm gen)                 # API를 바꾼 뒤: openapi.json + src/api/schema.d.ts 다시 만들기
 sqlx migrate add <설명>                     # 새 마이그레이션 파일 (migrations/)
 cargo sqlx prepare --workspace -- --all-targets   # 쿼리를 바꾼 뒤 .sqlx/ 갱신 (DB 필요)
 actionlint                                 # .github/workflows 검사
@@ -120,7 +131,8 @@ docker compose up -d --force-recreate otel-lgtm   # 알림 규칙(observability/
 
 - 셸 환경에 따라 `cargo`가 PATH에 없을 수 있다. 그럴 때는 `. "$HOME/.cargo/env"`를 먼저 실행한다.
 - `cargo nextest`를 직접 돌릴 때는 `DATABASE_URL`이 환경 변수로 있어야 한다 (`set -a; . ./.env; set +a`). `scripts/check.sh`는 기본값을 알아서 넣는다.
-- mock 업체의 장애 설정은 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다.
+- mock 업체의 장애 설정은 관리자 웹의 "장애 주입" 화면이나 `curl -X POST localhost:9090/_chaos/alpha/preset/<healthy|flaky|slow|throttled|lossy|outage>`로 바꾼다. 관리자 웹으로 하려면 `.env`에 `BOOKING_CHAOS_URL=http://127.0.0.1:9090`이 있어야 한다.
+- API 문서는 http://127.0.0.1:8080/docs/ (Swagger UI), 원본은 `/openapi.json`.
 - 두 서버는 추적 · 메트릭 · 로그를 OTLP로 `http://localhost:4318`(docker compose의 otel-lgtm)에 내보낸다. Grafana(http://localhost:3000)의 Dashboards → Booking 폴더에서 본다. 수집기가 꺼져 있어도 서버는 돌고, 콘솔에 내보내기 실패 경고만 남는다.
 - 대시보드 JSON(`observability/grafana/dashboards/`)은 고치면 10초 안에 Grafana가 다시 읽는다. 고치는 방법은 `observability/README.md`.
 

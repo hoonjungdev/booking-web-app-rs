@@ -1,0 +1,184 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,\n               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash\n        FROM bookings WHERE id = $1\n        FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "client_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "client_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "resource_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "resource_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "slot_start",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "slot_start"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "party_size",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "party_size"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "customer",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "customer"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "status_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "provider_booking_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "provider_booking_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "deadline_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "deadline_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "request_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "bookings",
+            "name": "request_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1a4ef7e5a6f2540a9408101bc7f7d990f7dcc7cde229f17fd79e2cae7e988c6c"
+}

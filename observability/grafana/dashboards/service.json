@@ -37,7 +37,7 @@
     {
       "type": "stat",
       "title": "예약 API 가용성 (선택한 기간)",
-      "description": "5xx가 아닌 응답의 비율. SLO: 99.9% 이상.",
+      "description": "예약 API(/v1) 응답 중 5xx가 아닌 비율. SLO: 99.9% 이상. 관리자 API(/admin/api)와 헬스 체크는 넣지 않는다.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -91,7 +91,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1 - (sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\", http_response_status_code=~\"5..\"}[$__range])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\"}[$__range]))",
+          "expr": "1 - (sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\", http_route=~\"/v1/.+\", http_response_status_code=~\"5..\"}[$__range])) or vector(0)) / sum(increase(http_server_request_duration_seconds_count{job=\"booking-server\", http_route=~\"/v1/.+\"}[$__range]))",
           "legendFormat": "",
           "refId": "A",
           "instant": true,

@@ -22,6 +22,11 @@ const MAX_PHONE_LEN: usize = 30;
 /// (`#[derive(Debug)]`를 쓰지 않고 `impl fmt::Debug`를 손으로 쓴 이유)
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema),
+    schema(description = "고객 정보. 예약을 만들 때만 받고, 응답 · 로그에는 내보내지 않는다")
+)]
 pub struct Customer {
     pub name: String,
     pub phone: String,

@@ -188,3 +188,8 @@ mock-provider는 일부러 `domain`에 의존하지 않는다. 진짜 외부 업
 | `WeakReference<T>` | `std::sync::Weak<T>` | 값을 살려 두지 않는 참조. `upgrade()`로 살아 있는지 확인하고 쓴다 |
 | `using var x = …` (끝날 때 `Dispose`) | 값을 변수에 담아 두기 + `Drop` | `let _telemetry = telemetry::init(..)?;` 사라질 때 남은 데이터를 내보낸다. `let _ =`로 받으면 바로 사라진다 |
 | `#if SYMBOL`, 조건부 패키지 참조 | Cargo feature, `#[cfg(feature = "…")]` | `--features tokio-console`로 켠 기능의 코드와 의존성만 컴파일한다 |
+| `#if` 안에서만 붙이는 특성(attribute) | `#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]` | 조건이 참일 때만 속성을 붙인다. domain은 API 문서를 만드는 빌드에서만 스키마를 derive한다 (D-25) |
+| Swashbuckle, `[ProducesResponseType]` | `#[utoipa::path(...)]`, `#[derive(ToSchema)]` | 핸들러 · 타입의 속성에서 OpenAPI 문서를 만든다. `routes!(핸들러)`가 라우트 등록과 문서 경로를 함께 한다 |
+| 예외 필터에서 `FormatException` → 400 | `impl From<QueryRejection> for ApiError` + `?` | `?`는 에러를 돌려주기 전에 `From`으로 함수의 에러 타입에 맞게 바꾼다 |
+| `SortedDictionary<K, V>` | `BTreeMap<K, V>` | 키 순서로 정렬된 맵 (통계 구간 채우기, 종류별 개수) |
+| `UPDLOCK` 힌트, `SELECT … FOR UPDATE` | sqlx로 `SELECT … FOR UPDATE` | 트랜잭션이 끝날 때까지 그 행을 다른 곳에서 바꾸지 못하게 잠근다 (관리자 재시도) |

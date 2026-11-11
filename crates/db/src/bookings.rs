@@ -207,6 +207,30 @@ pub async fn get(pool: &PgPool, id: BookingId) -> Result<Option<Booking>, DbErro
     row.map(Booking::try_from).transpose()
 }
 
+/// 예약 하나를 읽으면서 그 행을 잠근다 (`FOR UPDATE`). 트랜잭션이 끝날 때까지 다른 곳에서 이 예약을 바꾸지 못한다.
+///
+/// 관리자 재시도처럼 "상태를 확인하고 → 작업을 정리하고 → 상태를 바꾸는" 여러 단계를 한 예약에 대해 차례로 할 때,
+/// 두 요청이 동시에 와서 작업이 둘 생기는 일을 막는다.
+#[tracing::instrument(name = "db.bookings.get_for_update", skip_all)]
+pub async fn get_for_update(
+    conn: &mut PgConnection,
+    id: BookingId,
+) -> Result<Option<Booking>, DbError> {
+    let row = sqlx::query_as!(
+        BookingRow,
+        r#"
+        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        FROM bookings WHERE id = $1
+        FOR UPDATE
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await?;
+    row.map(Booking::try_from).transpose()
+}
+
 /// 클라이언트 자신의 예약 하나. 다른 클라이언트의 예약이면 `None`.
 #[tracing::instrument(name = "db.bookings.find_for_client", skip_all)]
 pub async fn find_for_client(
@@ -227,6 +251,59 @@ pub async fn find_for_client(
     .fetch_optional(pool)
     .await?;
     row.map(Booking::try_from).transpose()
+}
+
+/// 관리자 예약 목록의 조건. `None`인 조건은 걸지 않는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookingFilter {
+    pub status: Option<BookingStatus>,
+    pub provider: Option<ProviderId>,
+    /// 접수 시각이 이 시각 이후 (포함)
+    pub created_from: Option<DateTime<Utc>>,
+    /// 접수 시각이 이 시각 전 (미포함)
+    pub created_to: Option<DateTime<Utc>>,
+    /// 이 ID보다 먼저 접수된 예약만. 앞 페이지의 마지막 ID를 넣으면 다음 페이지가 된다 (커서 페이지네이션).
+    pub before: Option<BookingId>,
+}
+
+/// 예약 목록 (최근에 접수한 것부터, 최대 `limit`건). 관리자 화면용.
+///
+/// 정렬과 커서는 예약 ID 기준이다. ID가 UUID v7(앞부분이 생성 시각)이라 ID 순서가 곧 접수 순서다.
+/// "N번째 페이지"(OFFSET) 대신 "이 ID 다음"(커서)으로 넘기므로, 목록을 보는 동안 새 예약이 들어와도
+/// 같은 예약이 두 페이지에 걸쳐 나오거나 빠지지 않고, 뒤 페이지도 인덱스로 바로 찾는다.
+///
+/// `$1::text IS NULL OR status = $1`: 조건 값이 없으면(NULL) 그 조건을 건너뛴다. 조건 조합마다 SQL을 따로 만들지 않고
+/// 문장 하나로 `query_as!`의 컴파일 시점 검사를 받는다.
+#[tracing::instrument(name = "db.bookings.list", skip_all)]
+pub async fn list(
+    pool: &PgPool,
+    filter: &BookingFilter,
+    limit: i64,
+) -> Result<Vec<Booking>, DbError> {
+    let rows = sqlx::query_as!(
+        BookingRow,
+        r#"
+        SELECT id, client_id, provider_id, resource_id, slot_start, party_size, customer, status,
+               status_reason, provider_booking_id, deadline_at, created_at, updated_at, request_hash
+        FROM bookings
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::text IS NULL OR provider_id = $2)
+          AND ($3::timestamptz IS NULL OR created_at >= $3)
+          AND ($4::timestamptz IS NULL OR created_at < $4)
+          AND ($5::uuid IS NULL OR id < $5)
+        ORDER BY id DESC
+        LIMIT $6
+        "#,
+        filter.status.map(BookingStatus::as_str),
+        filter.provider.as_ref().map(ProviderId::as_str),
+        filter.created_from,
+        filter.created_to,
+        filter.before.map(|id| id.as_uuid()),
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(Booking::try_from).collect()
 }
 
 /// 상태를 바꾸고 이력을 남긴다.
@@ -269,7 +346,26 @@ pub async fn transition(
     Ok(Transitioned::Applied(to))
 }
 
+/// 확정 기한을 바꾼다. 관리자 재시도처럼 예약을 다시 처리하게 할 때, 기한도 그 시각부터 다시 잡는다
+/// (그대로 두면 이미 지난 기한 때문에 워커가 바로 다시 포기한다). 상태는 바꾸지 않는다.
+#[tracing::instrument(name = "db.bookings.set_deadline", skip_all)]
+pub async fn set_deadline(
+    conn: &mut PgConnection,
+    id: BookingId,
+    deadline_at: DateTime<Utc>,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        "UPDATE bookings SET deadline_at = $2, updated_at = now() WHERE id = $1",
+        id.as_uuid(),
+        deadline_at,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// 예약의 상태 이력 (오래된 것부터)
+#[tracing::instrument(name = "db.bookings.events", skip_all)]
 pub async fn events(pool: &PgPool, id: BookingId) -> Result<Vec<EventRecord>, DbError> {
     let rows = sqlx::query!(
         "SELECT from_status, to_status, reason, actor, trace_id, at

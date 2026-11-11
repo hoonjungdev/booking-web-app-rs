@@ -630,3 +630,80 @@ fn 최대_호출_시간은_예산과_관문_대기의_합이다() {
         Duration::from_millis(15_000 + 500 + 200)
     );
 }
+
+#[tokio::test]
+async fn limiter_여유는_토큰을_쓰면_줄고_시간이_지나면_다시_찬다() {
+    let adapter = Scripted::new(IDEMPOTENT)
+        .create(MS, booked("rsv_1"))
+        .create(MS, booked("rsv_2"));
+    let policy = ProviderPolicy {
+        rate_limit: RateLimitPolicy {
+            per_second: 10,
+            burst: 3,
+            max_wait_ms: 50,
+        },
+        ..fast_policy()
+    };
+    let (provider, _adapter, _records) = provider(adapter, policy);
+    assert_eq!(
+        provider.limiter_available(),
+        3,
+        "처음에는 버킷이 가득 차 있다"
+    );
+
+    for _ in 0..2 {
+        provider
+            .create_booking(&request(), CallContext::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(provider.limiter_available(), 1);
+
+    // 초당 10개씩 다시 채워지므로 0.3초면 버킷 크기(3)까지 찬다
+    tokio::time::sleep(300 * MS).await;
+    assert_eq!(provider.limiter_available(), 3);
+}
+
+#[tokio::test]
+async fn 관리자가_서킷을_강제로_열면_풀_때까지_부르지_않는다() {
+    let adapter = Scripted::new(IDEMPOTENT).create(MS, booked("rsv_1"));
+    let (provider, adapter, mut records) = provider(adapter, fast_policy());
+
+    provider.control_circuit(CircuitAction::ForceOpen);
+    let status = provider.runtime_status();
+    assert_eq!(status.circuit.state, CircuitState::Open);
+    assert_eq!(status.circuit.forced, Some(ForcedState::Open));
+
+    let blocked = provider
+        .create_booking(&request(), CallContext::default())
+        .await;
+    assert!(
+        matches!(blocked, Err(ProviderError::CircuitOpen { .. })),
+        "{blocked:?}"
+    );
+    assert_eq!(adapter.calls(), 0);
+    assert_eq!(drain(&mut records), vec![(1, "circuit_open")]);
+
+    provider.control_circuit(CircuitAction::Reset);
+    assert_eq!(provider.runtime_status().circuit.forced, None);
+    assert!(
+        provider
+            .create_booking(&request(), CallContext::default())
+            .await
+            .is_ok()
+    );
+    assert_eq!(adapter.calls(), 1);
+}
+
+#[test]
+fn 런타임_상태는_정책의_크기를_함께_알려_준다() {
+    let (provider, _adapter, _records) =
+        provider(Scripted::new(IDEMPOTENT), ProviderPolicy::default());
+    let status = provider.runtime_status();
+    assert_eq!(status.max_concurrency, 8);
+    assert_eq!(status.in_flight, 0);
+    assert_eq!((status.limiter_available, status.limiter_burst), (5, 5));
+    assert_eq!(status.paused_until, None);
+    assert_eq!(status.rate_limit_remaining, None);
+    assert_eq!(status.circuit.state, CircuitState::Closed);
+}

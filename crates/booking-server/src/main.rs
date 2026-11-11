@@ -3,8 +3,9 @@
 //! ```text
 //! booking-server serve [--role all|api|worker]   서버 실행 (기본: API와 워커를 함께)
 //! booking-server create-client --name <이름>      API 클라이언트를 만들고 키 발급
+//! booking-server openapi                         API 문서(OpenAPI JSON)를 표준 출력으로 (DB 불필요)
 //! ```
-//! 두 명령 모두 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
+//! `serve`와 `create-client`는 시작할 때 DB 마이그레이션을 적용한다. 설정은 `booking_server::config` 참고.
 //!
 //! `serve`는 추적 · 메트릭 · 로그를 OpenTelemetry(OTLP)로 내보낸다 (docs/05-observability-and-analytics.md).
 //! 받는 곳은 `OTEL_EXPORTER_OTLP_ENDPOINT`(기본 `http://localhost:4318`)이고, `OTEL_SDK_DISABLED=true`로 끌 수 있다.
@@ -16,9 +17,11 @@ use booking_server::{
     DEFAULT_LOG_FILTER,
     api::{self, ApiState},
     auth,
+    chaos::ChaosClient,
     config::Config,
     metrics, recorder,
     registry::ProviderRegistry,
+    web,
     worker::{self, WorkerContext},
 };
 use clap::{Parser, Subcommand, ValueEnum};
@@ -58,6 +61,9 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    /// API 문서(OpenAPI JSON)를 표준 출력으로 내보낸다. 관리자 웹의 타입 생성에 쓴다
+    /// (`booking-server openapi > web/admin/openapi.json`)
+    Openapi,
 }
 
 /// 한 바이너리로 API와 워커를 함께 또는 따로 띄운다 (docs/decisions.md D-04)
@@ -73,6 +79,10 @@ async fn main() -> anyhow::Result<()> {
     // .env 파일이 있으면 환경 변수로 읽어 둔다. 없어도 괜찮다 (`.ok()`로 결과를 버림).
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
+    // 문서 출력은 코드만으로 만들 수 있다. DB · 로그 설정 없이 바로 끝낸다 (CI에서 DB 없이 돌린다).
+    if matches!(cli.command, Command::Openapi) {
+        return print_openapi();
+    }
 
     // 반환값을 `_telemetry`에 담아 `main`이 끝날 때까지 들고 있는다. 이 값이 사라질 때(함수가 끝나거나 `?`로 빠져나갈 때)
     // 아직 보내지 않은 추적 · 메트릭 · 로그를 마저 내보낸다. `let _ = ...`로 받으면 그 줄에서 바로 사라져 버린다.
@@ -84,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         // 서버만 내보낸다. `create-client`처럼 금방 끝나는 명령은 콘솔 로그면 충분하다.
         export: match cli.command {
             Command::Serve { .. } => Export::Otlp,
-            Command::CreateClient { .. } => Export::Off,
+            Command::CreateClient { .. } | Command::Openapi => Export::Off,
         },
     })?;
 
@@ -101,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { role } => serve(&config, pool, role).await,
         Command::CreateClient { name } => create_client(&pool, &name).await,
+        Command::Openapi => print_openapi(),
     }
 }
 
@@ -109,6 +120,8 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
     let shutdown = CancellationToken::new();
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
     telemetry::register_runtime_metrics();
+    // 관리자 API가 볼 업체 파이프라인 (서킷 · rate limit 상태). 워커와 같은 프로세스일 때만 있다.
+    let mut runtime: Option<Arc<ProviderRegistry>> = None;
 
     if matches!(role, Role::All | Role::Worker) {
         // 업체 호출 기록 채널. 보내는 쪽은 업체 파이프라인마다 나눠 주고, 받는 쪽은 저장 태스크가 쓴다.
@@ -139,6 +152,9 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
         let registry = Arc::new(registry);
         // 서킷 상태 · pause · 동시 실행 수를 지표로 내보낸다 (지표를 내보낼 때마다 현재 값을 읽어 간다)
         metrics::register_provider_gauges(&registry);
+        if role == Role::All {
+            runtime = Some(registry.clone());
+        }
 
         // 대기 · dead 작업 수처럼 DB에 물어야 아는 지표를 주기적으로 갱신한다
         let (gauge_pool, token) = (pool.clone(), shutdown.clone());
@@ -168,7 +184,32 @@ async fn serve(config: &Config, pool: PgPool, role: Role) -> anyhow::Result<()> 
             .await
             .with_context(|| format!("{}에 바인드할 수 없습니다", config.listen_addr))?;
         tracing::info!(addr = %config.listen_addr, "booking-server API listening");
-        let app = api::router(ApiState { pool: pool.clone() });
+        let chaos = config
+            .chaos_url()
+            .map(ChaosClient::new)
+            .transpose()
+            .context("장애 주입 API 클라이언트를 만들 수 없습니다")?;
+        if let Some(url) = config.chaos_url() {
+            tracing::info!(%url, "관리자 API가 mock 업체의 장애 주입 API를 중계한다 (개발 환경 전용)");
+        }
+        let state = ApiState {
+            pool: pool.clone(),
+            // 이 값이 API 쪽에서 업체 파이프라인을 쥐고 있게 된다. API 서버가 멈추면서 놓으므로 종료 순서는 그대로다.
+            providers: runtime.take(),
+            chaos,
+            grafana_url: config.grafana_url(),
+        };
+        let mut app = api::router(state);
+        match web::routes(&config.admin_web_dir) {
+            Some(admin_web) => {
+                app = app.merge(admin_web);
+                tracing::info!(dir = %config.admin_web_dir.display(), "관리자 웹: http://{}/admin/", config.listen_addr);
+            }
+            None => tracing::info!(
+                dir = %config.admin_web_dir.display(),
+                "관리자 웹 빌드 결과가 없어 /admin 화면은 열지 않는다 (web/admin에서 `pnpm build`, 개발 중에는 `pnpm dev`)"
+            ),
+        }
         let token = shutdown.clone();
         tasks.spawn(async move {
             axum::serve(listener, app)
@@ -211,6 +252,17 @@ async fn create_client(pool: &PgPool, name: &str) -> anyhow::Result<()> {
 
     println!("클라이언트를 만들었습니다: {} ({})", client.name, client.id);
     println!("API 키 (다시 볼 수 없으니 지금 저장하세요): {key}");
+    Ok(())
+}
+
+/// API 문서를 JSON으로 출력한다. 관리자 웹이 이 파일로 TypeScript 타입을 만든다 (docs/06-admin-frontend.md §4).
+// 이 명령의 결과물은 표준 출력으로 내보내는 문서다 (로그가 아님)
+#[allow(clippy::print_stdout)]
+fn print_openapi() -> anyhow::Result<()> {
+    let json = api::openapi()
+        .to_pretty_json()
+        .context("API 문서를 JSON으로 만들 수 없습니다")?;
+    println!("{json}");
     Ok(())
 }
 

@@ -47,10 +47,19 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tokio-util = "0.7.20"
 tower = "0.5.3"
+# 관리자 웹 정적 파일 제공 (ServeDir). reqwest가 이미 쓰는 0.6을 그대로 쓴다.
+tower-http = { version = "0.6.11", features = ["fs"] }
 tracing = "0.1.44"
 # tracing span → OpenTelemetry span. 기본 기능 중 MetricsLayer(이벤트로 메트릭 만들기)는 쓰지 않는다.
 tracing-opentelemetry = { version = "0.34.0", default-features = false, features = ["tracing-log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+# OpenAPI 문서 생성 (docs/04-api.md §1, docs/06-admin-frontend.md §4). 핸들러 · 타입에 붙인 속성에서 문서를 만든다 (≈ Swashbuckle).
+# utoipa 계열은 버전을 함께 올린다 (utoipa-axum 0.3 · utoipa-swagger-ui 10 ↔ utoipa 6).
+utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
+# axum 라우트 등록과 문서의 경로를 한곳(`#[utoipa::path]`)에서 정한다
+utoipa-axum = "0.3.0"
+# `/docs` Swagger UI. `vendored`: 빌드할 때 GitHub에서 내려받지 않고 크레이트에 들어 있는 파일을 쓴다
+utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = ["axum", "vendored"] }
 uuid = { version = "1.29.2", features = ["v7", "serde"] }
 
 # 워크스페이스 내부 크레이트

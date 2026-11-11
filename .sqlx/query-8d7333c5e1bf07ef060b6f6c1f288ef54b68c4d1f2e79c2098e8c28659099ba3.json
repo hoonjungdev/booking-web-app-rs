@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error, payload\n         FROM jobs WHERE booking_id = $1 ORDER BY id",
+  "query": "\n        SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,\n               last_error, payload, created_at, updated_at\n        FROM jobs\n        WHERE ($1::text IS NULL OR status = $1)\n          AND ($2::text IS NULL OR kind = $2)\n          AND ($3::int8 IS NULL OR id < $3)\n        ORDER BY id DESC\n        LIMIT $4\n        ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,17 @@
       },
       {
         "ordinal": 7,
+        "name": "locked_until",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "locked_until"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "last_error",
         "type_info": "Text",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "payload",
         "type_info": "Jsonb",
         "origin": {
@@ -101,11 +112,36 @@
             "name": "payload"
           }
         }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "jobs",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -117,8 +153,11 @@
       false,
       false,
       true,
+      true,
+      false,
+      false,
       false
     ]
   },
-  "hash": "2a77b1a2e16779c9eec836f6e7b4c57704895d8df5a3e82f7eaf2338ad0ff3ff"
+  "hash": "8d7333c5e1bf07ef060b6f6c1f288ef54b68c4d1f2e79c2098e8c28659099ba3"
 }

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs\n         SET status = 'queued', kind = $2, payload = $3, trace_context = $4,\n             attempts = 0, run_at = now(), locked_until = NULL, updated_at = now()\n         WHERE id = $1 AND status = 'dead'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af8f9457d52b444282bb508416985cf186346288dc6f89f82c3d46d3d512d5c9"
+}

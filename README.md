@@ -8,7 +8,7 @@
 |---|---|---|
 | booking-server | Rust · axum · sqlx | 예약 API, 관리자 API, 백그라운드 워커 |
 | mock-provider | Rust · axum | 장애를 주입할 수 있는 가짜 외부 예약 업체 (alpha, beta) |
-| 관리자 웹 | React · TypeScript · Vite | 대시보드, 예약 재처리, 업체 정책 편집, 장애 주입 |
+| 관리자 웹 | React · TypeScript · Vite · Mantine | 대시보드, 예약 · 작업 조회와 재처리, 업체 상태와 서킷 조작, 장애 주입 |
 | 관측 | OpenTelemetry → Grafana LGTM | 추적 · 메트릭 · 로그 · 대시보드 |
 | 저장소 | PostgreSQL | 예약, 작업 큐, 업체 호출 기록 |
 
@@ -17,6 +17,7 @@
 ```bash
 cp .env.example .env                       # 처음 한 번
 docker compose up -d --wait                # PostgreSQL, Grafana LGTM
+(cd web/admin && pnpm install && pnpm build)   # 관리자 웹 빌드 (처음 한 번, 화면을 고친 뒤)
 cargo run -p mock-provider                 # 가짜 외부 업체 (http://127.0.0.1:9090)
 cargo run -p booking-server -- serve       # 예약 서버 (http://127.0.0.1:8080), 다른 터미널에서
 
@@ -40,6 +41,14 @@ docker compose exec postgres psql -U booking -c \
   "SELECT outcome, count(*), round(avg(duration_ms)) AS avg_ms FROM provider_calls GROUP BY 1 ORDER BY 2 DESC"
 ```
 
+### 관리자 웹
+
+http://127.0.0.1:8080/admin/ 에서 대시보드(업체별 서킷 · 성공률 · p95, 작업 큐), 예약 목록 · 상세(상태 이력, 업체 호출 기록, trace 링크), 업체 상세(지연 분위수 · 결과 분포 차트, 서킷 강제 조작), 작업 큐(dead 작업 다시 넣기), 장애 주입을 쓴다. API 문서는 http://127.0.0.1:8080/docs/ (Swagger UI).
+
+- 장애 주입 화면은 `.env`에 `BOOKING_CHAOS_URL=http://127.0.0.1:9090`이 있어야 켜진다 (`.env.example`에 들어 있다. 예전에 복사한 `.env`라면 이 줄을 더한다).
+- 화면을 고치는 동안은 `cd web/admin && pnpm dev`로 http://localhost:5173/admin/ 을 연다 (API는 :8080 서버로 넘어간다).
+- 해 볼 것: 장애 주입에서 "완전 장애" → 위의 curl로 예약 몇 건 → 대시보드에서 서킷이 "열림"이 되고 작업이 "미룸"으로 쌓인다 → "정상"으로 되돌리면 밀린 예약이 처리된다. 확정 기한(30분)이 지나 실패한 예약은 작업 큐의 "다시 넣기"나 예약 상세의 "재시도"로 다시 처리한다 (업체에서 먼저 찾아본 뒤 없을 때만 다시 보낸다).
+
 ### Grafana에서 보기
 
 두 서버는 추적 · 메트릭 · 로그를 OpenTelemetry로 내보낸다. http://localhost:3000 (로그인 없음)의 Dashboards → **Booking** 폴더에 대시보드 세 개가 있다.
@@ -50,7 +59,7 @@ docker compose exec postgres psql -U booking -c \
 
 응답 헤더의 `X-Trace-Id`나 예약 ID로 trace를 찾을 수 있다 (Explore → Tempo → `{ span.booking_id = "<예약 ID>" }`). 대시보드와 알림 규칙은 [observability/](observability/README.md)에서 코드로 관리한다.
 
-품질 검사는 `scripts/check.sh`로 돌립니다 (CI와 같은 명령, PostgreSQL 필요).
+품질 검사는 `scripts/check.sh`로 돌립니다 (CI와 같은 명령, PostgreSQL · pnpm 필요).
 
 ## 문서
 
@@ -58,4 +67,4 @@ docker compose exec postgres psql -U booking -c \
 
 ## 진행 상태
 
-Phase 4 (관측: OpenTelemetry 추적 · 메트릭 · 로그, 서비스 사이로 이어지는 trace, Grafana 대시보드 · 알림 규칙, tokio-console 개발 모드)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.
+Phase 5 (관리자 API + 관리자 웹: 예약 · 작업 조회와 재처리, 업체 런타임 상태와 서킷 조작, 호출 통계 차트, 장애 주입, OpenAPI 문서와 TypeScript 타입 자동 생성)까지 진행했습니다. 단계별 계획은 [docs/07-roadmap.md](docs/07-roadmap.md)에 있습니다.

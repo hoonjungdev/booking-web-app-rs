@@ -249,3 +249,132 @@ async fn 결과_불명으로_가장_오래_머문_시간을_알려_준다(pool: 
         "가장 오래된 것(12분 전) 기준이어야 한다: {age:?}"
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 목록은_최근_접수부터_조건과_커서로_나눠_읽는다(pool: PgPool) {
+    let client = common::create_client(&pool, "app").await;
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let new = common::new_booking(client, &format!("key-{n}"), b"hash");
+        bookings::accept(&pool, &new).await.unwrap();
+        ids.push(new.id);
+    }
+    // 하나는 실패 상태로 만든다
+    let mut conn = pool.acquire().await.unwrap();
+    let event = BookingEvent::GaveUp {
+        reason: "test".into(),
+    };
+    bookings::transition(
+        &mut conn,
+        ids[1],
+        BookingStatus::Pending,
+        &event,
+        "test",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let all = bookings::BookingFilter::default();
+    let first_page = bookings::list(&pool, &all, 2).await.unwrap();
+    let first_ids: Vec<_> = first_page.iter().map(|b| b.id).collect();
+    assert_eq!(first_ids, vec![ids[4], ids[3]], "최근에 접수한 것부터");
+
+    let next = bookings::BookingFilter {
+        before: Some(ids[3]),
+        ..all.clone()
+    };
+    let second_page: Vec<_> = bookings::list(&pool, &next, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        second_page,
+        vec![ids[2], ids[1], ids[0]],
+        "커서 다음부터 이어진다"
+    );
+
+    let failed = bookings::BookingFilter {
+        status: Some(BookingStatus::Failed),
+        ..all.clone()
+    };
+    let failed: Vec<_> = bookings::list(&pool, &failed, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(failed, vec![ids[1]]);
+
+    let other_provider = bookings::BookingFilter {
+        provider: Some(domain::ProviderId::parse("beta").unwrap()),
+        ..all.clone()
+    };
+    assert!(
+        bookings::list(&pool, &other_provider, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let future = bookings::BookingFilter {
+        created_from: Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
+        ..all.clone()
+    };
+    assert!(bookings::list(&pool, &future, 10).await.unwrap().is_empty());
+    let until_now = bookings::BookingFilter {
+        created_to: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(1)),
+        ..all
+    };
+    assert_eq!(
+        bookings::list(&pool, &until_now, 10).await.unwrap().len(),
+        5
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn 잠그고_읽은_예약은_트랜잭션이_끝날_때까지_다른_곳에서_바꾸지_못한다(
+    pool: PgPool,
+) {
+    let client = common::create_client(&pool, "app").await;
+    let new = common::new_booking(client, "key-1", b"hash-1");
+    bookings::accept(&pool, &new).await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let locked = bookings::get_for_update(&mut tx, new.id)
+        .await
+        .unwrap()
+        .expect("예약이 있어야 한다");
+    assert_eq!(locked.status, BookingStatus::Pending);
+
+    // 다른 연결에서 같은 예약을 바꾸려 하면 잠금이 풀릴 때까지 기다린다
+    let other_pool = pool.clone();
+    let id = new.id;
+    let waiting = tokio::spawn(async move {
+        let mut conn = other_pool.acquire().await.unwrap();
+        let event = BookingEvent::GaveUp {
+            reason: "late".into(),
+        };
+        bookings::transition(&mut conn, id, BookingStatus::Pending, &event, "test", None)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "잠금이 풀릴 때까지 기다린다");
+
+    let event = BookingEvent::ProviderConfirmed {
+        provider_booking_id: "rsv_1".into(),
+    };
+    bookings::transition(&mut tx, id, BookingStatus::Pending, &event, "test", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        waiting.await.unwrap(),
+        Transitioned::Conflict,
+        "잠금이 풀린 뒤에는 이미 바뀐 상태를 보고 충돌로 끝난다"
+    );
+}

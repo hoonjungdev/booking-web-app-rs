@@ -1,4 +1,14 @@
 //! `submit_booking` 작업: 접수된 예약을 업체에 제출한다
+//!
+//! 관리자가 실패한 예약을 다시 시도하면 작업에 `{"lookup_first": true}`가 붙는다. 그러면 보내기 전에 업체에서
+//! 이 예약을 먼저 찾아본다 (docs/03-resilience.md §5). 실패한 예약 중에는 업체에 실제로 만들어진 것이 있을 수 있어서
+//! (결과 불명이었다가 조회도 실패해 포기한 경우 등) 그대로 다시 보내면 멱등키 없는 업체에서는 이중 예약이 된다.
+//!
+//! ```text
+//! lookup_first ─┬─ 업체에 있음 ─────▶ confirmed (보내지 않음)
+//!               ├─ 업체에 없음 ─────▶ 제출 (아래 decide)
+//!               └─ 조회 실패 ───────▶ 작업 재예약 (표시는 그대로라 다음에도 조회부터 한다)
+//! ```
 
 use std::time::Instant;
 
@@ -6,10 +16,54 @@ use chrono::Utc;
 use db::jobs::Job;
 use domain::{BookingEvent, BookingStatus};
 use providers::{CallContext, Capabilities, CreateBooking, ProviderBooking, ProviderError};
+use serde::{Deserialize, Serialize};
 
 use super::{
     Decision, WorkerContext, WorkerError, apply, complete_only, defer_if_blocked, give_up,
 };
+
+/// `submit_booking` 작업의 진행 상황 (`jobs.payload`)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitPayload {
+    /// 보내기 전에 업체에서 이 예약을 먼저 찾아본다 (관리자 재시도)
+    #[serde(default)]
+    pub lookup_first: bool,
+}
+
+impl SubmitPayload {
+    /// 작업의 payload를 읽는다. 형식이 깨졌으면 조회부터 한다 (더 조심하는 쪽).
+    fn read(payload: &serde_json::Value) -> Self {
+        serde_json::from_value(payload.clone()).unwrap_or(Self { lookup_first: true })
+    }
+}
+
+/// 보내기 전에 먼저 조회한 결과 → 다음 행동. `None`이면 업체에 없으므로 제출을 이어서 한다 (순수 함수).
+///
+/// 관리자 재시도는 예약이 실패하고 한참 뒤(사람이 보고 누른 뒤)에 일어나므로, 결과 불명 확인(`resolve_unknown`)처럼
+/// "없음"을 두 번 확인하지 않고 한 번으로 판단한다.
+pub fn decide_lookup(
+    result: Result<Option<ProviderBooking>, ProviderError>,
+    now: Instant,
+) -> Option<Decision> {
+    let error = match result {
+        Ok(Some(found)) => {
+            return Some(Decision::Transition(BookingEvent::ProviderConfirmed {
+                provider_booking_id: found.provider_booking_id,
+            }));
+        }
+        Ok(None) => return None,
+        Err(error) => error,
+    };
+    if let Some(defer) = defer_if_blocked(&error, now) {
+        return Some(defer);
+    }
+    Some(match error {
+        // 다시 물어도 같은 답일 우리 쪽 버그. 관리자가 보게 한다.
+        error @ ProviderError::Client { .. } => Decision::GiveUp(format!("lookup_failed: {error}")),
+        // 조회는 업체 상태를 바꾸지 않으므로 몇 번을 다시 물어도 안전하다
+        error => Decision::Retry(format!("lookup_failed: {error}")),
+    })
+}
 
 /// 업체 호출 결과 → 다음 행동. DB도 네트워크도 쓰지 않는 순수 함수라서 단위 테스트로 모든 경우를 확인한다.
 ///
@@ -72,6 +126,25 @@ pub(super) async fn handle(ctx: &WorkerContext, job: &Job) -> Result<(), WorkerE
         booking_id: Some(booking.id),
         job_id: Some(job.id),
     };
+    if SubmitPayload::read(&job.payload).lookup_first {
+        if provider.capabilities().lookup_by_reference {
+            let found = provider.find_booking(booking.id, call).await;
+            match &found {
+                Ok(found) => tracing::info!(
+                    found = found.is_some(),
+                    "다시 보내기 전에 업체에서 예약을 찾아봤다"
+                ),
+                Err(error) if error.blocked_until().is_some() => {}
+                Err(error) => tracing::warn!(outcome = error.outcome(), %error, "업체 조회 실패"),
+            }
+            if let Some(decision) = decide_lookup(found, Instant::now()) {
+                return apply(ctx, job, &booking, decision).await;
+            }
+        } else {
+            // 확인할 방법이 없다. 관리자가 업체에 직접 확인하고 재시도했다고 보고 보낸다.
+            tracing::warn!("업체가 참조값 조회를 지원하지 않아 확인 없이 다시 보낸다");
+        }
+    }
     let result = provider
         .create_booking(&CreateBooking::from_booking(&booking), call)
         .await;
@@ -214,6 +287,58 @@ mod tests {
             later,
         );
         assert!(matches!(past, Decision::Defer { wait, .. } if wait.is_zero()));
+    }
+
+    #[test]
+    fn 먼저_조회해서_있으면_보내지_않고_확정한다() {
+        let found = Ok(Some(ProviderBooking {
+            provider_booking_id: "rsv_1".into(),
+        }));
+        assert_eq!(
+            decide_lookup(found, Instant::now()),
+            Some(Decision::Transition(BookingEvent::ProviderConfirmed {
+                provider_booking_id: "rsv_1".into()
+            }))
+        );
+        assert_eq!(
+            decide_lookup(Ok(None), Instant::now()),
+            None,
+            "없으면 제출한다"
+        );
+    }
+
+    #[test]
+    fn 먼저_조회하다_실패하면_보내지_않고_다시_조회한다() {
+        let now = Instant::now();
+        assert!(matches!(
+            decide_lookup(Err(ProviderError::Timeout), now),
+            Some(Decision::Retry(_))
+        ));
+        let blocked = ProviderError::CircuitOpen {
+            retry_at: now + Duration::from_secs(5),
+        };
+        assert!(matches!(
+            decide_lookup(Err(blocked), now),
+            Some(Decision::Defer { .. })
+        ));
+        let client = ProviderError::Client {
+            status: 400,
+            body: String::new(),
+        };
+        assert!(matches!(
+            decide_lookup(Err(client), now),
+            Some(Decision::GiveUp(_))
+        ));
+    }
+
+    #[test]
+    fn payload가_깨졌으면_조회부터_한다() {
+        assert_eq!(
+            SubmitPayload::read(&serde_json::json!({})),
+            SubmitPayload::default()
+        );
+        assert!(SubmitPayload::read(&serde_json::json!({ "lookup_first": true })).lookup_first);
+        assert!(SubmitPayload::read(&serde_json::json!("broken")).lookup_first);
     }
 
     #[test]

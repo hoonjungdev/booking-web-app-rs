@@ -103,18 +103,45 @@ pub struct JobRecord {
     pub id: i64,
     pub kind: String,
     pub booking_id: Option<BookingId>,
+    /// `queued`, `running`, `done`, `dead` (DB의 CHECK 제약이 이 값만 허용한다)
     pub status: String,
     pub attempts: i32,
     pub max_attempts: i32,
     pub run_at: DateTime<Utc>,
+    /// 실행 중일 때 이 시각까지 이 작업을 쥐고 있을 수 있다 (lease)
+    pub locked_until: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 관리자 작업 목록의 조건. `None`인 조건은 걸지 않는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobFilter {
+    pub status: Option<String>,
+    pub kind: Option<String>,
+    /// 이 ID보다 먼저 등록된 작업만 (커서 페이지네이션)
+    pub before: Option<i64>,
+}
+
+/// 작업 종류별 상태 개수 (관리자 화면의 작업 큐)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindCounts {
+    pub kind: String,
+    /// 지금 실행할 수 있는데 아직 가져가지 않은 작업
+    pub ready: i64,
+    /// 나중에 실행하기로 미뤄 둔 작업 (재시도 대기 등)
+    pub scheduled: i64,
+    /// 워커가 처리 중인 작업
+    pub running: i64,
+    /// 더 시도하지 않고 묻어 둔 작업
+    pub dead: i64,
 }
 
 /// 작업을 등록한다. 보통 예약 저장과 같은 트랜잭션 안에서 부른다.
 ///
 /// `trace_context`는 등록하는 쪽의 trace 문맥이다 ([`crate::TraceRef::context`]). 없으면 `None`.
-#[tracing::instrument(name = "db.jobs.enqueue", skip_all, fields(kind = kind.as_str()))]
 pub async fn enqueue(
     conn: &mut PgConnection,
     kind: JobKind,
@@ -122,13 +149,29 @@ pub async fn enqueue(
     max_attempts: i32,
     trace_context: Option<&serde_json::Value>,
 ) -> Result<i64, DbError> {
+    let empty = serde_json::json!({});
+    enqueue_with_payload(conn, kind, booking_id, max_attempts, &empty, trace_context).await
+}
+
+/// [`enqueue`]와 같지만 작업의 진행 상황(`payload`)을 처음부터 정해 둔다.
+/// 예: 관리자 재시도는 `{"lookup_first": true}`로 "다시 보내기 전에 업체에서 먼저 찾아본다"를 남긴다.
+#[tracing::instrument(name = "db.jobs.enqueue", skip_all, fields(kind = kind.as_str()))]
+pub async fn enqueue_with_payload(
+    conn: &mut PgConnection,
+    kind: JobKind,
+    booking_id: Option<BookingId>,
+    max_attempts: i32,
+    payload: &serde_json::Value,
+    trace_context: Option<&serde_json::Value>,
+) -> Result<i64, DbError> {
     let booking_id = booking_id.map(|id| id.as_uuid());
     let id = sqlx::query_scalar!(
-        "INSERT INTO jobs (kind, booking_id, max_attempts, trace_context)
-         VALUES ($1, $2, $3, $4) RETURNING id",
+        "INSERT INTO jobs (kind, booking_id, max_attempts, payload, trace_context)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
         kind.as_str(),
         booking_id,
         max_attempts,
+        payload,
         trace_context,
     )
     .fetch_one(conn)
@@ -314,19 +357,25 @@ pub async fn queue_depths(pool: &PgPool) -> Result<Vec<QueueDepth>, DbError> {
         .collect())
 }
 
-/// 예약에 딸린 작업 목록 (등록 순서대로)
-pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<JobRecord>, DbError> {
-    let rows = sqlx::query!(
-        "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, last_error, payload
-         FROM jobs WHERE booking_id = $1 ORDER BY id",
-        booking_id.as_uuid(),
-    )
-    .fetch_all(pool)
-    .await?;
+/// DB 행을 그대로 담는 구조체 ([`JobRecord`]로 바꿔 내보낸다)
+struct JobRow {
+    id: i64,
+    kind: String,
+    booking_id: Option<uuid::Uuid>,
+    status: String,
+    attempts: i32,
+    max_attempts: i32,
+    run_at: DateTime<Utc>,
+    locked_until: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    payload: serde_json::Value,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
 
-    Ok(rows
-        .into_iter()
-        .map(|r| JobRecord {
+impl From<JobRow> for JobRecord {
+    fn from(r: JobRow) -> Self {
+        Self {
             id: r.id,
             kind: r.kind,
             booking_id: r.booking_id.map(BookingId::from_uuid),
@@ -334,8 +383,155 @@ pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<Job
             attempts: r.attempts,
             max_attempts: r.max_attempts,
             run_at: r.run_at,
+            locked_until: r.locked_until,
             last_error: r.last_error,
             payload: r.payload,
-        })
-        .collect())
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+/// 예약에 딸린 작업 목록 (등록 순서대로)
+#[tracing::instrument(name = "db.jobs.for_booking", skip_all)]
+pub async fn for_booking(pool: &PgPool, booking_id: BookingId) -> Result<Vec<JobRecord>, DbError> {
+    let rows = sqlx::query_as!(
+        JobRow,
+        "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
+                last_error, payload, created_at, updated_at
+         FROM jobs WHERE booking_id = $1 ORDER BY id",
+        booking_id.as_uuid(),
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(JobRecord::from).collect())
+}
+
+/// 작업 하나
+#[tracing::instrument(name = "db.jobs.get", skip_all)]
+pub async fn get(conn: &mut PgConnection, id: i64) -> Result<Option<JobRecord>, DbError> {
+    let row = sqlx::query_as!(
+        JobRow,
+        "SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
+                last_error, payload, created_at, updated_at
+         FROM jobs WHERE id = $1",
+        id,
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(JobRecord::from))
+}
+
+/// 작업 목록 (최근에 등록한 것부터, 최대 `limit`건). 관리자 화면용.
+///
+/// dead 작업만 보는 조회는 부분 인덱스 `jobs_dead_idx (kind, id) WHERE status = 'dead'`를 쓴다.
+#[tracing::instrument(name = "db.jobs.list", skip_all)]
+pub async fn list(
+    pool: &PgPool,
+    filter: &JobFilter,
+    limit: i64,
+) -> Result<Vec<JobRecord>, DbError> {
+    let rows = sqlx::query_as!(
+        JobRow,
+        r#"
+        SELECT id, kind, booking_id, status, attempts, max_attempts, run_at, locked_until,
+               last_error, payload, created_at, updated_at
+        FROM jobs
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::text IS NULL OR kind = $2)
+          AND ($3::int8 IS NULL OR id < $3)
+        ORDER BY id DESC
+        LIMIT $4
+        "#,
+        filter.status.as_deref(),
+        filter.kind.as_deref(),
+        filter.before,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(JobRecord::from).collect())
+}
+
+/// 작업 종류별로 대기 · 미룸 · 실행 중 · dead 작업 수를 센다. 끝난 작업(done)은 세지 않는다 (계속 쌓이므로).
+///
+/// 해당하는 작업이 하나도 없는 종류는 결과에 없다.
+#[tracing::instrument(name = "db.jobs.counts", skip_all)]
+pub async fn counts(pool: &PgPool) -> Result<Vec<KindCounts>, DbError> {
+    let rows = sqlx::query_as!(
+        KindCounts,
+        r#"
+        SELECT kind,
+               count(*) FILTER (WHERE status = 'queued' AND run_at <= now()) AS "ready!",
+               count(*) FILTER (WHERE status = 'queued' AND run_at > now())  AS "scheduled!",
+               count(*) FILTER (WHERE status = 'running')                    AS "running!",
+               count(*) FILTER (WHERE status = 'dead')                       AS "dead!"
+        FROM jobs
+        WHERE status IN ('queued', 'running', 'dead')
+        GROUP BY kind
+        ORDER BY kind
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// dead 작업을 다시 실행 대기열에 넣는다. dead가 아니면(그사이 누가 먼저 되살림) 아무것도 하지 않고 `false`.
+///
+/// 같은 행을 되살린다 (새 작업을 만들지 않는다). 그래야 한 예약에 처리 중인 작업이 둘이 되지 않고,
+/// dead 작업 수(`jobs.dead` 지표 · 알림)도 바로 줄어든다. 시도 횟수는 처음부터 다시 센다.
+/// `kind`와 `payload`는 바꿀 수 있다: 실패한 예약을 되살릴 때는 예약 상태에 맞는 작업(`submit_booking`)으로 바꾼다.
+/// `trace_context`에는 되살린 요청의 trace를 넣어, 워커가 그 요청으로 link를 걸게 한다.
+#[tracing::instrument(name = "db.jobs.requeue", skip_all)]
+pub async fn requeue(
+    conn: &mut PgConnection,
+    id: i64,
+    kind: &str,
+    payload: &serde_json::Value,
+    trace_context: Option<&serde_json::Value>,
+) -> Result<bool, DbError> {
+    let result = sqlx::query!(
+        "UPDATE jobs
+         SET status = 'queued', kind = $2, payload = $3, trace_context = $4,
+             attempts = 0, run_at = now(), locked_until = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'dead'",
+        id,
+        kind,
+        payload,
+        trace_context,
+    )
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 예약에 대기 중이거나 실행 중인 작업이 있는가
+pub async fn has_active_for_booking(
+    conn: &mut PgConnection,
+    booking_id: BookingId,
+) -> Result<bool, DbError> {
+    let active = sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM jobs WHERE booking_id = $1 AND status IN ('queued', 'running')
+           ) AS "active!""#,
+        booking_id.as_uuid(),
+    )
+    .fetch_one(conn)
+    .await?;
+    Ok(active)
+}
+
+/// 예약의 dead 작업 중 가장 최근 것의 ID
+pub async fn latest_dead_for_booking(
+    conn: &mut PgConnection,
+    booking_id: BookingId,
+) -> Result<Option<i64>, DbError> {
+    let id = sqlx::query_scalar!(
+        "SELECT id FROM jobs WHERE booking_id = $1 AND status = 'dead' ORDER BY id DESC LIMIT 1",
+        booking_id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(id)
 }

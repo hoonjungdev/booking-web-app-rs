@@ -29,7 +29,10 @@ pub use policy::{
     BulkheadPolicy, CircuitBreakerPolicy, ProviderPolicy, RateLimitPolicy, RetryPolicy,
 };
 pub use recorder::{CallRecord, CallRecorder, call_recorder};
-pub use resilience::{CallContext, CircuitState, Operation, ResilientProvider};
+pub use resilience::{
+    CallContext, CircuitAction, CircuitSnapshot, CircuitState, ForcedState, Operation,
+    ResilientProvider, RuntimeStatus,
+};
 
 /// 어댑터가 할 수 있는 일 (docs/03-resilience.md §5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

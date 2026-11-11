@@ -11,7 +11,7 @@
 | 페이지네이션 | 커서 방식: `?limit=50&cursor=<불투명 문자열>` → 응답에 `next_cursor` |
 | 추적 | 응답 헤더에 `X-Trace-Id`, 에러 본문에도 같은 값의 `trace_id` (헬스 체크 제외). 요청에 W3C `traceparent` 헤더를 실어 보내면 그 trace에 이어 붙는다 |
 | 인증 | `X-Api-Key` 헤더. 키는 `booking-server create-client --name <이름>`으로 발급하며, 발급할 때 한 번만 보여 준다 |
-| 문서 | `/openapi.json`, `/docs` (Swagger UI). utoipa로 코드에서 생성 |
+| 문서 | `/openapi.json`, `/docs` (Swagger UI). utoipa로 코드에서 생성 ([D-25](decisions.md#d-25-api-문서는-utoipa로-코드에서-만들고-라우트와-문서-경로를-한곳에서-정한다)). 관리자 웹의 TypeScript 타입도 이 문서에서 만든다 ([06 §4](06-admin-frontend.md#4-타입-생성-흐름)) |
 
 에러 예:
 ```json
@@ -105,23 +105,25 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
 
 인증: Phase 6 전까지는 로컬 전용(인증 없음), 그 뒤로는 세션 쿠키.
 
-| 메서드 | 경로 | 설명 |
-|---|---|---|
-| GET | `/bookings?status=&provider=&from=&to=&cursor=` | 예약 목록 |
-| GET | `/bookings/{id}` | 예약 상세 + 상태 이력 + 업체 호출 기록 |
-| POST | `/bookings/{id}/retry` | `failed`/`cancel_failed` 재시도 |
-| GET | `/providers` | 업체 목록 + 런타임 요약 |
-| GET | `/providers/{id}` | 정책 + 런타임 상태 (서킷, limiter 여유, pause, 동시 실행 수) |
-| PUT | `/providers/{id}/policy` | 정책 변경 (즉시 반영) |
-| POST | `/providers/{id}/circuit` | `{ "action": "force_open" \| "force_close" \| "reset" }` |
-| GET | `/stats/providers/{id}/timeseries?from=&to=&interval=5m` | 구간별 호출 수, 결과별 수, p50/p95/p99 |
-| GET | `/stats/providers/summary?window=1h` | 업체별 요약 (대시보드 카드용) |
-| GET | `/jobs?status=dead&kind=` | 작업 목록 |
-| POST | `/jobs/{id}/requeue` | dead 작업 재큐잉 |
-| GET | `/reconciliation/issues?resolved=false` | 대사 이슈 |
-| POST | `/reconciliation/issues/{id}/resolve` | 처리 완료 표시 |
-| GET / PUT | `/chaos/{provider}` | mock-provider 장애 설정 중계 (개발 환경 전용) |
-| POST | `/chaos/{provider}/preset/{name}` | 프리셋 적용 (개발 환경 전용) |
+| 메서드 | 경로 | 설명 | 구현 |
+|---|---|---|---|
+| GET | `/bookings?status=&provider=&from=&to=&cursor=&limit=` | 예약 목록 (기간은 접수 시각 기준) | Phase 5 |
+| GET | `/bookings/{id}` | 예약 상세 + 상태 이력 + 업체 호출 기록 + 작업 | Phase 5 |
+| POST | `/bookings/{id}/retry` | `failed` 재시도 (`cancel_failed`는 취소 흐름과 함께) | Phase 5 (`cancel_failed`: Phase 6) |
+| GET | `/providers` | 업체 목록 + 런타임 요약 | Phase 5 |
+| GET | `/providers/{id}` | 정책 + 런타임 상태 (서킷, limiter 여유, pause, 동시 실행 수) | Phase 5 |
+| PUT | `/providers/{id}/policy` | 정책 변경 (즉시 반영) | Phase 6 ([D-28](decisions.md#d-28-업체-정책-편집은-정책-실시간-반영phase-6과-함께-만든다)) |
+| POST | `/providers/{id}/circuit` | `{ "action": "force_open" \| "force_close" \| "reset" }` | Phase 5 |
+| GET | `/stats/providers/{id}/timeseries?from=&to=&interval=5m` | 구간별 호출 수, 결과별 수, p50/p95/p99 | Phase 5 |
+| GET | `/stats/providers/summary?window=1h` | 업체별 요약 (대시보드 카드용) | Phase 5 |
+| GET | `/jobs?status=dead&kind=&cursor=&limit=` | 작업 목록 | Phase 5 |
+| GET | `/jobs/counts` | 작업 종류 · 상태별 개수 (작업 큐 화면 · 대시보드) | Phase 5 (추가) |
+| POST | `/jobs/{id}/requeue` | dead 작업 재큐잉 | Phase 5 |
+| GET | `/reconciliation/issues?resolved=false` | 대사 이슈 | Phase 6 |
+| POST | `/reconciliation/issues/{id}/resolve` | 처리 완료 표시 | Phase 6 |
+| GET / PUT | `/chaos/{provider}` | mock-provider 장애 설정 중계 (개발 환경 전용) | Phase 5 |
+| POST | `/chaos/{provider}/preset/{name}` | 프리셋 적용 (개발 환경 전용) | Phase 5 |
+| GET | `/info` | 관리자 화면 설정 (Grafana 주소, 장애 주입 · 런타임 상태를 쓸 수 있는가) | Phase 5 (추가) |
 
 시계열 응답 예:
 ```json
@@ -140,6 +142,25 @@ GET /readyz    DB 연결 정상 (워커 역할이면 큐 처리도 정상)
   ]
 }
 ```
+
+**구현 (Phase 5)**: `crates/booking-server/src/api/admin/`. 요청 · 응답의 정확한 모양은 `/docs`(Swagger UI)가 기준이다.
+
+- **목록과 커서**: 최근 것부터 `limit`건(기본 50, 최대 200). 다음 페이지가 있으면 `next_cursor`를 주고, 그 값을 그대로 `cursor`에 넣어 이어 읽는다 (마지막 항목의 ID다. 예약 ID는 UUID v7이라 ID 순서가 곧 접수 순서다). OFFSET 대신 커서라서 목록을 보는 동안 새 예약이 들어와도 같은 항목이 두 페이지에 나오지 않는다.
+- **예약 상세**는 고객 정보(이름 · 전화번호)를 관리자 화면에도 내보내지 않는다. 호출 기록의 `error_detail`(업체가 보낸 오류 본문 등)은 원인을 찾는 용도라 그대로 준다 ([05 §5](05-observability-and-analytics.md#5-로그)의 "호출 기록에만 남긴다").
+- **재시도 · 재큐잉** ([D-26](decisions.md#d-26-관리자-재시도는-예약을-잠그고-dead-작업을-같은-행으로-되살리고-기한을-다시-잡고-보내기-전에-업체에서-먼저-찾는다)): 예약 행을 잠그고 `failed → pending`, 확정 기한을 지금부터 다시 잡고, 그 예약의 dead 작업을 같은 행으로 되살린다 (`submit_booking` + `{"lookup_first": true}`). 워커는 보내기 전에 업체에서 먼저 찾아, 이미 있으면 다시 보내지 않고 확정한다. 응답은 `202`와 바뀐 예약 · 작업.
+  | 상황 | 응답 |
+  |---|---|
+  | `failed`가 아닌 예약, 처리 중인 작업이 있는 예약, 슬롯이 이미 시작한 예약 | 409 |
+  | dead가 아닌 작업 | 409 |
+  | 예약과 상관없이 묻힌 작업 (예약이 없음, 서버가 모르는 종류) | 예약은 그대로 두고 작업만 되살린다 |
+- **업체 런타임 상태**는 업체를 부르는 프로세스의 메모리에 있다 ([D-10](decisions.md#d-10-서킷rate-limit-상태는-프로세스-메모리에-단일-인스턴스-전제)). 워커와 같은 프로세스(`--role all`, 기본값)일 때만 보이고 조작할 수 있다. `--role api`로 띄우면 `runtime`은 `null`, 서킷 조작은 503이다.
+  - `limiter_available`: 우리 rate limiter 버킷에 남은 토큰 수. governor는 토큰을 쓰지 않고 엿보는 기능이 없어서, 마지막으로 토큰을 받을 때 남은 수에 그 뒤로 다시 채워졌을 수를 더한 **추정값**이다.
+  - `rate_limit_remaining`: 업체가 마지막 응답에서 알려 준 남은 호출 수 (`X-RateLimit-Remaining`).
+- **서킷 조작** ([03 §7](03-resilience.md#7-서킷-브레이커)): `force_open`은 풀 때까지 열어 둔다 (`open_ms`가 지나도 시험 호출을 하지 않는다. 업체 점검 공지에 대응). `force_close`는 풀 때까지 실패가 쌓여도 열리지 않는다. `reset`은 강제 상태를 풀고 닫힌 상태에서 처음부터 다시 센다. 강제된 동안의 호출 결과는 세지 않는다.
+- **통계** ([05 §7](05-observability-and-analytics.md#7-분석-쿼리-관리자-통계-api의-기반)): `interval`은 `10s` · `1m` · `5m` · `15m` · `1h`, `window`는 `5m` · `15m` · `1h` · `6h` · `24h`. 시계열은 호출이 없는 구간도 0으로 채워 돌려준다 (최대 1,000구간, 넘으면 400). 지연 분위수와 성공률은 관문에서 막혀 부르지 않은 시도(`circuit_open`, `throttled`)를 빼고 계산한다. 성공률 = (`success` + `rejected`) ÷ 실제로 부른 시도 (Grafana 대시보드와 같은 정의).
+- **장애 주입 중계**는 `BOOKING_CHAOS_URL`(mock 업체 주소)을 설정할 때만 켜진다 ([D-27](decisions.md#d-27-장애-주입-중계는-booking_chaos_url을-설정할-때만-켠다)). 꺼져 있으면 503(`chaos-disabled`). mock이 거절한 설정(확률이 0~1 밖 등)은 그 사유와 함께 400, mock에 없는 업체는 404, mock을 부를 수 없으면 502.
+- 관리자 API에 없는 경로는 Problem Details 형식의 404다 (관리자 웹 화면 경로 `/admin/*`보다 먼저 맞는다).
+- 관리자 API 요청도 예약 API처럼 추적 · 지표(`http.server.request.duration`, 라우트 틀 `/admin/api/bookings/{id}` 등)에 남는다. Service 대시보드의 "예약 API 가용성"(SLO)은 `/v1` 라우트만 센다.
 
 ## 4. Mock Provider API (포트 9090)
 

@@ -11,8 +11,11 @@
 //! | `BOOKING_WORKER_POLL_INTERVAL_MS` | `500` |
 //! | `BOOKING_WORKER_LEASE_SECS` | `60` (업체 호출 최대 시간 + 5초 이상이어야 한다. 짧으면 서버가 시작하지 않는다) |
 //! | `BOOKING_WORKER_UNKNOWN_RECHECK_SECS` | `30` |
+//! | `BOOKING_ADMIN_WEB_DIR` | `web/admin/dist` (관리자 웹 빌드 결과. 없으면 `/admin` 화면 없이 API만 연다) |
+//! | `BOOKING_GRAFANA_URL` | `http://localhost:3000` (관리자 화면의 trace 링크. 빈 값이면 링크를 보여 주지 않는다) |
+//! | `BOOKING_CHAOS_URL` | 없음 (mock 업체 주소. 설정하면 관리자 화면에서 장애를 주입할 수 있다. 개발 환경 전용) |
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use figment::{Figment, providers::Env};
 use serde::Deserialize;
@@ -35,6 +38,15 @@ pub struct Config {
     /// 결과 불명 예약을 업체에서 찾지 못했을 때 다시 조회하기까지의 간격
     #[serde(default = "defaults::worker_unknown_recheck_secs")]
     pub worker_unknown_recheck_secs: u64,
+    /// 관리자 웹 빌드 결과(`pnpm build`)가 있는 폴더. 서버를 실행한 위치 기준이다.
+    #[serde(default = "defaults::admin_web_dir")]
+    pub admin_web_dir: PathBuf,
+    /// Grafana 주소. 관리자 화면이 trace ID를 Grafana(Tempo) 링크로 보여 줄 때 쓴다.
+    #[serde(default = "defaults::grafana_url")]
+    pub grafana_url: String,
+    /// mock 업체 주소 (예: `http://127.0.0.1:9090`). 장애 주입 API를 중계할 곳이다.
+    #[serde(default)]
+    pub chaos_url: Option<String>,
 }
 
 impl Config {
@@ -60,11 +72,25 @@ impl Config {
             ..WorkerConfig::default()
         }
     }
+
+    /// trace 링크에 쓸 Grafana 주소. 빈 값이면 `None` (링크를 보여 주지 않는다).
+    pub fn grafana_url(&self) -> Option<String> {
+        let url = self.grafana_url.trim().trim_end_matches('/');
+        (!url.is_empty()).then(|| url.to_owned())
+    }
+
+    /// 장애 주입 API를 중계할 mock 업체 주소. 설정하지 않았거나 빈 값이면 `None`.
+    pub fn chaos_url(&self) -> Option<&str> {
+        self.chaos_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
 }
 
 /// serde의 `#[serde(default = "...")]`는 함수 경로를 받는다. 기본값을 한곳에 모아 둔다.
 mod defaults {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, path::PathBuf};
 
     pub fn listen_addr() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 8080))
@@ -88,5 +114,13 @@ mod defaults {
 
     pub fn worker_unknown_recheck_secs() -> u64 {
         30
+    }
+
+    pub fn admin_web_dir() -> PathBuf {
+        PathBuf::from("web/admin/dist")
+    }
+
+    pub fn grafana_url() -> String {
+        "http://localhost:3000".to_owned()
     }
 }
